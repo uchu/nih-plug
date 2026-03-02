@@ -428,6 +428,22 @@ impl CpalMidir {
                 .context("No default audio output device available")?,
         };
 
+        // Use the device's native sample rate to prevent CoreAudio/WASAPI from doing internal
+        // sample rate conversion, which causes variable buffer sizes and glitchy audio
+        let native_sample_rate = output_device
+            .default_output_config()
+            .map(|c| c.sample_rate().0 as f32)
+            .unwrap_or(config.sample_rate);
+        let mut config = config;
+        if (config.sample_rate - native_sample_rate).abs() > 0.1 {
+            nih_log!(
+                "Device native sample rate is {} Hz, using that instead of requested {} Hz",
+                native_sample_rate,
+                config.sample_rate
+            );
+            config.sample_rate = native_sample_rate;
+        }
+
         let requested_sample_rate = cpal::SampleRate(config.sample_rate as u32);
         let requested_buffer_size = cpal::BufferSize::Fixed(config.period_size);
         let num_input_channels = audio_io_layout
@@ -484,12 +500,15 @@ impl CpalMidir {
             .map(NonZeroU32::get)
             .unwrap_or_default() as usize;
         let output = {
-            let output_configs: Vec<_> = output_device
+            let mut output_configs: Vec<_> = output_device
                 .supported_output_configs()
                 .context("Could not get supported audio output configurations")?
                 .filter(|c| match c.buffer_size() {
                     cpal::SupportedBufferSize::Range { min, max } => {
-                        c.channels() as usize == num_output_channels
+                        // Accept devices with more channels than needed (e.g. multichannel
+                        // interfaces like UAD Apollo). We'll write to the first N channels and
+                        // silence the rest in the output callback.
+                        c.channels() as usize >= num_output_channels
                             && (c.min_sample_rate()..=c.max_sample_rate())
                                 .contains(&requested_sample_rate)
                             && (min..=max).contains(&&config.period_size)
@@ -497,6 +516,8 @@ impl CpalMidir {
                     cpal::SupportedBufferSize::Unknown => false,
                 })
                 .collect();
+            // Prefer F32 with the fewest channels to minimize wasted bandwidth
+            output_configs.sort_by_key(|c| c.channels());
             let output_config_range = output_configs
                 .iter()
                 .find(|c| c.sample_format() == SampleFormat::F32)
@@ -504,13 +525,22 @@ impl CpalMidir {
                 .cloned()
                 .with_context(|| {
                     format!(
-                        "The audio output device does not support {} audio channels at a sample \
-                         rate of {} Hz and a period size of {} samples",
+                        "The audio output device does not support at least {} audio channels at a \
+                         sample rate of {} Hz and a period size of {} samples",
                         num_output_channels, config.sample_rate, config.period_size,
                     )
                 })?;
+            let device_channels = output_config_range.channels();
+            if device_channels as usize > num_output_channels {
+                nih_log!(
+                    "Output device has {} channels, plugin needs {}. Writing to first {} channels.",
+                    device_channels,
+                    num_output_channels,
+                    num_output_channels,
+                );
+            }
             let output_config = StreamConfig {
-                channels: output_config_range.channels(),
+                channels: device_channels,
                 sample_rate: requested_sample_rate,
                 buffer_size: requested_buffer_size,
             };
@@ -626,6 +656,12 @@ impl CpalMidir {
         })
     }
 
+    /// Returns the actual sample rate being used, which may differ from the requested rate
+    /// if the device's native rate was used instead.
+    pub fn actual_sample_rate(&self) -> f32 {
+        self.config.sample_rate
+    }
+
     fn build_input_data_callback<T>(
         &self,
         input_unparker: Unparker,
@@ -702,6 +738,8 @@ impl CpalMidir {
             .main_input_channels
             .map(NonZeroU32::get)
             .unwrap_or(0) as usize;
+        // The device may have more channels than the plugin needs (e.g. multichannel interfaces)
+        let device_output_channels = self.output.config.channels as usize;
         // This may contain excess unused space at the end if we get fewer samples than configured
         // from CPAL
         let mut main_io_storage = vec![vec![0.0f32; buffer_size]; num_output_channels];
@@ -828,7 +866,7 @@ impl CpalMidir {
             {
                 // Even though we told CPAL that we wanted `buffer_size` samples, it may still give
                 // us fewer. If we receive more than what we configured, then this will panic.
-                let actual_sample_count = data.len() / num_output_channels;
+                let actual_sample_count = data.len() / device_output_channels;
                 assert!(
                     actual_sample_count <= buffer_size,
                     "Received {actual_sample_count} samples, while the configured buffer size is \
@@ -901,12 +939,18 @@ impl CpalMidir {
                 }
             }
 
-            // The buffer's samples need to be written to `data` in an interlaced format
+            // The buffer's samples need to be written to `data` in an interlaced format.
+            // When the device has more channels than the plugin, write plugin output to the
+            // first channels and silence the rest.
             // SAFETY: Dropping `buffers` allows us to borrow `main_io_storage` again
             for (i, output_sample) in data.iter_mut().enumerate() {
-                let ch = i % num_output_channels;
-                let n = i / num_output_channels;
-                *output_sample = T::from_sample(main_io_storage[ch][n]);
+                let ch = i % device_output_channels;
+                let n = i / device_output_channels;
+                if ch < num_output_channels {
+                    *output_sample = T::from_sample(main_io_storage[ch][n]);
+                } else {
+                    *output_sample = T::from_sample(0.0f32);
+                }
             }
 
             if let Some(output_event_rb_producer) = &mut output_event_rb_producer {

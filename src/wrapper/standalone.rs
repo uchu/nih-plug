@@ -82,8 +82,9 @@ pub fn nih_export_standalone_with_args<P: Plugin, Args: IntoIterator<Item = Stri
             let result = result.or_else(|_| {
                 match backend::CpalMidir::new::<P>(config.clone(), cpal::HostId::Alsa) {
                     Ok(backend) => {
+                        let actual_config = config_with_actual_rate(&config, &backend);
                         nih_log!("Using the ALSA backend");
-                        Ok(run_wrapper::<P, _>(backend, config.clone()))
+                        Ok(run_wrapper::<P, _>(backend, actual_config))
                     }
                     Err(err) => {
                         nih_error!(
@@ -98,8 +99,9 @@ pub fn nih_export_standalone_with_args<P: Plugin, Args: IntoIterator<Item = Stri
             let result = result.or_else(|_| {
                 match backend::CpalMidir::new::<P>(config.clone(), cpal::HostId::CoreAudio) {
                     Ok(backend) => {
+                        let actual_config = config_with_actual_rate(&config, &backend);
                         nih_log!("Using the CoreAudio backend");
-                        Ok(run_wrapper::<P, _>(backend, config.clone()))
+                        Ok(run_wrapper::<P, _>(backend, actual_config))
                     }
                     Err(err) => {
                         nih_error!(
@@ -114,8 +116,9 @@ pub fn nih_export_standalone_with_args<P: Plugin, Args: IntoIterator<Item = Stri
             let result = result.or_else(|_| {
                 match backend::CpalMidir::new::<P>(config.clone(), cpal::HostId::Wasapi) {
                     Ok(backend) => {
+                        let actual_config = config_with_actual_rate(&config, &backend);
                         nih_log!("Using the WASAPI backend");
-                        Ok(run_wrapper::<P, _>(backend, config.clone()))
+                        Ok(run_wrapper::<P, _>(backend, actual_config))
                     }
                     Err(err) => {
                         nih_error!(
@@ -142,7 +145,10 @@ pub fn nih_export_standalone_with_args<P: Plugin, Args: IntoIterator<Item = Stri
         #[cfg(target_os = "linux")]
         config::BackendType::Alsa => {
             match backend::CpalMidir::new::<P>(config.clone(), cpal::HostId::Alsa) {
-                Ok(backend) => run_wrapper::<P, _>(backend, config),
+                Ok(backend) => {
+                    let actual_config = config_with_actual_rate(&config, &backend);
+                    run_wrapper::<P, _>(backend, actual_config)
+                }
                 Err(err) => {
                     nih_error!("Could not initialize the ALSA backend: {:#}", err);
                     false
@@ -152,7 +158,10 @@ pub fn nih_export_standalone_with_args<P: Plugin, Args: IntoIterator<Item = Stri
         #[cfg(target_os = "macos")]
         config::BackendType::CoreAudio => {
             match backend::CpalMidir::new::<P>(config.clone(), cpal::HostId::CoreAudio) {
-                Ok(backend) => run_wrapper::<P, _>(backend, config),
+                Ok(backend) => {
+                    let actual_config = config_with_actual_rate(&config, &backend);
+                    run_wrapper::<P, _>(backend, actual_config)
+                }
                 Err(err) => {
                     nih_error!("Could not initialize the CoreAudio backend: {:#}", err);
                     false
@@ -162,7 +171,10 @@ pub fn nih_export_standalone_with_args<P: Plugin, Args: IntoIterator<Item = Stri
         #[cfg(target_os = "windows")]
         config::BackendType::Wasapi => {
             match backend::CpalMidir::new::<P>(config.clone(), cpal::HostId::Wasapi) {
-                Ok(backend) => run_wrapper::<P, _>(backend, config),
+                Ok(backend) => {
+                    let actual_config = config_with_actual_rate(&config, &backend);
+                    run_wrapper::<P, _>(backend, actual_config)
+                }
                 Err(err) => {
                     nih_error!("Could not initialize the WASAPI backend: {:#}", err);
                     false
@@ -173,6 +185,14 @@ pub fn nih_export_standalone_with_args<P: Plugin, Args: IntoIterator<Item = Stri
             run_wrapper::<P, _>(backend::Dummy::new::<P>(config.clone()), config)
         }
     }
+}
+
+/// Create a config with the actual sample rate from the CPAL backend, which may have adjusted
+/// the rate to match the device's native rate.
+fn config_with_actual_rate(config: &WrapperConfig, backend: &backend::CpalMidir) -> WrapperConfig {
+    let mut actual_config = config.clone();
+    actual_config.sample_rate = backend.actual_sample_rate();
+    actual_config
 }
 
 fn run_wrapper<P: Plugin, B: Backend<P>>(backend: B, config: WrapperConfig) -> bool {
