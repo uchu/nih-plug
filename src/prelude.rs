@@ -34,7 +34,9 @@ pub use crate::params::range::{FloatRange, IntRange};
 pub use crate::params::smoothing::{AtomicF32, Smoothable, Smoother, SmoothingStyle};
 pub use crate::params::Params;
 pub use crate::params::{BoolParam, FloatParam, IntParam, Param, ParamFlags};
-pub use crate::plugin::clap::{ClapPlugin, PolyModulationConfig};
+pub use crate::plugin::clap::{
+    ClapPlugin, ClapPresetDiscovery, ClapPresetEntry, PolyModulationConfig, PresetLoadContext,
+};
 #[cfg(feature = "vst3")]
 pub use crate::plugin::vst3::Vst3Plugin;
 pub use crate::plugin::{Plugin, ProcessStatus, TaskExecutor};

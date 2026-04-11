@@ -1,4 +1,5 @@
 use super::Plugin;
+use crate::params::internals::ParamPtr;
 use crate::prelude::{ClapFeature, RemoteControlsContext};
 
 /// Provides auxiliary metadata needed for a CLAP plugin.
@@ -25,6 +26,51 @@ pub trait ClapPlugin: Plugin {
     /// that the host can use to provide better hardware mapping for a plugin. See the linked
     /// extension for more information.
     fn remote_controls(&self, context: &mut impl RemoteControlsContext) {}
+
+    /// Return a preset discovery provider if this plugin supports CLAP preset discovery.
+    /// This is called at factory level (no plugin instance) to enumerate presets for the host.
+    fn clap_preset_discovery() -> Option<Box<dyn ClapPresetDiscovery>> {
+        None
+    }
+
+    /// Load a preset identified by the given location triple. Called by the host when the user
+    /// selects a preset from the host's browser. The `context` can be used to set parameter values.
+    fn load_preset_from_location(
+        &mut self,
+        location_kind: u32,
+        location: &str,
+        load_key: &str,
+        context: &dyn PresetLoadContext,
+    ) -> bool {
+        false
+    }
+}
+
+/// A context passed to [`ClapPlugin::load_preset_from_location`] that allows setting parameter
+/// values from the wrapper level. Uses `ParamPtr` and normalized values to remain object-safe.
+pub trait PresetLoadContext {
+    /// Set a parameter's normalized value directly via its pointer.
+    /// # Safety
+    /// The caller must ensure the `ParamPtr` is valid (obtained from `Param::as_ptr()`).
+    fn set_param_normalized(&self, ptr: ParamPtr, normalized: f32);
+}
+
+/// Trait for providing preset discovery to CLAP hosts. Implement this to enumerate your plugin's
+/// presets at scan time (no plugin instance required).
+pub trait ClapPresetDiscovery: Send + Sync {
+    fn provider_id(&self) -> &str;
+    fn provider_name(&self) -> &str;
+    fn provider_vendor(&self) -> &str;
+    fn enumerate_presets(&self) -> Vec<ClapPresetEntry>;
+}
+
+/// A single preset entry for CLAP preset discovery.
+pub struct ClapPresetEntry {
+    pub name: String,
+    pub load_key: String,
+    pub creator: Option<String>,
+    pub description: Option<String>,
+    pub flags: u32,
 }
 
 /// Configuration for the plugin's polyphonic modulation options, if it supports .

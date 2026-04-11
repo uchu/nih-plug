@@ -22,6 +22,7 @@ use clap_sys::ext::audio_ports::{
 use clap_sys::ext::audio_ports_config::{
     clap_audio_ports_config, clap_plugin_audio_ports_config, CLAP_EXT_AUDIO_PORTS_CONFIG,
 };
+use clap_sys::ext::preset_load::{clap_plugin_preset_load, CLAP_EXT_PRESET_LOAD};
 use clap_sys::ext::remote_controls::{
     clap_plugin_remote_controls, clap_remote_controls_page, CLAP_EXT_REMOTE_CONTROLS,
 };
@@ -82,6 +83,7 @@ use super::descriptor::PluginDescriptor;
 use super::util::ClapPtr;
 use crate::event_loop::{BackgroundThread, EventLoop, MainThreadExecutor, TASK_QUEUE_CAPACITY};
 use crate::midi::MidiResult;
+use crate::plugin::clap::PresetLoadContext;
 use crate::prelude::{
     AsyncExecutor, AudioIOLayout, AuxiliaryBuffers, BufferConfig, ClapPlugin, Editor, MidiConfig,
     NoteEvent, ParamFlags, ParamPtr, Params, ParentWindowHandle, Plugin, PluginNoteEvent,
@@ -99,6 +101,18 @@ use crate::wrapper::util::{
 /// How many output parameter changes we can store in our output parameter change queue. Storing
 /// more than this many parameters at a time will cause changes to get lost.
 const OUTPUT_EVENT_QUEUE_CAPACITY: usize = 2048;
+
+/// A [`PresetLoadContext`] implementation for the CLAP wrapper. Allows the plugin to set parameter
+/// values during preset loading.
+struct WrapperPresetLoadContext;
+
+impl PresetLoadContext for WrapperPresetLoadContext {
+    fn set_param_normalized(&self, ptr: ParamPtr, normalized: f32) {
+        unsafe {
+            ptr.set_normalized_value(normalized);
+        }
+    }
+}
 
 pub struct Wrapper<P: ClapPlugin> {
     /// A reference to this object, upgraded to an `Arc<Self>` for the GUI context.
@@ -228,6 +242,8 @@ pub struct Wrapper<P: ClapPlugin> {
     clap_plugin_remote_controls: clap_plugin_remote_controls,
     /// The plugin's remote control pages, if it defines any. Filled when initializing the plugin.
     remote_control_pages: Vec<clap_remote_controls_page>,
+
+    clap_plugin_preset_load: clap_plugin_preset_load,
 
     clap_plugin_render: clap_plugin_render,
 
@@ -650,6 +666,10 @@ impl<P: ClapPlugin> Wrapper<P> {
                 get: Some(Self::ext_remote_controls_get),
             },
             remote_control_pages,
+
+            clap_plugin_preset_load: clap_plugin_preset_load {
+                from_location: Some(Self::ext_preset_load_from_location),
+            },
 
             clap_plugin_render: clap_plugin_render {
                 has_hard_realtime_requirement: Some(Self::ext_render_has_hard_realtime_requirement),
@@ -2329,6 +2349,8 @@ impl<P: ClapPlugin> Wrapper<P> {
             &wrapper.clap_plugin_params as *const _ as *const c_void
         } else if id == CLAP_EXT_REMOTE_CONTROLS {
             &wrapper.clap_plugin_remote_controls as *const _ as *const c_void
+        } else if id == CLAP_EXT_PRESET_LOAD {
+            &wrapper.clap_plugin_preset_load as *const _ as *const c_void
         } else if id == CLAP_EXT_RENDER {
             &wrapper.clap_plugin_render as *const _ as *const c_void
         } else if id == CLAP_EXT_STATE {
@@ -3066,6 +3088,52 @@ impl<P: ClapPlugin> Wrapper<P> {
             }
             None => false,
         }
+    }
+
+    unsafe extern "C" fn ext_preset_load_from_location(
+        plugin: *const clap_plugin,
+        location_kind: u32,
+        location: *const c_char,
+        load_key: *const c_char,
+    ) -> bool {
+        check_null_ptr!(false, plugin, (*plugin).plugin_data);
+        let wrapper = &*((*plugin).plugin_data as *const Self);
+
+        let location_str = if location.is_null() {
+            ""
+        } else {
+            match CStr::from_ptr(location).to_str() {
+                Ok(s) => s,
+                Err(_) => return false,
+            }
+        };
+        let load_key_str = if load_key.is_null() {
+            ""
+        } else {
+            match CStr::from_ptr(load_key).to_str() {
+                Ok(s) => s,
+                Err(_) => return false,
+            }
+        };
+
+        let context = WrapperPresetLoadContext;
+
+        let success = {
+            let mut plugin_guard = wrapper.plugin.lock();
+            plugin_guard.load_preset_from_location(
+                location_kind,
+                location_str,
+                load_key_str,
+                &context,
+            )
+        };
+
+        if success {
+            let task_posted = wrapper.schedule_gui(Task::ParameterValuesChanged);
+            nih_debug_assert!(task_posted, "The task queue is full, dropping task...");
+        }
+
+        success
     }
 
     unsafe extern "C" fn ext_render_has_hard_realtime_requirement(

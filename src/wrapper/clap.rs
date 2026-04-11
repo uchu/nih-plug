@@ -4,13 +4,16 @@ mod util;
 mod context;
 mod descriptor;
 pub mod features;
+pub mod preset_discovery;
 mod wrapper;
 
 /// Re-export for the macro
 pub use self::descriptor::PluginDescriptor;
+pub use self::preset_discovery::PresetDiscoveryFactory;
 pub use self::wrapper::Wrapper;
 pub use clap_sys::entry::clap_plugin_entry;
 pub use clap_sys::factory::plugin_factory::{clap_plugin_factory, CLAP_PLUGIN_FACTORY_ID};
+pub use clap_sys::factory::preset_discovery::CLAP_PRESET_DISCOVERY_FACTORY_ID;
 pub use clap_sys::host::clap_host;
 pub use clap_sys::plugin::{clap_plugin, clap_plugin_descriptor};
 pub use clap_sys::version::CLAP_VERSION;
@@ -26,8 +29,8 @@ macro_rules! nih_export_clap {
         mod clap {
             use $crate::prelude::nih_debug_assert_eq;
             use $crate::wrapper::setup_logger;
-            use $crate::wrapper::clap::{PluginDescriptor, Wrapper};
-            use $crate::wrapper::clap::{CLAP_PLUGIN_FACTORY_ID, clap_host, clap_plugin, clap_plugin_descriptor, clap_plugin_factory};
+            use $crate::wrapper::clap::{PluginDescriptor, PresetDiscoveryFactory, Wrapper};
+            use $crate::wrapper::clap::{CLAP_PLUGIN_FACTORY_ID, CLAP_PRESET_DISCOVERY_FACTORY_ID, clap_host, clap_plugin, clap_plugin_descriptor, clap_plugin_factory};
             use ::std::collections::HashSet;
             use ::std::ffi::{CStr, c_void};
             use ::std::os::raw::c_char;
@@ -121,9 +124,24 @@ macro_rules! nih_export_clap {
             pub extern "C" fn deinit() {}
 
             pub extern "C" fn get_factory(factory_id: *const c_char) -> *const c_void {
-                if !factory_id.is_null() && unsafe { CStr::from_ptr(factory_id) } == CLAP_PLUGIN_FACTORY_ID {
+                if factory_id.is_null() {
+                    return ::std::ptr::null();
+                }
+                let id = unsafe { CStr::from_ptr(factory_id) };
+                if id == CLAP_PLUGIN_FACTORY_ID {
                     &CLAP_PLUGIN_FACTORY as *const _ as *const c_void
-                } else {
+                }
+                // Return the preset discovery factory for the first plugin type that supports it
+                $(
+                    else if id == CLAP_PRESET_DISCOVERY_FACTORY_ID {
+                        if <$plugin_ty as $crate::prelude::ClapPlugin>::clap_preset_discovery().is_some() {
+                            PresetDiscoveryFactory::<$plugin_ty>::factory() as *const _ as *const c_void
+                        } else {
+                            ::std::ptr::null()
+                        }
+                    }
+                )+
+                else {
                     ::std::ptr::null()
                 }
             }
