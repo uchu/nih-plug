@@ -1,9 +1,11 @@
 use std::num::NonZeroU32;
 use std::ptr::NonNull;
+use std::sync::atomic::AtomicBool;
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use super::super::config::WrapperConfig;
-use super::Backend;
+use super::{Backend, RunOutcome};
 use crate::prelude::{AudioIOLayout, AuxiliaryBuffers, Buffer, Plugin, PluginNoteEvent, Transport};
 use crate::wrapper::util::buffer_management::{BufferManager, ChannelPointers};
 
@@ -18,6 +20,9 @@ pub struct Dummy {
 impl<P: Plugin> Backend<P> for Dummy {
     fn run(
         &mut self,
+        // The process callback already returns `false` within one period of a stop request, so
+        // there's no separate flag to poll here.
+        _should_stop: Arc<AtomicBool>,
         mut cb: impl FnMut(
                 &mut Buffer,
                 &mut AuxiliaryBuffers,
@@ -27,7 +32,7 @@ impl<P: Plugin> Backend<P> for Dummy {
             ) -> bool
             + 'static
             + Send,
-    ) {
+    ) -> RunOutcome {
         // We can't really do anything meaningful here, so we'll simply periodically call the
         // callback with empty buffers
         let interval =
@@ -175,6 +180,8 @@ impl<P: Plugin> Backend<P> for Dummy {
             let period_end = Instant::now();
             std::thread::sleep((period_start + interval).saturating_duration_since(period_end));
         }
+
+        RunOutcome::Stopped
     }
 }
 

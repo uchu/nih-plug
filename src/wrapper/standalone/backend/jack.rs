@@ -1,7 +1,9 @@
 use std::borrow::Borrow;
 use std::num::NonZeroU32;
 use std::ptr::NonNull;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use std::time::Duration;
 
 use anyhow::{Context, Result};
 use crossbeam::sync::Parker;
@@ -12,7 +14,7 @@ use jack::{
 use parking_lot::Mutex;
 
 use super::super::config::WrapperConfig;
-use super::Backend;
+use super::{Backend, RunOutcome};
 use crate::midi::MidiResult;
 use crate::prelude::{
     AudioIOLayout, AuxiliaryBuffers, Buffer, MidiConfig, NoteEvent, Plugin, PluginNoteEvent,
@@ -55,6 +57,7 @@ impl ChannelPointerVec {
 impl<P: Plugin> Backend<P> for Jack {
     fn run(
         &mut self,
+        should_stop: Arc<AtomicBool>,
         mut cb: impl FnMut(
                 &mut Buffer,
                 &mut AuxiliaryBuffers,
@@ -64,9 +67,15 @@ impl<P: Plugin> Backend<P> for Jack {
             ) -> bool
             + 'static
             + Send,
-    ) {
+    ) -> RunOutcome {
         let client = self.client.take().unwrap();
         let buffer_size = client.buffer_size();
+
+        // Set by the process handler right before it returns `Control::Quit`, so the park loop
+        // below can distinguish an intentional stop from a spurious wakeup. Also lets this thread
+        // wind down when the JACK server dies mid-session (no more process callbacks, so the old
+        // unconditional `park()` would have blocked forever and hung the application on exit).
+        let quit = Arc::new(AtomicBool::new(false));
 
         // We'll preallocate the buffers here, and then assign them to the slices belonging to the
         // JACK ports later. For consistency with the other backends we'll reuse the
@@ -115,6 +124,7 @@ impl<P: Plugin> Backend<P> for Jack {
         let aux_output_ports = self.aux_output_ports.clone();
         let midi_input = self.midi_input.clone();
         let midi_output = self.midi_output.clone();
+        let quit_flag = quit.clone();
         let process_handler = ClosureProcessHandler::new(move |client, ps| {
             // In theory we could handle `num_frames <= buffer_size`, but JACK will never chop up
             // buffers like that so we'll just make it easier for ourselves by not supporting that
@@ -124,6 +134,7 @@ impl<P: Plugin> Backend<P> for Jack {
                     "Buffer size changed from {buffer_size} to {num_frames}. Buffer size changes \
                      are currently not supported, aborting..."
                 );
+                quit_flag.store(true, Ordering::Release);
                 unparker.unpark();
                 return Control::Quit;
             }
@@ -294,6 +305,7 @@ impl<P: Plugin> Backend<P> for Jack {
 
                 Control::Continue
             } else {
+                quit_flag.store(true, Ordering::Release);
                 unparker.unpark();
                 Control::Quit
             }
@@ -308,12 +320,23 @@ impl<P: Plugin> Backend<P> for Jack {
         }
 
         // The process callback happens on another thread, so we need to block this thread until we
-        // get the request to shut down or until the process callback runs into an error
-        parker.park();
+        // get the request to shut down or until the process callback runs into an error. The
+        // timeout lets us also notice a stop request when no more process callbacks arrive (e.g.
+        // the JACK server died) instead of blocking forever.
+        loop {
+            parker.park_timeout(Duration::from_millis(100));
+            if quit.load(Ordering::Acquire) || should_stop.load(Ordering::SeqCst) {
+                break;
+            }
+        }
 
         // And put the client back where it belongs in case this function is called a second time
         let (client, _, _) = async_client.deactivate().unwrap();
         self.client = Some(client);
+
+        // JACK handles device/server management itself, so there is no restart-on-stream-failure
+        // behavior here; every exit is final as far as the wrapper is concerned.
+        RunOutcome::Stopped
     }
 }
 

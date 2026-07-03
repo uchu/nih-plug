@@ -9,8 +9,9 @@ use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::Arc;
 use std::thread;
+use std::time::{Duration, Instant};
 
-use super::backend::Backend;
+use super::backend::{Backend, RunOutcome};
 use super::config::WrapperConfig;
 use super::context::{WrapperGuiContext, WrapperInitContext, WrapperProcessContext};
 use crate::event_loop::{EventLoop, MainThreadExecutor, OsEventLoop};
@@ -499,88 +500,163 @@ impl<P: Plugin, B: Backend<P>> Wrapper<P, B> {
     }
 
     /// The audio thread. This should be called from another thread, and it will run until
-    /// `should_terminate` is `true`.
+    /// `should_terminate` is `true`. If the audio stream dies (e.g. the device was disconnected),
+    /// this attempts to recover by reinitializing the backend — on the new system default device
+    /// when no specific device was requested — with bounded, interruptible backoff. If recovery
+    /// is impossible the thread exits and the application keeps running without audio.
     fn run_audio_thread(
         self: Arc<Self>,
         should_terminate: Arc<AtomicBool>,
         gui_task_sender: channel::Sender<GuiTask>,
     ) {
-        self.clone().backend.borrow_mut().run(
-            move |buffer, aux, transport, input_events, output_events| {
-                // TODO: This process wrapper should actually be in the backends (since the backends
-                //       should also not allocate in their audio callbacks), but that's a bit more
-                //       error prone
-                process_wrapper(|| {
-                    if should_terminate.load(Ordering::SeqCst) {
-                        return false;
+        const MAX_RETRIES: u32 = 5;
+        const BACKOFF_MS: [u64; 5] = [250, 500, 1000, 2000, 4000];
+        /// A run that lasted at least this long counts as healthy, so a later stream failure (a
+        /// second unplug an hour later) starts with a fresh retry budget.
+        const STABLE_RUN_THRESHOLD: Duration = Duration::from_secs(10);
+
+        let mut failed_attempts = 0u32;
+        loop {
+            let run_started = Instant::now();
+            let outcome = {
+                let this = self.clone();
+                let gui_task_sender = gui_task_sender.clone();
+                let should_stop = should_terminate.clone();
+                let should_terminate = should_terminate.clone();
+                // The process callback is consumed by `run()`, so it's rebuilt for every attempt.
+                self.backend.borrow_mut().run(
+                    should_stop,
+                    move |buffer, aux, transport, input_events, output_events| {
+                        // TODO: This process wrapper should actually be in the backends (since the backends
+                        //       should also not allocate in their audio callbacks), but that's a bit more
+                        //       error prone
+                        process_wrapper(|| {
+                            if should_terminate.load(Ordering::SeqCst) {
+                                return false;
+                            }
+
+                            let sample_rate = this.buffer_config.sample_rate;
+                            {
+                                let mut plugin = this.plugin.lock();
+                                if let ProcessStatus::Error(err) = plugin.process(
+                                    buffer,
+                                    aux,
+                                    &mut this.make_process_context(
+                                        transport,
+                                        input_events,
+                                        output_events,
+                                    ),
+                                ) {
+                                    nih_error!("The plugin returned an error while processing:");
+                                    nih_error!("{}", err);
+
+                                    let push_successful =
+                                        gui_task_sender.send(GuiTask::Close).is_ok();
+                                    nih_debug_assert!(
+                                        push_successful,
+                                        "Could not queue window close, the editor will remain open"
+                                    );
+
+                                    return false;
+                                }
+                            }
+
+                            // Any output note events are now in a vector that can be processed by the
+                            // audio/MIDI backend
+
+                            // We'll always write these events to the first sample, so even when we add note
+                            // output we shouldn't have to think about interleaving events here
+                            while let Some((param_ptr, normalized_value)) =
+                                this.unprocessed_param_changes.pop()
+                            {
+                                if unsafe { param_ptr.set_normalized_value(normalized_value) } {
+                                    unsafe { param_ptr.update_smoother(sample_rate, false) };
+                                    let task_posted = this.schedule_gui(
+                                        Task::ParameterValueChanged(param_ptr, normalized_value),
+                                    );
+                                    nih_debug_assert!(
+                                        task_posted,
+                                        "The task queue is full, dropping task..."
+                                    );
+                                }
+                            }
+
+                            // After processing audio, we'll check if the editor has sent us updated plugin
+                            // state.  We'll restore that here on the audio thread to prevent changing the
+                            // values during the process call and also to prevent inconsistent state when
+                            // the host also wants to load plugin state.
+                            // FIXME: Zero capacity channels allocate on receiving, find a better
+                            //        alternative that doesn't do that
+                            let updated_state =
+                                permit_alloc(|| this.updated_state_receiver.try_recv());
+                            if let Ok(mut state) = updated_state {
+                                this.set_state_inner(&mut state);
+
+                                // We'll pass the state object back to the GUI thread so deallocation can
+                                // happen there without potentially blocking the audio thread
+                                if let Err(err) = this.updated_state_sender.send(state) {
+                                    nih_debug_assert_failure!(
+                                        "Failed to send state object back to GUI thread: {}",
+                                        err
+                                    );
+                                };
+                            }
+
+                            true
+                        })
+                    },
+                )
+            };
+
+            if should_terminate.load(Ordering::SeqCst) {
+                break;
+            }
+            match outcome {
+                // The plugin or the user asked to stop; same behavior as before the restart loop
+                RunOutcome::Stopped => break,
+                RunOutcome::StreamFailed => {
+                    if run_started.elapsed() > STABLE_RUN_THRESHOLD {
+                        failed_attempts = 0;
+                    }
+                    if failed_attempts >= MAX_RETRIES {
+                        nih_error!(
+                            "The audio stream died and could not be recovered after \
+                             {MAX_RETRIES} attempts. Audio is disabled; the application will \
+                             keep running."
+                        );
+                        break;
                     }
 
-                    let sample_rate = self.buffer_config.sample_rate;
-                    {
-                        let mut plugin = self.plugin.lock();
-                        if let ProcessStatus::Error(err) = plugin.process(
-                            buffer,
-                            aux,
-                            &mut self.make_process_context(transport, input_events, output_events),
-                        ) {
-                            nih_error!("The plugin returned an error while processing:");
-                            nih_error!("{}", err);
+                    let backoff = Duration::from_millis(BACKOFF_MS[failed_attempts as usize]);
+                    failed_attempts += 1;
+                    nih_error!(
+                        "The audio stream died, attempting to recover in {backoff:?} (attempt \
+                         {failed_attempts}/{MAX_RETRIES})"
+                    );
+                    let deadline = Instant::now() + backoff;
+                    while Instant::now() < deadline {
+                        if should_terminate.load(Ordering::SeqCst) {
+                            return;
+                        }
+                        thread::sleep(Duration::from_millis(50));
+                    }
 
-                            let push_successful = gui_task_sender.send(GuiTask::Close).is_ok();
-                            nih_debug_assert!(
-                                push_successful,
-                                "Could not queue window close, the editor will remain open"
-                            );
-
-                            return false;
+                    match self.backend.borrow_mut().reinit() {
+                        Ok(()) => {
+                            // The stream died mid-note; clear held voices and effect tails that
+                            // accumulated across the audio gap before the new stream starts.
+                            process_wrapper(|| self.plugin.lock().reset());
+                            nih_log!("Audio device reinitialized, resuming playback");
+                        }
+                        // Fall through: the next `run()` attempt fails fast and consumes the
+                        // next retry slot
+                        Err(err) => {
+                            nih_error!("Could not reinitialize the audio backend: {err:#}")
                         }
                     }
-
-                    // Any output note events are now in a vector that can be processed by the
-                    // audio/MIDI backend
-
-                    // We'll always write these events to the first sample, so even when we add note
-                    // output we shouldn't have to think about interleaving events here
-                    while let Some((param_ptr, normalized_value)) =
-                        self.unprocessed_param_changes.pop()
-                    {
-                        if unsafe { param_ptr.set_normalized_value(normalized_value) } {
-                            unsafe { param_ptr.update_smoother(sample_rate, false) };
-                            let task_posted = self.schedule_gui(Task::ParameterValueChanged(
-                                param_ptr,
-                                normalized_value,
-                            ));
-                            nih_debug_assert!(
-                                task_posted,
-                                "The task queue is full, dropping task..."
-                            );
-                        }
-                    }
-
-                    // After processing audio, we'll check if the editor has sent us updated plugin
-                    // state.  We'll restore that here on the audio thread to prevent changing the
-                    // values during the process call and also to prevent inconsistent state when
-                    // the host also wants to load plugin state.
-                    // FIXME: Zero capacity channels allocate on receiving, find a better
-                    //        alternative that doesn't do that
-                    let updated_state = permit_alloc(|| self.updated_state_receiver.try_recv());
-                    if let Ok(mut state) = updated_state {
-                        self.set_state_inner(&mut state);
-
-                        // We'll pass the state object back to the GUI thread so deallocation can
-                        // happen there without potentially blocking the audio thread
-                        if let Err(err) = self.updated_state_sender.send(state) {
-                            nih_debug_assert_failure!(
-                                "Failed to send state object back to GUI thread: {}",
-                                err
-                            );
-                        };
-                    }
-
-                    true
-                })
-            },
-        );
+                }
+            }
+        }
     }
 
     fn make_gui_context(self: Arc<Self>) -> Arc<WrapperGuiContext<P, B>> {
