@@ -10,7 +10,7 @@ use crate::prelude::{
     Transport, Vst3Plugin,
 };
 
-use super::inner::{Task, WrapperInner};
+use super::inner::{OutputParamEvent, Task, WrapperInner};
 
 /// An [`InitContext`] implementation for the wrapper.
 ///
@@ -115,6 +115,58 @@ impl<P: Vst3Plugin> ProcessContext<P> for WrapperProcessContext<'_, P> {
 
     fn set_current_voice_capacity(&self, _capacity: u32) {
         // This is only supported by CLAP
+    }
+
+    // Engine-originated parameter events are queued lock-free and replayed on the main thread
+    // through the host's `IComponentHandler` (begin_edit/perform_edit/end_edit) by a
+    // `Task::FlushEngineParamEvents` scheduled at the end of the processing cycle.
+    unsafe fn raw_begin_set_parameter_from_engine(&self, param: ParamPtr) {
+        match self.inner.param_ptr_to_hash.get(&param) {
+            Some(hash) => {
+                let success = self
+                    .inner
+                    .queue_parameter_event(OutputParamEvent::BeginGesture { param_hash: *hash });
+                nih_debug_assert!(
+                    success,
+                    "Parameter output event queue was full, parameter change will not be sent to \
+                     the host"
+                );
+            }
+            None => nih_debug_assert_failure!("Unknown parameter: {:?}", param),
+        }
+    }
+
+    unsafe fn raw_set_parameter_normalized_from_engine(&self, param: ParamPtr, normalized: f32) {
+        match self.inner.param_ptr_to_hash.get(&param) {
+            Some(hash) => {
+                let success = self.inner.queue_parameter_event(OutputParamEvent::SetValue {
+                    param_hash: *hash,
+                    normalized_value: normalized,
+                });
+                nih_debug_assert!(
+                    success,
+                    "Parameter output event queue was full, parameter change will not be sent to \
+                     the host"
+                );
+            }
+            None => nih_debug_assert_failure!("Unknown parameter: {:?}", param),
+        }
+    }
+
+    unsafe fn raw_end_set_parameter_from_engine(&self, param: ParamPtr) {
+        match self.inner.param_ptr_to_hash.get(&param) {
+            Some(hash) => {
+                let success = self
+                    .inner
+                    .queue_parameter_event(OutputParamEvent::EndGesture { param_hash: *hash });
+                nih_debug_assert!(
+                    success,
+                    "Parameter output event queue was full, parameter change will not be sent to \
+                     the host"
+                );
+            }
+            None => nih_debug_assert_failure!("Unknown parameter: {:?}", param),
+        }
     }
 }
 

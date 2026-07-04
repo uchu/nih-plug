@@ -19,7 +19,7 @@ use vst3_sys::vst::{
 use vst3_sys::VST3;
 use widestring::U16CStr;
 
-use super::inner::{ProcessEvent, WrapperInner};
+use super::inner::{ProcessEvent, Task, WrapperInner};
 use super::note_expressions::{self, NoteExpressionController};
 use super::util::{
     u16strlcpy, VstPtr, VST3_MIDI_CCS, VST3_MIDI_NUM_PARAMS, VST3_MIDI_PARAMS_START,
@@ -1664,6 +1664,14 @@ impl<P: Vst3Plugin> IAudioProcessor for Wrapper<P> {
                         err
                     );
                 };
+            }
+
+            // Parameter events queued from the audio thread (`raw_*_from_engine()`) are replayed
+            // through the main-thread-only `IComponentHandler`. If the task queue was full the
+            // events stay queued and the next cycle reschedules the flush.
+            if !self.inner.output_parameter_events.is_empty() {
+                let task_posted = self.inner.schedule_gui(Task::FlushEngineParamEvents);
+                nih_debug_assert!(task_posted, "The task queue is full, dropping task...");
             }
 
             result

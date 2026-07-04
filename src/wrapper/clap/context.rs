@@ -127,6 +127,61 @@ impl<P: ClapPlugin> ProcessContext<P> for WrapperProcessContext<'_, P> {
     fn set_current_voice_capacity(&self, capacity: u32) {
         self.wrapper.set_current_voice_capacity(capacity)
     }
+
+    // Engine-originated parameter events reuse the same lock-free output queue the GUI context
+    // uses; the wrapper flushes it to the host at the end of the processing cycle (or on an
+    // explicit host flush) and updates the plugin-side value at that point.
+    unsafe fn raw_begin_set_parameter_from_engine(&self, param: ParamPtr) {
+        match self.wrapper.param_ptr_to_hash.get(&param) {
+            Some(hash) => {
+                let success = self
+                    .wrapper
+                    .queue_parameter_event(OutputParamEvent::BeginGesture { param_hash: *hash });
+                nih_debug_assert!(
+                    success,
+                    "Parameter output event queue was full, parameter change will not be sent to \
+                     the host"
+                );
+            }
+            None => nih_debug_assert_failure!("Unknown parameter: {:?}", param),
+        }
+    }
+
+    unsafe fn raw_set_parameter_normalized_from_engine(&self, param: ParamPtr, normalized: f32) {
+        match self.wrapper.param_ptr_to_hash.get(&param) {
+            Some(hash) => {
+                let clap_plain_value = normalized as f64 * param.step_count().unwrap_or(1) as f64;
+                let success = self
+                    .wrapper
+                    .queue_parameter_event(OutputParamEvent::SetValue {
+                        param_hash: *hash,
+                        clap_plain_value,
+                    });
+                nih_debug_assert!(
+                    success,
+                    "Parameter output event queue was full, parameter change will not be sent to \
+                     the host"
+                );
+            }
+            None => nih_debug_assert_failure!("Unknown parameter: {:?}", param),
+        }
+    }
+
+    unsafe fn raw_end_set_parameter_from_engine(&self, param: ParamPtr) {
+        match self.wrapper.param_ptr_to_hash.get(&param) {
+            Some(hash) => {
+                let success = self
+                    .wrapper
+                    .queue_parameter_event(OutputParamEvent::EndGesture { param_hash: *hash });
+                nih_debug_assert!(
+                    success,
+                    "Parameter output event queue was full, parameter change will not be sent to \
+                     the host"
+                );
+            }
+            None => nih_debug_assert_failure!("Unknown parameter: {:?}", param),
+        }
+    }
 }
 
 impl<P: ClapPlugin> GuiContext for WrapperGuiContext<P> {

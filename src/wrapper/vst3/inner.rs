@@ -1,6 +1,7 @@
 use atomic_refcell::AtomicRefCell;
 use crossbeam::atomic::AtomicCell;
 use crossbeam::channel::{self, SendTimeoutError};
+use crossbeam::queue::ArrayQueue;
 use parking_lot::{Mutex, RwLock};
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
@@ -137,7 +138,34 @@ pub(crate) struct WrapperInner<P: Vst3Plugin> {
     /// having to add a setter function to the parameter (or even worse, have it be completely
     /// untyped).
     pub param_ptr_to_hash: HashMap<ParamPtr, u32>,
+
+    /// Parameter events queued from the audio thread through the `ProcessContext`'s
+    /// `raw_*_from_engine()` methods. VST3's `IComponentHandler` is main-thread only, so the
+    /// wrapper schedules a [`Task::FlushEngineParamEvents`] at the end of the processing cycle and
+    /// the events are replayed there with the same semantics as GUI-originated gestures.
+    pub output_parameter_events: ArrayQueue<OutputParamEvent>,
 }
+
+/// A parameter event queued by the plugin's audio thread, to be replayed on the main thread
+/// through the host's `IComponentHandler`. The equivalent of the CLAP wrapper's
+/// `OutputParamEvent`.
+#[derive(Debug, Clone)]
+pub enum OutputParamEvent {
+    /// Begin an automation gesture. This must always be sent before sending [`SetValue`].
+    BeginGesture { param_hash: u32 },
+    /// Change the value of a parameter.
+    SetValue {
+        param_hash: u32,
+        normalized_value: f32,
+    },
+    /// End an automation gesture. This must always be sent after sending one or more [`SetValue`]
+    /// events.
+    EndGesture { param_hash: u32 },
+}
+
+/// The capacity of [`WrapperInner::output_parameter_events`], matching the CLAP wrapper's output
+/// event queue capacity.
+const OUTPUT_PARAM_EVENT_QUEUE_CAPACITY: usize = 2048;
 
 /// Tasks that can be sent from the plugin to be executed on the main thread in a non-blocking
 /// realtime-safe way (either a random thread or `IRunLoop` on Linux, the OS' message loop on
@@ -157,6 +185,9 @@ pub enum Task<P: Plugin> {
     /// Request the editor to be resized according to its current size. Right now there is no way to
     /// handle "denied resize" requests yet.
     RequestResize,
+    /// Replay parameter events queued from the audio thread
+    /// ([`WrapperInner::output_parameter_events`]) through the host's `IComponentHandler`.
+    FlushEngineParamEvents,
 }
 
 /// VST3 makes audio processing pretty complicated. In order to support both block splitting for
@@ -318,6 +349,8 @@ impl<P: Vst3Plugin> WrapperInner<P> {
             param_units,
             param_id_to_hash,
             param_ptr_to_hash,
+
+            output_parameter_events: ArrayQueue::new(OUTPUT_PARAM_EVENT_QUEUE_CAPACITY),
         });
 
         // FIXME: Right now this is safe, but if we are going to have a singleton main thread queue
@@ -437,6 +470,13 @@ impl<P: Vst3Plugin> WrapperInner<P> {
     /// [`notify_param_values_changed()`][Self::notify_param_values_changed()] to allow the editor
     /// to update itself. This needs to be done separately so you can process parameter changes in
     /// batches.
+    /// Queue a parameter event originating from the audio thread. These are replayed on the main
+    /// thread through the host's `IComponentHandler` by [`Task::FlushEngineParamEvents`], which
+    /// the wrapper schedules at the end of the processing cycle.
+    pub fn queue_parameter_event(&self, event: OutputParamEvent) -> bool {
+        self.output_parameter_events.push(event).is_ok()
+    }
+
     pub fn set_normalized_value_by_hash(
         &self,
         hash: u32,
@@ -648,6 +688,43 @@ impl<P: Vst3Plugin> MainThreadExecutor<Task<P>> for WrapperInner<P> {
                 },
                 None => nih_debug_assert_failure!("Can't resize a closed editor"),
             },
+            Task::FlushEngineParamEvents => {
+                nih_debug_assert!(is_gui_thread);
+                let sample_rate = self.current_buffer_config.load().map(|c| c.sample_rate);
+                match &*self.component_handler.borrow() {
+                    Some(handler) => {
+                        while let Some(event) = self.output_parameter_events.pop() {
+                            match event {
+                                OutputParamEvent::BeginGesture { param_hash } => unsafe {
+                                    handler.begin_edit(param_hash);
+                                },
+                                OutputParamEvent::SetValue {
+                                    param_hash,
+                                    normalized_value,
+                                } => {
+                                    // Same semantics as GUI-originated edits: while the plugin is
+                                    // processing, the host passes the change back through the
+                                    // audio callback; otherwise update the value directly.
+                                    if !self.is_processing.load(Ordering::SeqCst) {
+                                        self.set_normalized_value_by_hash(
+                                            param_hash,
+                                            normalized_value,
+                                            sample_rate,
+                                        );
+                                    }
+                                    unsafe {
+                                        handler.perform_edit(param_hash, normalized_value as f64);
+                                    }
+                                }
+                                OutputParamEvent::EndGesture { param_hash } => unsafe {
+                                    handler.end_edit(param_hash);
+                                },
+                            }
+                        }
+                    }
+                    None => nih_debug_assert_failure!("Component handler not yet set"),
+                }
+            }
         }
     }
 }

@@ -97,6 +97,20 @@ impl<P: Plugin, B: Backend<P>> ProcessContext<P> for WrapperProcessContext<'_, P
     fn set_current_voice_capacity(&self, _capacity: u32) {
         // This is only supported by CLAP
     }
+
+    unsafe fn raw_begin_set_parameter_from_engine(&self, _param: ParamPtr) {
+        // There's no automation to record without a host, so gestures don't mean anything
+    }
+
+    unsafe fn raw_set_parameter_normalized_from_engine(&self, param: ParamPtr, normalized: f32) {
+        // Same mechanism as GUI-originated changes: the value lands on the
+        // `unprocessed_param_changes` queue and is applied at a processing cycle boundary.
+        self.wrapper.set_parameter(param, normalized);
+    }
+
+    unsafe fn raw_end_set_parameter_from_engine(&self, _param: ParamPtr) {
+        // See raw_begin_set_parameter_from_engine()
+    }
 }
 
 impl<P: Plugin, B: Backend<P>> GuiContext for WrapperGuiContext<P, B> {

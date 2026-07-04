@@ -1,7 +1,7 @@
 //! A context passed during the process function.
 
 use super::PluginApi;
-use crate::prelude::{Plugin, PluginNoteEvent};
+use crate::prelude::{ParamPtr, Plugin, PluginNoteEvent};
 
 /// Contains both context data and callbacks the plugin can use during processing. Most notably this
 /// is how a plugin sends and receives note events, gets transport information, and accesses
@@ -92,10 +92,43 @@ pub trait ProcessContext<P: Plugin> {
     /// monophonic modulation when dropping the capacity down to 1.
     fn set_current_voice_capacity(&self, capacity: u32);
 
-    // TODO: Add this, this works similar to [GuiContext::set_parameter] but it adds the parameter
-    //       change to a queue (or directly to the VST3 plugin's parameter output queues) instead of
-    //       using main thread host automation (and all the locks involved there).
-    // fn set_parameter<P: Param>(&self, param: &P, value: P::Plain);
+    /// Inform the host that the engine (audio thread) will start automating a parameter — the
+    /// realtime-safe counterpart of [`GuiContext::raw_begin_set_parameter()`
+    /// ][crate::prelude::GuiContext::raw_begin_set_parameter()]. Use this for parameter changes
+    /// that originate in `process()` itself, e.g. hardware MIDI CC mappings, so the host can
+    /// record them as automation with a proper touch gesture. The events are queued and flushed
+    /// to the host by the wrapper; they never block the audio thread.
+    ///
+    /// Always bracket one or more `raw_set_parameter_normalized_from_engine()` calls with a
+    /// begin/end pair, exactly like the GUI gesture API.
+    ///
+    /// # Safety
+    ///
+    /// The implementing function still needs to check if `param` actually exists. This function is
+    /// mostly marked as unsafe for API reasons.
+    unsafe fn raw_begin_set_parameter_from_engine(&self, param: ParamPtr);
+
+    /// Set a parameter to a new normalized value from the audio thread. Must be called between a
+    /// [`raw_begin_set_parameter_from_engine()`][Self::raw_begin_set_parameter_from_engine()] and
+    /// a [`raw_end_set_parameter_from_engine()`][Self::raw_end_set_parameter_from_engine()] call.
+    /// The plugin-visible parameter value is updated when the wrapper writes the queued event out
+    /// (end of the current processing cycle at the earliest), never in the middle of a cycle.
+    ///
+    /// # Safety
+    ///
+    /// The implementing function still needs to check if `param` actually exists. This function is
+    /// mostly marked as unsafe for API reasons.
+    unsafe fn raw_set_parameter_normalized_from_engine(&self, param: ParamPtr, normalized: f32);
+
+    /// Inform the host that the engine has finished automating a parameter — the realtime-safe
+    /// counterpart of [`GuiContext::raw_end_set_parameter()`
+    /// ][crate::prelude::GuiContext::raw_end_set_parameter()].
+    ///
+    /// # Safety
+    ///
+    /// The implementing function still needs to check if `param` actually exists. This function is
+    /// mostly marked as unsafe for API reasons.
+    unsafe fn raw_end_set_parameter_from_engine(&self, param: ParamPtr);
 }
 
 /// Information about the plugin's transport. Depending on the plugin API and the host not all
