@@ -129,14 +129,16 @@ impl<P: ClapPlugin> ProcessContext<P> for WrapperProcessContext<'_, P> {
     }
 
     // Engine-originated parameter events reuse the same lock-free output queue the GUI context
-    // uses; the wrapper flushes it to the host at the end of the processing cycle (or on an
-    // explicit host flush) and updates the plugin-side value at that point.
+    // uses, but without the host flush request — `request_flush()` must not be called from the
+    // audio thread, and the wrapper drains the queue at the end of this processing cycle anyway.
     unsafe fn raw_begin_set_parameter_from_engine(&self, param: ParamPtr) {
         match self.wrapper.param_ptr_to_hash.get(&param) {
             Some(hash) => {
                 let success = self
                     .wrapper
-                    .queue_parameter_event(OutputParamEvent::BeginGesture { param_hash: *hash });
+                    .queue_parameter_event_from_audio_thread(OutputParamEvent::BeginGesture {
+                        param_hash: *hash,
+                    });
                 nih_debug_assert!(
                     success,
                     "Parameter output event queue was full, parameter change will not be sent to \
@@ -153,7 +155,7 @@ impl<P: ClapPlugin> ProcessContext<P> for WrapperProcessContext<'_, P> {
                 let clap_plain_value = normalized as f64 * param.step_count().unwrap_or(1) as f64;
                 let success = self
                     .wrapper
-                    .queue_parameter_event(OutputParamEvent::SetValue {
+                    .queue_parameter_event_from_audio_thread(OutputParamEvent::SetValue {
                         param_hash: *hash,
                         clap_plain_value,
                     });
@@ -172,7 +174,9 @@ impl<P: ClapPlugin> ProcessContext<P> for WrapperProcessContext<'_, P> {
             Some(hash) => {
                 let success = self
                     .wrapper
-                    .queue_parameter_event(OutputParamEvent::EndGesture { param_hash: *hash });
+                    .queue_parameter_event_from_audio_thread(OutputParamEvent::EndGesture {
+                        param_hash: *hash,
+                    });
                 nih_debug_assert!(
                     success,
                     "Parameter output event queue was full, parameter change will not be sent to \

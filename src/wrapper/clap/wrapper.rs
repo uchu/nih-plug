@@ -806,6 +806,14 @@ impl<P: ClapPlugin> Wrapper<P> {
         result
     }
 
+    /// The same as [`queue_parameter_event()`][Self::queue_parameter_event()], but callable from
+    /// the audio thread. `clap_host_params::request_flush()` must not be called from the audio
+    /// thread, and it is also not needed there: the wrapper writes the queued events to the
+    /// host's output event queue at the end of the current processing cycle.
+    pub fn queue_parameter_event_from_audio_thread(&self, event: OutputParamEvent) -> bool {
+        self.output_parameter_events.push(event).is_ok()
+    }
+
     /// Request a resize based on the editor's current reported size. As of CLAP 0.24 this can
     /// safely be called from any thread. If this returns `false`, then the plugin should reset its
     /// size back to the previous value.
