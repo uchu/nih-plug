@@ -34,6 +34,10 @@ type BundlerConfig = HashMap<String, PackageConfig>;
 #[derive(Debug, Clone, Deserialize)]
 struct PackageConfig {
     name: Option<String>,
+    /// Reverse-DNS base for the macOS `CFBundleIdentifier`. The bundle's format extension
+    /// (`vst3`, `clap`, `app`) is appended so each format gets a distinct identifier. Falls back
+    /// to `com.nih-plug.<package>` when unset.
+    identifier: Option<String>,
 }
 
 /// The target we're generating a plugin for. This can be either the native target or a cross
@@ -342,7 +346,7 @@ fn bundle_binary(
 ) -> Result<()> {
     let bundle_home_dir = bundle_home(target_dir);
     let bundle_name = match load_bundler_config()?.and_then(|c| c.get(package).cloned()) {
-        Some(PackageConfig { name: Some(name) }) => name,
+        Some(PackageConfig { name: Some(name), .. }) => name,
         _ => package.to_string(),
     };
 
@@ -406,7 +410,7 @@ fn bundle_plugin(
 ) -> Result<()> {
     let bundle_home_dir = bundle_home(target_dir);
     let bundle_name = match load_bundler_config()?.and_then(|c| c.get(package).cloned()) {
-        Some(PackageConfig { name: Some(name) }) => name,
+        Some(PackageConfig { name: Some(name), .. }) => name,
         _ => package.to_string(),
     };
 
@@ -750,8 +754,32 @@ pub fn maybe_create_macos_bundle_metadata(
         BundleType::Binary => "APPL",
     };
 
-    // TODO: May want to add bundler.toml fields for the identifier, version and signature at some
-    //       point.
+    let bundle_identifier = match load_bundler_config()?.and_then(|c| c.get(package).cloned()) {
+        Some(PackageConfig {
+            identifier: Some(identifier),
+            ..
+        }) => match bundle_home.extension().and_then(|ext| ext.to_str()) {
+            Some(extension) => format!("{identifier}.{extension}"),
+            None => identifier,
+        },
+        _ => format!("com.nih-plug.{package}"),
+    };
+    // The plist version fields should carry the real package version rather than upstream's
+    // hardcoded 1.0.0; fall back to that only if the package can't be resolved.
+    let bundle_version = cargo_metadata::MetadataCommand::new()
+        .manifest_path("./Cargo.toml")
+        .no_deps()
+        .exec()
+        .ok()
+        .and_then(|metadata| {
+            metadata
+                .packages
+                .iter()
+                .find(|p| p.name == package)
+                .map(|p| p.version.to_string())
+        })
+        .unwrap_or_else(|| String::from("1.0.0"));
+
     fs::write(
         bundle_home.join("Contents").join("PkgInfo"),
         format!("{package_type}????"),
@@ -769,7 +797,7 @@ pub fn maybe_create_macos_bundle_metadata(
     <key>CFBundleIconFile</key>
     <string></string>
     <key>CFBundleIdentifier</key>
-    <string>com.nih-plug.{package}</string>
+    <string>{bundle_identifier}</string>
     <key>CFBundleName</key>
     <string>{display_name}</string>
     <key>CFBundleDisplayName</key>
@@ -779,9 +807,9 @@ pub fn maybe_create_macos_bundle_metadata(
     <key>CFBundleSignature</key>
     <string>????</string>
     <key>CFBundleShortVersionString</key>
-    <string>1.0.0</string>
+    <string>{bundle_version}</string>
     <key>CFBundleVersion</key>
-    <string>1.0.0</string>
+    <string>{bundle_version}</string>
     <key>NSHumanReadableCopyright</key>
     <string></string>
     <key>NSHighResolutionCapable</key>
