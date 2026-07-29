@@ -1280,7 +1280,21 @@ impl<P: Vst3Plugin> IAudioProcessorTrait for Wrapper<P> {
                                     .enumerate()
                                 {
                                     let aux_input_idx = aux_input_no + aux_input_start_idx;
-                                    if aux_input_idx > data.numOutputs as usize {
+                                    // Bound against the INPUTS array this indexes into, not
+                                    // the outputs array. Two bugs in one line: it compared
+                                    // against `numOutputs` (a different array's length), and
+                                    // used `>` where the last valid index is `len - 1`.
+                                    //
+                                    // It happened to work whenever a plugin declared as many
+                                    // output buses as input buses. It does not when a host
+                                    // passes fewer input buses than were declared — an
+                                    // unconnected sidechain reporting `numInputs == 0` — where
+                                    // the old check let the loop dereference `data.inputs[0]`
+                                    // on an empty array. `!data.inputs.is_null()` above does
+                                    // not catch that (a non-null empty array passes), and the
+                                    // `channelBuffers32` NonNull check below happens after the
+                                    // read. The CLAP wrapper already bounds this correctly.
+                                    if aux_input_idx >= data.numInputs as usize {
                                         break;
                                     }
 
@@ -1306,7 +1320,11 @@ impl<P: Vst3Plugin> IAudioProcessorTrait for Wrapper<P> {
                                     .enumerate()
                                 {
                                     let aux_output_idx = aux_output_no + aux_output_start_idx;
-                                    if aux_output_idx > data.numOutputs as usize {
+                                    // `>=`: the last valid index into an array of
+                                    // `numOutputs` entries is `numOutputs - 1`. This one at
+                                    // least bounds against the right array, unlike the aux
+                                    // input loop above.
+                                    if aux_output_idx >= data.numOutputs as usize {
                                         break;
                                     }
 
