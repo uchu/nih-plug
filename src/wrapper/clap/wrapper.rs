@@ -2108,7 +2108,15 @@ impl<P: ClapPlugin> Wrapper<P> {
                                 .enumerate()
                             {
                                 let aux_input_idx = aux_input_no + aux_input_start_idx;
-                                if aux_input_idx > process.audio_inputs_count as usize {
+                                // `>=`: the last valid index into an array of
+                                // `audio_inputs_count` entries is one less than
+                                // the count. With a sidechain left unconnected
+                                // the count is 0 and `0 > 0` let the loop
+                                // dereference an empty array — the
+                                // `!audio_inputs.is_null()` guard above does not
+                                // catch a non-null empty array, and the `data32`
+                                // NonNull check below happens after the read.
+                                if aux_input_idx >= process.audio_inputs_count as usize {
                                     break;
                                 }
 
@@ -2132,7 +2140,8 @@ impl<P: ClapPlugin> Wrapper<P> {
                                 .enumerate()
                             {
                                 let aux_output_idx = aux_output_no + aux_output_start_idx;
-                                if aux_output_idx > process.audio_outputs_count as usize {
+                                // Same off-by-one, mirrored (see above).
+                                if aux_output_idx >= process.audio_outputs_count as usize {
                                     break;
                                 }
 
