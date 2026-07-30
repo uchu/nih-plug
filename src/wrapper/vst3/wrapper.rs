@@ -751,7 +751,16 @@ impl<P: Vst3Plugin> IAudioProcessorTrait for Wrapper<P> {
                 // NOTE: We completely ignore the speaker arrangements and only look at the channel
                 //       counts here. This may cause issues at some point, but it works for now.
                 let has_main_input = layout.main_input_channels.is_some();
-                let aux_input_start_idx = if has_main_input { 0 } else { 1 };
+                // A main input, when present, occupies index 0 and pushes the
+                // aux ports to 1 — so this is `1` WITH a main input, not
+                // without. It was inverted here and only here; getBusInfo,
+                // getBusArrangement and process all have it the right way
+                // round. For a plugin with no main input and one aux port
+                // (an instrument with a sidechain) the array holds exactly one
+                // bus, and the inverted index read one past the end: the
+                // garbage channel count never matched, every layout was
+                // rejected, and the host silently never enabled the sidechain.
+                let aux_input_start_idx = if has_main_input { 1 } else { 0 };
                 if has_main_input
                     && (*inputs).count_ones() != layout.main_input_channels.unwrap().get()
                 {
@@ -766,7 +775,8 @@ impl<P: Vst3Plugin> IAudioProcessorTrait for Wrapper<P> {
                 }
 
                 let has_main_output = layout.main_output_channels.is_some();
-                let aux_output_start_idx = if has_main_output { 0 } else { 1 };
+                // Same inversion, mirrored (see above).
+                let aux_output_start_idx = if has_main_output { 1 } else { 0 };
                 if (*outputs).count_ones()
                     != layout
                         .main_output_channels
