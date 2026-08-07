@@ -25,7 +25,7 @@ pub use crate::context::remote_controls::{
 };
 pub use crate::context::PluginApi;
 // This also includes the derive macro
-pub use crate::editor::{Editor, ParentWindowHandle};
+pub use crate::editor::{Editor, ParentWindowHandle, ResizeHints};
 pub use crate::midi::sysex::SysExMessage;
 pub use crate::midi::{control_change, MidiConfig, NoteEvent, PluginNoteEvent};
 pub use crate::params::enums::{Enum, EnumParam};

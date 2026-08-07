@@ -73,7 +73,86 @@ pub trait Editor: Send {
     //       and API agnostic, add a way to ask the GuiContext if the wrapper already provides a
     //       tick function. If it does not, then the Editor implementation must handle this by
     //       itself. This would also need an associated `PREFERRED_FRAME_RATE` constant.
-    // TODO: Host->Plugin resizing
+
+    /// Return `Some(..)` to let the host resize this editor. Defaults to `None`, which keeps the
+    /// fixed-size behavior every editor had before this existed: the wrappers then tell the host
+    /// the editor cannot be resized and reject any size but its own.
+    fn resize_hints(&self) -> Option<ResizeHints> {
+        None
+    }
+
+    /// Called when the host has resized the editor's parent window to `width` by `height` _logical
+    /// pixels_, i.e. after dividing out the DPI scaling factor. Return `false` to reject the size.
+    /// Only ever called when [`resize_hints()`][Self::resize_hints()] returns `Some(..)`, since the
+    /// default implementation rejects everything.
+    fn set_size(&self, _width: u32, _height: u32) -> bool {
+        false
+    }
+}
+
+/// Constraints a host must respect when resizing an editor, returned from
+/// [`Editor::resize_hints()`]. All sizes are in logical pixels, like [`Editor::size()`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ResizeHints {
+    pub min_width: u32,
+    pub min_height: u32,
+    /// Whether the editor must keep the aspect ratio it currently has.
+    pub preserve_aspect_ratio: bool,
+}
+
+impl ResizeHints {
+    /// The smallest integer aspect ratio that expresses `size`, as the `(width, height)` pair
+    /// CLAP's `clap_gui_resize_hints` asks for.
+    pub fn aspect_ratio(size: (u32, u32)) -> (u32, u32) {
+        let (width, height) = (size.0.max(1), size.1.max(1));
+        let divisor = gcd(width, height);
+
+        (width / divisor, height / divisor)
+    }
+
+    /// Correct a size the host asked for into one this editor accepts: never smaller than the
+    /// minimum, and on `current_size`'s aspect ratio when that has to be preserved. The result fits
+    /// inside `requested` unless the minimum forces it larger.
+    pub fn adjust_size(&self, current_size: (u32, u32), requested: (u32, u32)) -> (u32, u32) {
+        let (width, height) = (requested.0.max(1), requested.1.max(1));
+        if !self.preserve_aspect_ratio {
+            return (width.max(self.min_width), height.max(self.min_height));
+        }
+
+        let (ratio_width, ratio_height) = Self::aspect_ratio(current_size);
+        // Whole multiples of the reduced ratio land on it exactly, so a run of resizes can never
+        // accumulate rounding error. A current size that barely reduces has no usable grid — its
+        // steps would be as large as the window — so scale that directly instead.
+        if ratio_width > width / 8 || ratio_height > height / 8 {
+            let (current_width, current_height) =
+                (current_size.0.max(1) as f64, current_size.1.max(1) as f64);
+            let scale = (width as f64 / current_width)
+                .min(height as f64 / current_height)
+                .max(self.min_width as f64 / current_width)
+                .max(self.min_height as f64 / current_height);
+
+            return (
+                (current_width * scale).round().max(1.0) as u32,
+                (current_height * scale).round().max(1.0) as u32,
+            );
+        }
+
+        let steps = (width / ratio_width)
+            .min(height / ratio_height)
+            .max(self.min_width.div_ceil(ratio_width))
+            .max(self.min_height.div_ceil(ratio_height))
+            .max(1);
+
+        (steps * ratio_width, steps * ratio_height)
+    }
+}
+
+fn gcd(mut a: u32, mut b: u32) -> u32 {
+    while b != 0 {
+        (a, b) = (b, a % b);
+    }
+
+    a.max(1)
 }
 
 /// A raw window handle for platform and GUI framework agnostic editors. This implements
@@ -109,5 +188,61 @@ unsafe impl HasRawWindowHandle for ParentWindowHandle {
                 RawWindowHandle::Win32(handle)
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const HINTS: ResizeHints = ResizeHints {
+        min_width: 640,
+        min_height: 360,
+        preserve_aspect_ratio: true,
+    };
+
+    #[test]
+    fn aspect_ratio_reduces() {
+        assert_eq!(ResizeHints::aspect_ratio((1280, 720)), (16, 9));
+        assert_eq!(ResizeHints::aspect_ratio((0, 0)), (1, 1));
+    }
+
+    #[test]
+    fn adjusted_sizes_keep_the_ratio_exactly() {
+        for requested in [(1000, 800), (1920, 1080), (700, 400), (2000, 500)] {
+            let (width, height) = HINTS.adjust_size((1280, 720), requested);
+            assert_eq!(ResizeHints::aspect_ratio((width, height)), (16, 9));
+            assert!(width >= HINTS.min_width && height >= HINTS.min_height);
+        }
+    }
+
+    #[test]
+    fn adjusted_sizes_fit_inside_the_request() {
+        let (width, height) = HINTS.adjust_size((1280, 720), (1000, 800));
+        assert!(width <= 1000 && height <= 800);
+    }
+
+    #[test]
+    fn the_minimum_wins_over_the_request() {
+        assert_eq!(HINTS.adjust_size((1280, 720), (16, 9)), (640, 360));
+    }
+
+    #[test]
+    fn a_coarse_ratio_still_scales() {
+        // A size that does not reduce has no grid to snap to, so shrinking must still work.
+        let current = (1009, 563);
+        let (width, height) = HINTS.adjust_size(current, (800, 800));
+        assert!(width < current.0 && width >= HINTS.min_width);
+        assert!((width as f64 / height as f64 - current.0 as f64 / current.1 as f64).abs() < 0.01);
+    }
+
+    #[test]
+    fn free_resizing_only_clamps() {
+        let hints = ResizeHints {
+            preserve_aspect_ratio: false,
+            ..HINTS
+        };
+        assert_eq!(hints.adjust_size((1280, 720), (1000, 800)), (1000, 800));
+        assert_eq!(hints.adjust_size((1280, 720), (100, 100)), (640, 360));
     }
 }

@@ -87,7 +87,7 @@ use crate::plugin::clap::PresetLoadContext;
 use crate::prelude::{
     AsyncExecutor, AudioIOLayout, AuxiliaryBuffers, BufferConfig, ClapPlugin, Editor, MidiConfig,
     NoteEvent, ParamFlags, ParamPtr, Params, ParentWindowHandle, Plugin, PluginNoteEvent,
-    ProcessMode, ProcessStatus, SysExMessage, TaskExecutor, Transport,
+    ProcessMode, ProcessStatus, ResizeHints, SysExMessage, TaskExecutor, Transport,
 };
 use crate::util::permit_alloc;
 use crate::wrapper::clap::context::RemoteControlPages;
@@ -2750,26 +2750,72 @@ impl<P: ClapPlugin> Wrapper<P> {
         true
     }
 
-    unsafe extern "C" fn ext_gui_can_resize(_plugin: *const clap_plugin) -> bool {
-        // TODO: Implement Host->Plugin GUI resizing
-        false
+    unsafe extern "C" fn ext_gui_can_resize(plugin: *const clap_plugin) -> bool {
+        check_null_ptr!(false, plugin, (*plugin).plugin_data);
+        let wrapper = &*((*plugin).plugin_data as *const Self);
+
+        let editor = wrapper.editor.borrow();
+        let editor = editor.as_ref().unwrap().lock();
+
+        editor.resize_hints().is_some()
     }
 
     unsafe extern "C" fn ext_gui_get_resize_hints(
-        _plugin: *const clap_plugin,
-        _hints: *mut clap_gui_resize_hints,
+        plugin: *const clap_plugin,
+        hints: *mut clap_gui_resize_hints,
     ) -> bool {
-        // TODO: Implement Host->Plugin GUI resizing
-        false
+        check_null_ptr!(false, plugin, (*plugin).plugin_data, hints);
+        let wrapper = &*((*plugin).plugin_data as *const Self);
+
+        let editor = wrapper.editor.borrow();
+        let editor = editor.as_ref().unwrap().lock();
+        let Some(editor_hints) = editor.resize_hints() else {
+            return false;
+        };
+
+        // CLAP has no field for a minimum size, so that is enforced through `adjust_size()`.
+        let (aspect_ratio_width, aspect_ratio_height) = ResizeHints::aspect_ratio(editor.size());
+        *hints = clap_gui_resize_hints {
+            can_resize_horizontally: true,
+            can_resize_vertically: true,
+            preserve_aspect_ratio: editor_hints.preserve_aspect_ratio,
+            aspect_ratio_width,
+            aspect_ratio_height,
+        };
+
+        true
     }
 
     unsafe extern "C" fn ext_gui_adjust_size(
-        _plugin: *const clap_plugin,
-        _width: *mut u32,
-        _height: *mut u32,
+        plugin: *const clap_plugin,
+        width: *mut u32,
+        height: *mut u32,
     ) -> bool {
-        // TODO: Implement Host->Plugin GUI resizing
-        false
+        check_null_ptr!(false, plugin, (*plugin).plugin_data, width, height);
+        let wrapper = &*((*plugin).plugin_data as *const Self);
+
+        let editor = wrapper.editor.borrow();
+        let editor = editor.as_ref().unwrap().lock();
+        let Some(editor_hints) = editor.resize_hints() else {
+            return false;
+        };
+
+        // The host works in physical pixels, the editor in logical ones, so the scaling factor
+        // `ext_gui_get_size()` multiplies by has to be divided back out here.
+        let scaling_factor = wrapper.editor_scaling_factor.load(Ordering::Relaxed);
+        let (adjusted_width, adjusted_height) = editor_hints.adjust_size(
+            editor.size(),
+            (
+                (*width as f32 / scaling_factor).round().max(1.0) as u32,
+                (*height as f32 / scaling_factor).round().max(1.0) as u32,
+            ),
+        );
+        (*width, *height) = (
+            (adjusted_width as f32 * scaling_factor).round() as u32,
+            (adjusted_height as f32 * scaling_factor).round() as u32,
+        );
+
+        true
     }
 
     unsafe extern "C" fn ext_gui_set_size(
@@ -2777,20 +2823,26 @@ impl<P: ClapPlugin> Wrapper<P> {
         width: u32,
         height: u32,
     ) -> bool {
-        // TODO: Implement Host->Plugin GUI resizing
         // TODO: The host will also call this if an asynchronous (on Linux) resize request fails
         check_null_ptr!(false, plugin, (*plugin).plugin_data);
         let wrapper = &*((*plugin).plugin_data as *const Self);
 
-        let (unscaled_width, unscaled_height) =
-            wrapper.editor.borrow().as_ref().unwrap().lock().size();
+        let editor = wrapper.editor.borrow();
+        let editor = editor.as_ref().unwrap().lock();
+        let (unscaled_width, unscaled_height) = editor.size();
         let scaling_factor = wrapper.editor_scaling_factor.load(Ordering::Relaxed);
         let (editor_width, editor_height) = (
             (unscaled_width as f32 * scaling_factor).round() as u32,
             (unscaled_height as f32 * scaling_factor).round() as u32,
         );
+        if width == editor_width && height == editor_height {
+            return true;
+        }
 
-        width == editor_width && height == editor_height
+        editor.set_size(
+            (width as f32 / scaling_factor).round().max(1.0) as u32,
+            (height as f32 / scaling_factor).round().max(1.0) as u32,
+        )
     }
 
     unsafe extern "C" fn ext_gui_set_parent(

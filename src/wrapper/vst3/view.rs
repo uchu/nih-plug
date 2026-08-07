@@ -6,8 +6,8 @@ use std::mem;
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use vst3::Steinberg::{
-    char16, int16, kInvalidArgument, kNotImplemented, kResultFalse, kResultOk, tresult, FIDString,
-    TBool,
+    char16, int16, kInvalidArgument, kNotImplemented, kResultFalse, kResultOk, kResultTrue, tresult,
+    FIDString, TBool,
 };
 use vst3::Steinberg::{
     IPlugFrame, IPlugFrameTrait, IPlugView, IPlugViewContentScaleSupport,
@@ -382,17 +382,29 @@ impl<P: Vst3Plugin> IPlugViewTrait for WrapperView<P> {
     unsafe fn onSize(&self, new_size: *mut ViewRect) -> tresult {
         check_null_ptr!(new_size);
 
-        // TODO: Implement Host->Plugin resizing
-        let (unscaled_width, unscaled_height) = self.editor.lock().size();
+        let width = (*new_size).right - (*new_size).left;
+        let height = (*new_size).bottom - (*new_size).top;
+        if width <= 0 || height <= 0 {
+            return kResultFalse;
+        }
+
+        let editor = self.editor.lock();
+        let (unscaled_width, unscaled_height) = editor.size();
         let scaling_factor = self.scaling_factor.load(Ordering::Relaxed);
         let (editor_width, editor_height) = (
             (unscaled_width as f32 * scaling_factor).round() as i32,
             (unscaled_height as f32 * scaling_factor).round() as i32,
         );
-
-        let width = (*new_size).right - (*new_size).left;
-        let height = (*new_size).bottom - (*new_size).top;
         if width == editor_width && height == editor_height {
+            return kResultOk;
+        }
+
+        // The host works in physical pixels, the editor in logical ones, so the scaling factor
+        // `getSize()` multiplies by has to be divided back out here.
+        if editor.set_size(
+            (width as f32 / scaling_factor).round().max(1.0) as u32,
+            (height as f32 / scaling_factor).round().max(1.0) as u32,
+        ) {
             kResultOk
         } else {
             kResultFalse
@@ -429,19 +441,43 @@ impl<P: Vst3Plugin> IPlugViewTrait for WrapperView<P> {
     }
 
     unsafe fn canResize(&self) -> tresult {
-        // TODO: Implement Host->Plugin resizing
-        kResultFalse
+        if self.editor.lock().resize_hints().is_some() {
+            kResultTrue
+        } else {
+            kResultFalse
+        }
     }
 
     unsafe fn checkSizeConstraint(&self, rect: *mut ViewRect) -> tresult {
         check_null_ptr!(rect);
 
-        // TODO: Implement Host->Plugin resizing
-        if (*rect).right - (*rect).left > 0 && (*rect).bottom - (*rect).top > 0 {
-            kResultOk
-        } else {
-            kResultFalse
+        let rect = &mut *rect;
+        let width = rect.right - rect.left;
+        let height = rect.bottom - rect.top;
+        if width <= 0 || height <= 0 {
+            return kResultFalse;
         }
+
+        let editor = self.editor.lock();
+        let Some(hints) = editor.resize_hints() else {
+            // A fixed-size editor has nothing to correct, and the host already knows it cannot
+            // resize this view.
+            return kResultOk;
+        };
+
+        let scaling_factor = self.scaling_factor.load(Ordering::Relaxed);
+        let (adjusted_width, adjusted_height) = hints.adjust_size(
+            editor.size(),
+            (
+                (width as f32 / scaling_factor).round().max(1.0) as u32,
+                (height as f32 / scaling_factor).round().max(1.0) as u32,
+            ),
+        );
+
+        rect.right = rect.left + (adjusted_width as f32 * scaling_factor).round() as i32;
+        rect.bottom = rect.top + (adjusted_height as f32 * scaling_factor).round() as i32;
+
+        kResultOk
     }
 }
 
