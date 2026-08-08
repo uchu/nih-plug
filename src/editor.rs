@@ -83,8 +83,12 @@ pub trait Editor: Send {
 
     /// Called when the host has resized the editor's parent window to `width` by `height` _logical
     /// pixels_, i.e. after dividing out the DPI scaling factor. Return `false` to reject the size.
-    /// Only ever called when [`resize_hints()`][Self::resize_hints()] returns `Some(..)`, since the
-    /// default implementation rejects everything.
+    ///
+    /// The wrappers call this unconditionally and rely on the default implementation to refuse, so
+    /// an editor that does not return hints from [`resize_hints()`][Self::resize_hints()] stays
+    /// fixed-size. An editor that does is only ever handed a size that already satisfies those
+    /// hints — the wrappers reject anything else before it gets here — and is responsible for
+    /// actually resizing the window it spawned, since the host resized only its own parent window.
     fn set_size(&self, _width: u32, _height: u32) -> bool {
         false
     }

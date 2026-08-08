@@ -23,7 +23,8 @@ pub trait GuiContext: Send + Sync + 'static {
     /// somehow didn't like this and rejected the resize, in which case the window should revert to
     /// its old size. You should only actually resize your embedded window once this returns `true`.
     ///
-    /// TODO: Host->Plugin resizing has not been implemented yet
+    /// This is the plugin->host direction. For the host->plugin direction, see
+    /// [`Editor::resize_hints()`][crate::prelude::Editor::resize_hints()].
     fn request_resize(&self) -> bool;
 
     /// Inform the host a parameter will be automated. Create a [`ParamSetter`] and use

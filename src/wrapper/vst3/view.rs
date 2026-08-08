@@ -401,10 +401,23 @@ impl<P: Vst3Plugin> IPlugViewTrait for WrapperView<P> {
 
         // The host works in physical pixels, the editor in logical ones, so the scaling factor
         // `getSize()` multiplies by has to be divided back out here.
-        if editor.set_size(
+        let requested = (
             (width as f32 / scaling_factor).round().max(1.0) as u32,
             (height as f32 / scaling_factor).round().max(1.0) as u32,
-        ) {
+        );
+
+        // Calling `checkSizeConstraint()` first is only a recommendation in the VST3 docs, so a
+        // host may hand over a size that violates the editor's constraints. Refusing here is what
+        // keeps the editor on a size its own hints allow — `getResizeHints()` derives the aspect
+        // ratio it advertises from the current size, so one accepted off-ratio size would poison
+        // every later resize.
+        if let Some(hints) = editor.resize_hints() {
+            if hints.adjust_size(editor.size(), requested) != requested {
+                return kResultFalse;
+            }
+        }
+
+        if editor.set_size(requested.0, requested.1) {
             kResultOk
         } else {
             kResultFalse

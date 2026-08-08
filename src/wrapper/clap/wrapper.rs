@@ -2839,10 +2839,22 @@ impl<P: ClapPlugin> Wrapper<P> {
             return true;
         }
 
-        editor.set_size(
+        let requested = (
             (width as f32 / scaling_factor).round().max(1.0) as u32,
             (height as f32 / scaling_factor).round().max(1.0) as u32,
-        )
+        );
+
+        // CLAP only recommends that the host call `adjust_size()` first, so refuse a size that
+        // violates the editor's constraints rather than letting it through — `get_resize_hints()`
+        // derives the advertised aspect ratio from the current size, so one accepted off-ratio
+        // size would poison every later resize.
+        if let Some(editor_hints) = editor.resize_hints() {
+            if editor_hints.adjust_size(editor.size(), requested) != requested {
+                return false;
+            }
+        }
+
+        editor.set_size(requested.0, requested.1)
     }
 
     unsafe extern "C" fn ext_gui_set_parent(
