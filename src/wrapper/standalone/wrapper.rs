@@ -116,6 +116,29 @@ pub enum Task<P: Plugin> {
     ParameterValueChanged(ParamPtr, f32),
 }
 
+/// Give the audio callback's thread real-time scheduling. cpal 0.15's WASAPI
+/// host tries this itself but hands `SetThreadPriority` a thread ID where a
+/// HANDLE is required, so the call fails silently and the callback runs at
+/// NORMAL priority — on a loaded machine (software-rendered webview, RDP
+/// encoders) it then misses its ~10 ms WASAPI deadline and Windows inserts
+/// silence with no diagnostics. MMCSS "Pro Audio" is the proper mechanism;
+/// plain TIME_CRITICAL is the fallback when the service is unavailable.
+#[cfg(target_os = "windows")]
+fn promote_audio_thread() {
+    use windows::core::w;
+    use windows::Win32::System::Threading::{
+        AvSetMmThreadCharacteristicsW, GetCurrentThread, SetThreadPriority,
+        THREAD_PRIORITY_TIME_CRITICAL,
+    };
+
+    unsafe {
+        let mut task_index = 0u32;
+        if AvSetMmThreadCharacteristicsW(w!("Pro Audio"), &mut task_index).is_err() {
+            SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_TIME_CRITICAL);
+        }
+    }
+}
+
 /// Errors that may arise while initializing the wrapped plugins.
 #[derive(Debug, Clone, Copy)]
 pub enum WrapperError {
@@ -597,10 +620,20 @@ impl<P: Plugin, B: Backend<P>> Wrapper<P, B> {
                 let gui_task_sender = gui_task_sender.clone();
                 let should_stop = should_terminate.clone();
                 let should_terminate = should_terminate.clone();
+                // Every stream (re)start gets a fresh cpal audio thread, so the
+                // promotion flag lives with the per-attempt callback.
+                #[cfg(target_os = "windows")]
+                let mut audio_thread_promoted = false;
                 // The process callback is consumed by `run()`, so it's rebuilt for every attempt.
                 self.backend.borrow_mut().run(
                     should_stop,
                     move |buffer, aux, transport, input_events, output_events| {
+                        #[cfg(target_os = "windows")]
+                        if !audio_thread_promoted {
+                            audio_thread_promoted = true;
+                            promote_audio_thread();
+                        }
+
                         // TODO: This process wrapper should actually be in the backends (since the backends
                         //       should also not allocate in their audio callbacks), but that's a bit more
                         //       error prone
