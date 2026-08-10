@@ -821,7 +821,20 @@ impl CpalMidir {
     {
         // This callback needs to copy input samples to a ring buffer that can be read from in the
         // output data callback
+        #[cfg(target_os = "windows")]
+        let mut input_thread_promoted = false;
         move |data, _info| {
+            // The promoted output callback busy-spins on this thread's ring
+            // (see the pop loop in the output callback) — leaving the capture
+            // thread at cpal's silently-broken NORMAL priority would be a
+            // priority inversion: a real-time spinner starved of the very
+            // samples it waits for.
+            #[cfg(target_os = "windows")]
+            if !input_thread_promoted {
+                input_thread_promoted = true;
+                super::super::wrapper::promote_audio_thread();
+            }
+
             for sample in data {
                 // If for whatever reason the input callback is fired twice before an output
                 // callback, then just spin on this until the push succeeds

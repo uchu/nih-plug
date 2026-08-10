@@ -124,7 +124,7 @@ pub enum Task<P: Plugin> {
 /// silence with no diagnostics. MMCSS "Pro Audio" is the proper mechanism;
 /// plain TIME_CRITICAL is the fallback when the service is unavailable.
 #[cfg(target_os = "windows")]
-fn promote_audio_thread() {
+pub(super) fn promote_audio_thread() {
     use windows::core::w;
     use windows::Win32::System::Threading::{
         AvSetMmThreadCharacteristicsW, GetCurrentThread, SetThreadPriority,
