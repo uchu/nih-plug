@@ -135,6 +135,13 @@ struct WrapperWindowHandler {
     /// Runs [`Wrapper::apply_param_changes_without_audio`] every frame. Boxed so this struct does
     /// not need the wrapper's type parameters.
     param_flush: Box<dyn FnMut()>,
+
+    /// Forwards a user-driven resize of this outer window to the editor's own (child) window.
+    /// Windows needs this: nothing else moves the child when the user drags the frame, so the
+    /// editor stayed at its opening size with unpainted window around it. macOS must NOT use it —
+    /// the NSView autoresizing masks already cascade the resize, and the editor side treats a
+    /// standalone `set_size` there as a hosted pending resize.
+    editor_resized: Box<dyn FnMut(u32, u32)>,
 }
 
 /// A message sent to the GUI thread.
@@ -162,7 +169,17 @@ impl WindowHandler for WrapperWindowHandler {
         }
     }
 
-    fn on_event(&mut self, _window: &mut Window, _event: baseview::Event) -> EventStatus {
+    fn on_event(&mut self, _window: &mut Window, event: baseview::Event) -> EventStatus {
+        #[cfg(not(target_os = "macos"))]
+        if let baseview::Event::Window(baseview::WindowEvent::Resized(info)) = &event {
+            let logical = info.logical_size();
+            (self.editor_resized)(
+                logical.width.round().max(1.0) as u32,
+                logical.height.round().max(1.0) as u32,
+            );
+        }
+        #[cfg(target_os = "macos")]
+        let _ = &event;
         EventStatus::Ignored
     }
 }
@@ -341,6 +358,7 @@ impl<P: Plugin, B: Backend<P>> Wrapper<P, B> {
         match self.editor.borrow().clone() {
             Some(editor) => {
                 let param_flush_wrapper = self.clone();
+                let resize_editor = editor.clone();
                 let context = self.clone().make_gui_context();
 
                 // DPI scaling should not be used on macOS since the OS handles it there
@@ -391,6 +409,9 @@ impl<P: Plugin, B: Backend<P>> Wrapper<P, B> {
                             gui_task_receiver,
                             param_flush: Box::new(move || {
                                 param_flush_wrapper.apply_param_changes_without_audio()
+                            }),
+                            editor_resized: Box::new(move |width, height| {
+                                resize_editor.lock().set_size(width, height);
                             }),
                         }
                     },
