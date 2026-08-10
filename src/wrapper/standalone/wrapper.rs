@@ -6,7 +6,7 @@ use parking_lot::Mutex;
 use raw_window_handle::HasRawWindowHandle;
 use std::any::Any;
 use std::collections::{HashMap, HashSet};
-use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::thread;
 use std::time::{Duration, Instant};
@@ -89,6 +89,15 @@ pub struct Wrapper<P: Plugin, B: Backend<P>> {
     /// still kept track of to avoid firing debug assertions multiple times for the same latency
     /// value.
     current_latency: AtomicU32,
+
+    /// When the wrapper was created; the base for [`Self::audio_heartbeat`].
+    created_at: Instant,
+    /// Milliseconds since `created_at` of the most recent audio callback.
+    /// [`Self::apply_param_changes_without_audio`] uses this to detect that no
+    /// callback is running (no output device, exhausted retries, mid-backoff)
+    /// and drains the parameter queue from the GUI thread instead — otherwise
+    /// the editor freezes solid on machines without usable audio.
+    audio_heartbeat: AtomicU64,
 }
 
 /// Tasks that can be sent from the plugin to be executed on the main thread in a non-blocking
@@ -122,6 +131,10 @@ struct WrapperWindowHandler {
     /// This is used to communicate with the wrapper from the audio thread and from within the
     /// baseview window handler on the GUI thread.
     gui_task_receiver: channel::Receiver<GuiTask>,
+
+    /// Runs [`Wrapper::apply_param_changes_without_audio`] every frame. Boxed so this struct does
+    /// not need the wrapper's type parameters.
+    param_flush: Box<dyn FnMut()>,
 }
 
 /// A message sent to the GUI thread.
@@ -134,6 +147,8 @@ pub enum GuiTask {
 
 impl WindowHandler for WrapperWindowHandler {
     fn on_frame(&mut self, window: &mut Window) {
+        (self.param_flush)();
+
         while let Ok(task) = self.gui_task_receiver.try_recv() {
             match task {
                 GuiTask::Resize(new_width, new_height) => {
@@ -254,6 +269,8 @@ impl<P: Plugin, B: Backend<P>> Wrapper<P, B> {
             updated_state_sender,
             updated_state_receiver,
             current_latency: AtomicU32::new(0),
+            created_at: Instant::now(),
+            audio_heartbeat: AtomicU64::new(0),
         });
 
         *wrapper.event_loop.borrow_mut() =
@@ -323,6 +340,7 @@ impl<P: Plugin, B: Backend<P>> Wrapper<P, B> {
 
         match self.editor.borrow().clone() {
             Some(editor) => {
+                let param_flush_wrapper = self.clone();
                 let context = self.clone().make_gui_context();
 
                 // DPI scaling should not be used on macOS since the OS handles it there
@@ -371,6 +389,9 @@ impl<P: Plugin, B: Backend<P>> Wrapper<P, B> {
                         WrapperWindowHandler {
                             _editor_handle: editor_handle,
                             gui_task_receiver,
+                            param_flush: Box::new(move || {
+                                param_flush_wrapper.apply_param_changes_without_audio()
+                            }),
                         }
                     },
                 )
@@ -418,6 +439,38 @@ impl<P: Plugin, B: Backend<P>> Wrapper<P, B> {
         nih_debug_assert!(push_successful, "The parameter change queue was full");
 
         push_successful
+    }
+
+    /// Apply queued GUI parameter changes when no audio callback is running
+    /// (no output device, exhausted stream retries, mid-backoff). The queue is
+    /// normally drained at the end of every processing cycle; without a
+    /// running stream nothing drains it, so every control in the editor
+    /// freezes and, once the queue fills, further changes are dropped
+    /// entirely. Called from the GUI thread on every window frame; the
+    /// heartbeat gate keeps it inert while audio is alive. The queue is
+    /// lock-free, so a stream reviving mid-drain merely splits the backlog
+    /// between the two threads, and smoothers are reset rather than ramped
+    /// because there is no stream to run the ramp.
+    pub fn apply_param_changes_without_audio(&self) {
+        /// Comfortably longer than any realistic buffer period, short enough
+        /// that the editor stays responsive while the stream is down.
+        const AUDIO_SILENT_AFTER_MS: u64 = 250;
+
+        let last_callback = self.audio_heartbeat.load(Ordering::Relaxed);
+        let now = self.created_at.elapsed().as_millis() as u64;
+        if now.saturating_sub(last_callback) < AUDIO_SILENT_AFTER_MS {
+            return;
+        }
+
+        let sample_rate = self.buffer_config.sample_rate;
+        while let Some((param_ptr, normalized_value)) = self.unprocessed_param_changes.pop() {
+            if unsafe { param_ptr.set_normalized_value(normalized_value) } {
+                unsafe { param_ptr.update_smoother(sample_rate, true) };
+                let task_posted =
+                    self.schedule_gui(Task::ParameterValueChanged(param_ptr, normalized_value));
+                nih_debug_assert!(task_posted, "The task queue is full, dropping task...");
+            }
+        }
     }
 
     /// Get the plugin's state object, may be called by the plugin's GUI as part of its own preset
@@ -531,6 +584,11 @@ impl<P: Plugin, B: Backend<P>> Wrapper<P, B> {
                         //       should also not allocate in their audio callbacks), but that's a bit more
                         //       error prone
                         process_wrapper(|| {
+                            this.audio_heartbeat.store(
+                                this.created_at.elapsed().as_millis() as u64,
+                                Ordering::Relaxed,
+                            );
+
                             if should_terminate.load(Ordering::SeqCst) {
                                 return false;
                             }
