@@ -58,6 +58,12 @@ assert_process_allocs = ["dep:assert_no_alloc"]
 # `nih_export_standalone()` function. Disabled by default as this requires
 # building additional dependencies for audio and MIDI handling.
 standalone = ["dep:baseview", "dep:clap", "dep:cpal", "dep:jack", "dep:midir", "dep:rtrb"]
+# The standalone window enforces the editor's minimum size on interactive
+# (drag) resizing via `baseview::Window::set_min_client_size`. That method
+# exists only in Phaseburn's patched baseview (vendored in the consuming
+# workspace and applied over the upstream pin with `[patch]`), so the call is
+# opt-in: enabling this against upstream baseview will not compile.
+baseview-min-size = []
 # Enables the `nih_export_vst3!()` macro. Enabled by default. This feature
 # exists mostly for GPL-compliance reasons, since even if you don't use the VST3
 # wrapper you might otherwise still include a couple (unused) symbols from the

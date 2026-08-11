@@ -169,7 +169,8 @@ struct WrapperWindowHandler {
 
 /// A message sent to the GUI thread.
 pub enum GuiTask {
-    /// Resize the window to the following physical size.
+    /// Resize the window to the following logical size (baseview applies the
+    /// DPI scale factor itself).
     Resize(u32, u32),
     /// The close window. This will cause the application to terminate.
     Close,
@@ -211,17 +212,26 @@ impl<P: Plugin, B: Backend<P>> MainThreadExecutor<Task<P>> for Wrapper<P, B> {
     fn execute(&self, task: Task<P>, _is_gui_thread: bool) {
         match task {
             Task::PluginTask(task) => (self.task_executor.lock())(task),
+            // `try_lock`, not `lock`: these tasks can be dispatched by a
+            // nested message pump while `Editor::spawn` holds the editor
+            // Mutex on this same thread (WebView2 construction pumps, and a
+            // MIDI CC arriving during startup schedules exactly this task) —
+            // a blocking lock would deadlock the GUI thread forever. Dropping
+            // a change notification is harmless: the editor that is still
+            // being constructed has not painted anything to update yet.
             Task::ParameterValuesChanged => {
                 if let Some(editor) = self.editor.borrow().as_ref() {
-                    editor.lock().param_values_changed();
+                    if let Some(editor) = editor.try_lock() {
+                        editor.param_values_changed();
+                    }
                 }
             }
             Task::ParameterValueChanged(param_ptr, normalized_value) => {
                 if let Some(editor) = self.editor.borrow().as_ref() {
-                    let param_id = &self.param_ptr_to_id[&param_ptr];
-                    editor
-                        .lock()
-                        .param_value_changed(param_id, normalized_value);
+                    if let Some(editor) = editor.try_lock() {
+                        let param_id = &self.param_ptr_to_id[&param_ptr];
+                        editor.param_value_changed(param_id, normalized_value);
+                    }
                 }
             }
         }
@@ -405,6 +415,23 @@ impl<P: Plugin, B: Backend<P>> Wrapper<P, B> {
                         gl_config: None,
                     },
                     move |window| {
+                        // Logical minimum from the editor's own resize hints.
+                        // Two uses: the OS-level drag floor below, and the
+                        // clamp inside `editor_resized` for sizes that reach
+                        // the window without interactive tracking (snap
+                        // layouts, programmatic SetWindowPos).
+                        let (min_width, min_height) = editor
+                            .lock()
+                            .resize_hints()
+                            .map(|hints| (hints.min_width, hints.min_height))
+                            .unwrap_or((1, 1));
+
+                        #[cfg(all(target_os = "windows", feature = "baseview-min-size"))]
+                        window.set_min_client_size(Some(baseview::Size {
+                            width: min_width as f64,
+                            height: min_height as f64,
+                        }));
+
                         let parent_handle = match window.raw_window_handle() {
                             raw_window_handle::RawWindowHandle::Xlib(handle) => {
                                 ParentWindowHandle::X11Window(handle.window as u32)
@@ -434,7 +461,9 @@ impl<P: Plugin, B: Backend<P>> Wrapper<P, B> {
                                 param_flush_wrapper.apply_param_changes_without_audio()
                             }),
                             editor_resized: Box::new(move |width, height| {
-                                resize_editor.lock().set_size(width, height);
+                                resize_editor
+                                    .lock()
+                                    .set_size(width.max(min_width), height.max(min_height));
                             }),
                         }
                     },
