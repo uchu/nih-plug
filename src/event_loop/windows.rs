@@ -124,7 +124,10 @@ where
                 Some(Box::into_raw(Box::new(callback)) as *const c_void),
             )
         };
-        assert_ne!(!window.0, 0);
+        // A null HWND here means no cross-thread GUI task will ever run; fail
+        // loudly at construction instead of dying silently later. (This used
+        // to read `!window.0`, whose bitwise NOT made the assert a no-op.)
+        assert_ne!(window.0, 0);
 
         Self {
             executor: executor.clone(),
