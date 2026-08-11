@@ -451,8 +451,10 @@ impl<P: ClapPlugin> MainThreadExecutor<Task<P>> for Wrapper<P> {
 #[allow(non_camel_case_types)]
 #[repr(C)]
 struct clap_plugin_auv2_param_ordering {
-    /// Fill `order` (of `param_count` entries) such that `order[clap_index]` is the AUv2 position
-    /// of the parameter at `clap_index`, each position occurring exactly once. Return false to
+    /// Fill `order` (of `param_count` entries) as a ranked list: `order[auv2_position]` is the
+    /// CLAP parameter index shown at that AUv2 position, each index occurring exactly once
+    /// (matches clap-wrapper's consumption in wrapasauv2.cpp, `clapIndex = ordering[i]`; the
+    /// header comment in clapwrapper/auv2.h describes the inverse and is wrong). Return false to
     /// fall back to the default id-sorted ordering.
     get_param_order: Option<
         unsafe extern "C" fn(plugin: *const clap_plugin, order: *mut usize, param_count: usize) -> bool,
@@ -2437,24 +2439,33 @@ impl<P: ClapPlugin> Wrapper<P> {
             return false;
         }
 
-        let mut position_by_hash: HashMap<u32, usize> = HashMap::with_capacity(id_order.len());
+        // clap-wrapper consumes the array as a ranked list — `order[i]` is the
+        // CLAP parameter index to place at AUv2 position `i` (wrapasauv2.cpp:
+        // `clapIndex = ordering[i]`). The header prose in clapwrapper/auv2.h
+        // describes the inverse; the shipping consumer and its own sort-based
+        // sample code agree on this direction, so this is the one that counts.
+        let mut clap_index_by_hash: HashMap<u32, usize> =
+            HashMap::with_capacity(wrapper.param_hashes.len());
+        for (clap_index, hash) in wrapper.param_hashes.iter().enumerate() {
+            clap_index_by_hash.insert(*hash, clap_index);
+        }
+
+        let order = std::slice::from_raw_parts_mut(order, param_count);
+        let mut seen = vec![false; param_count];
         for (position, id) in id_order.iter().enumerate() {
             let Some(hash) = wrapper.param_id_to_hash.get(*id) else {
                 nih_debug_assert_failure!("auv2_param_id_order() names unknown parameter {:?}", id);
                 return false;
             };
-            if position_by_hash.insert(*hash, position).is_some() {
+            let Some(&clap_index) = clap_index_by_hash.get(hash) else {
+                return false;
+            };
+            if seen[clap_index] {
                 nih_debug_assert_failure!("auv2_param_id_order() repeats parameter {:?}", id);
                 return false;
             }
-        }
-
-        let order = std::slice::from_raw_parts_mut(order, param_count);
-        for (clap_index, hash) in wrapper.param_hashes.iter().enumerate() {
-            match position_by_hash.get(hash) {
-                Some(&position) => order[clap_index] = position,
-                None => return false,
-            }
+            seen[clap_index] = true;
+            order[position] = clap_index;
         }
 
         true
