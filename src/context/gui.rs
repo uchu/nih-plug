@@ -18,6 +18,12 @@ pub trait GuiContext: Send + Sync + 'static {
     /// about screen.
     fn plugin_api(&self) -> PluginApi;
 
+    /// The host's self-reported name, if the plugin API carries one (currently CLAP only, from
+    /// `clap_host.name`). See [`InitContext::host_name()`][crate::context::init::InitContext::host_name()].
+    fn host_name(&self) -> Option<&str> {
+        None
+    }
+
     /// Ask the host to resize the editor window to the size specified by
     /// [`Editor::size()`][crate::prelude::Editor::size()]. This will return false if the host
     /// somehow didn't like this and rejected the resize, in which case the window should revert to

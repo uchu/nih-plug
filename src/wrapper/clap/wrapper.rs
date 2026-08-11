@@ -179,6 +179,10 @@ pub struct Wrapper<P: ClapPlugin> {
 
     // We'll query all of the host's extensions upfront
     host_callback: ClapPtr<clap_host>,
+    /// The host's self-reported `clap_host.name`, captured at construction. Exposed to the plugin
+    /// through the context traits so it can adapt to specific hosts (e.g. clap-wrapper's
+    /// "(CLAP-as-AUv2)" suffix when running as an Audio Unit).
+    pub host_name: Option<String>,
 
     clap_plugin_audio_ports_config: clap_plugin_audio_ports_config,
 
@@ -250,6 +254,8 @@ pub struct Wrapper<P: ClapPlugin> {
     clap_plugin_state: clap_plugin_state,
 
     clap_plugin_tail: clap_plugin_tail,
+
+    clap_plugin_auv2_param_ordering: clap_plugin_auv2_param_ordering,
 
     clap_plugin_voice_info: clap_plugin_voice_info,
     host_voice_info: AtomicRefCell<Option<ClapPtr<clap_host_voice_info>>>,
@@ -439,6 +445,22 @@ impl<P: ClapPlugin> MainThreadExecutor<Task<P>> for Wrapper<P> {
     }
 }
 
+/// clap-wrapper's `clap.plugin-auv2-param-ordering/0` plugin-side extension (from its
+/// `clapwrapper/auv2.h`; not part of clap-sys). When provided, the CLAP-as-AUv2 wrapper exposes
+/// parameters to the AU host in the returned order instead of sorting by CLAP parameter id.
+#[allow(non_camel_case_types)]
+#[repr(C)]
+struct clap_plugin_auv2_param_ordering {
+    /// Fill `order` (of `param_count` entries) such that `order[clap_index]` is the AUv2 position
+    /// of the parameter at `clap_index`, each position occurring exactly once. Return false to
+    /// fall back to the default id-sorted ordering.
+    get_param_order: Option<
+        unsafe extern "C" fn(plugin: *const clap_plugin, order: *mut usize, param_count: usize) -> bool,
+    >,
+}
+
+const CLAP_PLUGIN_AUV2_PARAM_ORDERING: &CStr = c"clap.plugin-auv2-param-ordering/0";
+
 impl<P: ClapPlugin> Wrapper<P> {
     /// # Safety
     ///
@@ -458,6 +480,12 @@ impl<P: ClapPlugin> Wrapper<P> {
         // need a bunch of AtomicRefCells instead
         assert!(!host_callback.is_null());
         let host_callback = unsafe { ClapPtr::new(host_callback) };
+        // `clap_host.name` is a plain struct field, readable before init() unlike extensions.
+        let host_name = {
+            let name = host_callback.name;
+            (!name.is_null())
+                .then(|| unsafe { CStr::from_ptr(name) }.to_string_lossy().into_owned())
+        };
 
         // This is a mapping from the parameter IDs specified by the plugin to pointers to those
         // parameters. These pointers are assumed to be safe to dereference as long as
@@ -579,6 +607,7 @@ impl<P: ClapPlugin> Wrapper<P> {
             updated_state_receiver,
 
             host_callback,
+            host_name,
 
             clap_plugin: AtomicRefCell::new(clap_plugin {
                 // This needs to live on the heap because the plugin object contains a direct
@@ -683,6 +712,10 @@ impl<P: ClapPlugin> Wrapper<P> {
 
             clap_plugin_tail: clap_plugin_tail {
                 get: Some(Self::ext_tail_get),
+            },
+
+            clap_plugin_auv2_param_ordering: clap_plugin_auv2_param_ordering {
+                get_param_order: Some(Self::ext_auv2_param_ordering_get),
             },
 
             clap_plugin_voice_info: clap_plugin_voice_info {
@@ -2376,10 +2409,55 @@ impl<P: ClapPlugin> Wrapper<P> {
             &wrapper.clap_plugin_tail as *const _ as *const c_void
         } else if id == CLAP_EXT_VOICE_INFO && P::CLAP_POLY_MODULATION_CONFIG.is_some() {
             &wrapper.clap_plugin_voice_info as *const _ as *const c_void
+        } else if id == CLAP_PLUGIN_AUV2_PARAM_ORDERING && P::auv2_param_id_order().is_some() {
+            &wrapper.clap_plugin_auv2_param_ordering as *const _ as *const c_void
         } else {
             nih_trace!("Host tried to query unknown extension {:?}", id);
             std::ptr::null()
         }
+    }
+
+    unsafe extern "C" fn ext_auv2_param_ordering_get(
+        plugin: *const clap_plugin,
+        order: *mut usize,
+        param_count: usize,
+    ) -> bool {
+        check_null_ptr!(false, plugin, (*plugin).plugin_data, order);
+        let wrapper = &*((*plugin).plugin_data as *const Self);
+
+        let Some(id_order) = P::auv2_param_id_order() else {
+            return false;
+        };
+        if param_count != wrapper.param_hashes.len() || id_order.len() != param_count {
+            nih_debug_assert_failure!(
+                "auv2_param_id_order() has {} entries but the plugin exposes {} parameters",
+                id_order.len(),
+                wrapper.param_hashes.len()
+            );
+            return false;
+        }
+
+        let mut position_by_hash: HashMap<u32, usize> = HashMap::with_capacity(id_order.len());
+        for (position, id) in id_order.iter().enumerate() {
+            let Some(hash) = wrapper.param_id_to_hash.get(*id) else {
+                nih_debug_assert_failure!("auv2_param_id_order() names unknown parameter {:?}", id);
+                return false;
+            };
+            if position_by_hash.insert(*hash, position).is_some() {
+                nih_debug_assert_failure!("auv2_param_id_order() repeats parameter {:?}", id);
+                return false;
+            }
+        }
+
+        let order = std::slice::from_raw_parts_mut(order, param_count);
+        for (clap_index, hash) in wrapper.param_hashes.iter().enumerate() {
+            match position_by_hash.get(hash) {
+                Some(&position) => order[clap_index] = position,
+                None => return false,
+            }
+        }
+
+        true
     }
 
     unsafe extern "C" fn on_main_thread(plugin: *const clap_plugin) {

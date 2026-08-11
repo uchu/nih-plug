@@ -13,6 +13,12 @@ use crate::prelude::{ParamPtr, Plugin, PluginNoteEvent};
 // The implementing wrapper needs to be able to handle concurrent requests, and it should perform
 // the actual callback within [MainThreadQueue::schedule_gui].
 pub trait ProcessContext<P: Plugin> {
+    /// The host's self-reported name, if the plugin API carries one (currently CLAP only, from
+    /// `clap_host.name`). See [`InitContext::host_name()`][crate::context::init::InitContext::host_name()].
+    fn host_name(&self) -> Option<&str> {
+        None
+    }
+
     /// Get the current plugin API.
     fn plugin_api(&self) -> PluginApi;
 

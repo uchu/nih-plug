@@ -78,6 +78,10 @@ impl<P: ClapPlugin> InitContext<P> for WrapperInitContext<'_, P> {
         PluginApi::Clap
     }
 
+    fn host_name(&self) -> Option<&str> {
+        self.wrapper.host_name.as_deref()
+    }
+
     fn execute(&self, task: P::BackgroundTask) {
         (self.wrapper.task_executor.lock())(task);
     }
@@ -95,6 +99,10 @@ impl<P: ClapPlugin> InitContext<P> for WrapperInitContext<'_, P> {
 impl<P: ClapPlugin> ProcessContext<P> for WrapperProcessContext<'_, P> {
     fn plugin_api(&self) -> PluginApi {
         PluginApi::Clap
+    }
+
+    fn host_name(&self) -> Option<&str> {
+        self.wrapper.host_name.as_deref()
     }
 
     fn execute_background(&self, task: P::BackgroundTask) {
@@ -191,6 +199,10 @@ impl<P: ClapPlugin> ProcessContext<P> for WrapperProcessContext<'_, P> {
 impl<P: ClapPlugin> GuiContext for WrapperGuiContext<P> {
     fn plugin_api(&self) -> PluginApi {
         PluginApi::Clap
+    }
+
+    fn host_name(&self) -> Option<&str> {
+        self.wrapper.host_name.as_deref()
     }
 
     fn request_resize(&self) -> bool {

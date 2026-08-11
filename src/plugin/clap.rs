@@ -33,6 +33,19 @@ pub trait ClapPlugin: Plugin {
         None
     }
 
+    /// A frozen AUv2 parameter order for CLAP-as-AUv2 wrappers, implementing clap-wrapper's
+    /// `clap.plugin-auv2-param-ordering/0` extension. Logic and GarageBand identify automated
+    /// parameters by their *position*, and without this extension clap-wrapper sorts by CLAP
+    /// parameter id — for nih-plug that is a 31-bit hash of the `#[id]` string, so adding any
+    /// parameter would reshuffle the ordering and break automation in saved host projects.
+    ///
+    /// Return every parameter ID from [`Plugin::params()`]'s `param_map()` exactly once, in the
+    /// order they should appear to AUv2 hosts. Treat the returned list as append-only across
+    /// releases: new parameters go at the end, existing entries must never move or disappear.
+    fn auv2_param_id_order() -> Option<&'static [&'static str]> {
+        None
+    }
+
     /// Load a preset identified by the given location triple. Called by the host when the user
     /// selects a preset from the host's browser. The `context` can be used to set parameter values.
     fn load_preset_from_location(

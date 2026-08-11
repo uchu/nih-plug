@@ -14,6 +14,13 @@ pub trait InitContext<P: Plugin> {
     /// Get the current plugin API.
     fn plugin_api(&self) -> PluginApi;
 
+    /// The host's self-reported name, if the plugin API carries one (currently CLAP only, from
+    /// `clap_host.name`). Wrappers like clap-wrapper append a marker to the real host name (e.g.
+    /// "Logic Pro (CLAP-as-AUv2)"), which lets a plugin adapt to the actual hosting environment.
+    fn host_name(&self) -> Option<&str> {
+        None
+    }
+
     /// Run a task directly on this thread. This ensures that the task has finished executing before
     /// the plugin finishes initializing.
     ///
