@@ -209,17 +209,22 @@ impl<P: Plugin> Backend<P> for CpalMidir {
                         (SampleFormat::F64, f64)
                     ),
                     |stream: &Stream| stream.play(),
-                );
-                match stream {
-                    Some(stream) => {
-                        _input_stream = Some(stream);
-                        // Playback is delayed one period if we're capturing audio so it has
-                        // something to process. The timeout keeps a wedged capture device from
-                        // blocking this thread forever.
+                    // Playback is delayed one period if we're capturing audio so it has something
+                    // to process, and the timeout keeps a wedged capture device from blocking this
+                    // thread forever. Until the output stream exists only the capture `error_cb`
+                    // can raise `stream_error`, so a raised flag here is a refused start.
+                    || {
                         input_parker.park_timeout(Duration::from_secs(2));
-                    }
-                    None => input_rb_consumer = None,
+                        stream_error.load(Ordering::Acquire)
+                    },
+                );
+                if stream.is_none() {
+                    // The capture stream is gone and can no longer raise the flag, so a start
+                    // failure it reported must not end the run
+                    stream_error.store(false, Ordering::Release);
+                    input_rb_consumer = None;
                 }
+                _input_stream = stream;
             }
 
             // The output callback can read input events from this ringbuffer
@@ -1227,10 +1232,14 @@ fn input_config_rank(
 }
 
 /// A built and started capture stream, or `None` (logged) when either step fails, so a capture
-/// device that refuses to run costs the session its input rather than its output.
+/// device that refuses to run costs the session its input rather than its output. `start_failed`
+/// runs only after `play` succeeded: it waits for the first capture period and reports whether
+/// the stream's error callback fired meanwhile, because WASAPI's `play()` merely queues the start
+/// and a refused `IAudioClient::Start()` arrives through the error callback instead.
 fn started_capture<S, B, P>(
     built: Result<S, B>,
     play: impl FnOnce(&S) -> Result<(), P>,
+    start_failed: impl FnOnce() -> bool,
 ) -> Option<S>
 where
     B: std::fmt::Display,
@@ -1245,6 +1254,10 @@ where
     };
     if let Err(err) = play(&stream) {
         nih_error!("Could not start the capture stream, running without audio input: {err:#}");
+        return None;
+    }
+    if start_failed() {
+        nih_error!("The capture stream failed while starting, running without audio input");
         return None;
     }
     Some(stream)
@@ -1335,11 +1348,30 @@ mod tests {
     fn a_capture_that_cannot_build_or_start_is_dropped_instead_of_ending_the_run() {
         let started = |_: &u8| Ok::<(), &str>(());
         let refused = |_: &u8| Err::<(), &str>("privacy switch off");
-        assert_eq!(started_capture(Ok::<u8, &str>(7), started), Some(7));
+        let running = || false;
+        let not_waited_for =
+            || -> bool { unreachable!("a capture that never started was awaited") };
         assert_eq!(
-            started_capture(Err::<u8, &str>("no such device"), started),
+            started_capture(Ok::<u8, &str>(7), started, running),
+            Some(7)
+        );
+        assert_eq!(
+            started_capture(Err::<u8, &str>("no such device"), started, not_waited_for),
             None
         );
-        assert_eq!(started_capture(Ok::<u8, &str>(7), refused), None);
+        assert_eq!(
+            started_capture(Ok::<u8, &str>(7), refused, not_waited_for),
+            None
+        );
+    }
+
+    #[test]
+    fn a_start_refused_through_the_error_callback_drops_the_capture_too() {
+        let queued = |_: &u8| Ok::<(), &str>(());
+        let refused_on_the_stream_thread = || true;
+        assert_eq!(
+            started_capture(Ok::<u8, &str>(7), queued, refused_on_the_stream_thread),
+            None
+        );
     }
 }
