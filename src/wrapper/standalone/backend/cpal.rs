@@ -122,11 +122,11 @@ impl<P: Plugin> Backend<P> for CpalMidir {
         // channels.
         //
         // Audio input is read from the input device (if configured), and is send at a period at a
-        // time to the output stream in an interleaved format. Because of that the audio output
-        // stream is delayed for one period using a parker to you don't immediately get xruns. CPAL
-        // audio devices may also not accept floating point samples, so all of the actual audio
-        // handling and buffer management handles in the `build_*_data_callback()` functions defined
-        // below.
+        // time to the output stream interleaved, one frame of the plugin's main input channels at a
+        // time. Because of that the audio output stream is delayed for one period using a parker to
+        // you don't immediately get xruns. CPAL audio devices may also not accept floating point
+        // samples, so all of the actual audio handling and buffer management handles in the
+        // `build_*_data_callback()` functions defined below.
         //
         // MIDI input is parsed in the Midir callback and the events are sent over a callback to the
         // output audio thread where the process callback happens. If that process callback outputs
@@ -148,9 +148,16 @@ impl<P: Plugin> Backend<P> for CpalMidir {
             let mut _input_stream: Option<Stream> = None;
             let mut input_rb_consumer: Option<rtrb::Consumer<f32>> = None;
             if let Some(input) = &self.input {
-                // Data is sent to the output data callback using a wait-free ring buffer
+                // Data is sent to the output data callback using a wait-free ring buffer, one
+                // interleaved frame of the plugin's main input channel count at a time
+                let ring_channels = self
+                    .audio_io_layout
+                    .main_input_channels
+                    .map(NonZeroU32::get)
+                    .unwrap_or(0) as usize;
                 let (rb_producer, rb_consumer) = RingBuffer::new(
-                    self.output.config.channels as usize * self.config.period_size as usize,
+                    (self.output.config.channels as usize).max(ring_channels)
+                        * self.config.period_size as usize,
                 );
                 input_rb_consumer = Some(rb_consumer);
 
@@ -184,37 +191,35 @@ impl<P: Plugin> Backend<P> for CpalMidir {
                         }
                     }
                 }
-                // These failures are recoverable (the caller can `reinit()` and try again), and
-                // nothing has been taken out of `self` yet, so early returns are safe here.
-                let stream = match build_input_streams!(
-                    input.sample_format,
-                    (SampleFormat::I8, i8),
-                    (SampleFormat::I16, i16),
-                    (SampleFormat::I32, i32),
-                    (SampleFormat::I64, i64),
-                    (SampleFormat::U8, u8),
-                    (SampleFormat::U16, u16),
-                    (SampleFormat::U32, u32),
-                    (SampleFormat::U64, u64),
-                    (SampleFormat::F32, f32),
-                    (SampleFormat::F64, f64)
-                ) {
-                    Ok(stream) => stream,
-                    Err(err) => {
-                        nih_error!("Error creating the capture stream: {err:#}");
-                        return RunOutcome::StreamFailed;
+                // A capture stream that cannot be built or started must not take the output down
+                // with it: the run goes on without audio input and the output callback hands the
+                // plugin silence. A capture error mid-session still ends the run via `error_cb`.
+                let stream = started_capture(
+                    build_input_streams!(
+                        input.sample_format,
+                        (SampleFormat::I8, i8),
+                        (SampleFormat::I16, i16),
+                        (SampleFormat::I32, i32),
+                        (SampleFormat::I64, i64),
+                        (SampleFormat::U8, u8),
+                        (SampleFormat::U16, u16),
+                        (SampleFormat::U32, u32),
+                        (SampleFormat::U64, u64),
+                        (SampleFormat::F32, f32),
+                        (SampleFormat::F64, f64)
+                    ),
+                    |stream: &Stream| stream.play(),
+                );
+                match stream {
+                    Some(stream) => {
+                        _input_stream = Some(stream);
+                        // Playback is delayed one period if we're capturing audio so it has
+                        // something to process. The timeout keeps a wedged capture device from
+                        // blocking this thread forever.
+                        input_parker.park_timeout(Duration::from_secs(2));
                     }
-                };
-                if let Err(err) = stream.play() {
-                    nih_error!("Error trying to start the capture stream: {err:#}");
-                    return RunOutcome::StreamFailed;
+                    None => input_rb_consumer = None,
                 }
-                _input_stream = Some(stream);
-
-                // Playback is delayed one period if we're capturing audio so it has something to
-                // process. The timeout keeps a wedged capture device from blocking this thread
-                // forever.
-                input_parker.park_timeout(Duration::from_secs(2));
             }
 
             // The output callback can read input events from this ringbuffer
@@ -362,10 +367,10 @@ impl<P: Plugin> Backend<P> for CpalMidir {
                     }
                 }
             }
-            // MIDI connections were already taken out of `self` above, so unlike the capture
-            // stream failures these must NOT return early: fall through to the MIDI restore code
-            // below instead (an early return would also deadlock the scoped MIDI output thread,
-            // which blocks on its channel until it receives a `Terminate` task).
+            // MIDI connections were already taken out of `self` above, so these failures must NOT
+            // return early: fall through to the MIDI restore code below instead (an early return
+            // would also deadlock the scoped MIDI output thread, which blocks on its channel until
+            // it receives a `Terminate` task).
             let mut setup_failed = false;
             let output_stream = match build_output_streams!(
                 self.output.sample_format,
@@ -701,15 +706,22 @@ impl CpalMidir {
         config: &WrapperConfig,
         num_input_channels: usize,
     ) -> Result<CpalDevice> {
+        if num_input_channels == 0 {
+            anyhow::bail!("The plugin has no main audio input to connect an input device to");
+        }
         let requested_sample_rate = cpal::SampleRate(config.sample_rate as u32);
         let requested_buffer_size = cpal::BufferSize::Fixed(config.period_size);
 
-        let input_configs: Vec<_> = device
+        // Any device with an input channel is accepted: its first channels feed the main input in
+        // order and a mono device feeds all of them (`input_source_channel()`). CoreAudio reports
+        // only a device's total channel count, so an exact match would refuse every mono and every
+        // multichannel interface.
+        let mut input_configs: Vec<_> = device
             .supported_input_configs()
             .context("Could not get supported audio input configurations")?
             .filter(|c| match c.buffer_size() {
                 cpal::SupportedBufferSize::Range { min, max } => {
-                    c.channels() as usize == num_input_channels
+                    c.channels() >= 1
                         && (c.min_sample_rate()..=c.max_sample_rate())
                             .contains(&requested_sample_rate)
                         && (min..=max).contains(&&config.period_size)
@@ -717,19 +729,20 @@ impl CpalMidir {
                 cpal::SupportedBufferSize::Unknown => false,
             })
             .collect();
-        let input_config_range = input_configs
-            .iter()
-            // Prefer floating point samples to avoid conversions
-            .find(|c| c.sample_format() == SampleFormat::F32)
-            .or_else(|| input_configs.first())
-            .cloned()
-            .with_context(|| {
-                format!(
-                    "The audio input device does not support {} audio channels at a \
-                     sample rate of {} Hz and a period size of {} samples",
-                    num_input_channels, config.sample_rate, config.period_size,
-                )
-            })?;
+        input_configs.sort_by_key(|c| {
+            input_config_rank(
+                c.channels() as usize,
+                num_input_channels,
+                c.sample_format() == SampleFormat::F32,
+            )
+        });
+        let input_config_range = input_configs.first().cloned().with_context(|| {
+            format!(
+                "The audio input device does not support a sample rate of {} Hz and a period size \
+                 of {} samples",
+                config.sample_rate, config.period_size,
+            )
+        })?;
 
         // We already checked that these settings are valid
         let input_config = StreamConfig {
@@ -823,6 +836,15 @@ impl CpalMidir {
         // output data callback
         #[cfg(target_os = "windows")]
         let mut input_thread_promoted = false;
+        let device_channels = self
+            .input
+            .as_ref()
+            .map_or(1, |input| input.config.channels as usize);
+        let plugin_channels = self
+            .audio_io_layout
+            .main_input_channels
+            .map(NonZeroU32::get)
+            .unwrap_or(0) as usize;
         move |data, _info| {
             // The promoted output callback busy-spins on this thread's ring
             // (see the pop loop in the output callback) — leaving the capture
@@ -835,11 +857,11 @@ impl CpalMidir {
                 super::super::wrapper::promote_audio_thread();
             }
 
-            for sample in data {
-                // If for whatever reason the input callback is fired twice before an output
-                // callback, then just spin on this until the push succeeds
-                while input_rb_producer.push(sample.to_sample()).is_err() {}
-            }
+            // If for whatever reason the input callback is fired twice before an output callback,
+            // then just spin on this until the push succeeds
+            fold_input_frames(data, device_channels, plugin_channels, |sample| {
+                while input_rb_producer.push(sample).is_err() {}
+            });
 
             // The run function is blocked until a single period has been processed here. After this
             // point output playback can start.
@@ -979,18 +1001,18 @@ impl CpalMidir {
                 // write-only (with `BufferManager` always zeroing them out when creating the buffers).
                 match &mut input_rb_consumer {
                     Some(input_rb_consumer) => {
-                        for channel in main_io_storage.iter_mut() {
-                            for sample in &mut channel[..chunk_size] {
-                                loop {
-                                    // Keep spinning on this if the output callback somehow outpaces the
-                                    // input callback
-                                    if let Ok(input_sample) = input_rb_consumer.pop() {
-                                        *sample = input_sample;
-                                        break;
-                                    }
+                        // Keep spinning on this if the output callback somehow outpaces the input
+                        // callback
+                        deinterleave_frames(
+                            || loop {
+                                if let Ok(input_sample) = input_rb_consumer.pop() {
+                                    break input_sample;
                                 }
-                            }
-                        }
+                            },
+                            &mut main_io_storage,
+                            num_input_channels,
+                            chunk_size,
+                        );
                     }
                     None => {
                         for channel in main_io_storage.iter_mut() {
@@ -1132,5 +1154,192 @@ impl CpalMidir {
                 chunk_start += chunk_size;
             }
         }
+    }
+}
+
+/// The device channel that feeds `plugin_channel` of the plugin's main input: the same-numbered
+/// channel when the device has it, the only channel of a mono device for every plugin channel,
+/// and none (silence) for plugin channels a multichannel device does not have.
+fn input_source_channel(plugin_channel: usize, device_channels: usize) -> Option<usize> {
+    if device_channels == 1 {
+        Some(0)
+    } else if plugin_channel < device_channels {
+        Some(plugin_channel)
+    } else {
+        None
+    }
+}
+
+/// Converts one capture callback's interleaved device frames into interleaved frames of the
+/// plugin's main input channel count, handing each sample to `push` in order.
+fn fold_input_frames<T>(
+    data: &[T],
+    device_channels: usize,
+    plugin_channels: usize,
+    mut push: impl FnMut(f32),
+) where
+    T: Sample,
+    f32: FromSample<T>,
+{
+    for frame in data.chunks_exact(device_channels.max(1)) {
+        for plugin_channel in 0..plugin_channels {
+            push(
+                match input_source_channel(plugin_channel, device_channels) {
+                    Some(source) => frame[source].to_sample::<f32>(),
+                    None => 0.0,
+                },
+            );
+        }
+    }
+}
+
+/// Fills channel-major `storage` from `frames` interleaved frames of `ring_channels` samples
+/// each, pulled in order from `next_sample`. Storage channels past the ring's are silenced; ring
+/// channels without a storage channel are still consumed so the ring stays frame-aligned.
+fn deinterleave_frames(
+    mut next_sample: impl FnMut() -> f32,
+    storage: &mut [Vec<f32>],
+    ring_channels: usize,
+    frames: usize,
+) {
+    for frame in 0..frames {
+        for channel in 0..ring_channels {
+            let sample = next_sample();
+            if let Some(dst) = storage.get_mut(channel) {
+                dst[frame] = sample;
+            }
+        }
+    }
+    for dst in storage.iter_mut().skip(ring_channels) {
+        dst[..frames].fill(0.0);
+    }
+}
+
+/// Sort key over the capture configurations that can run the stream: the fewest channels that
+/// still cover the plugin's main input first, then smaller devices, and floating point before
+/// integer formats within one channel count.
+fn input_config_rank(
+    device_channels: usize,
+    plugin_channels: usize,
+    is_f32: bool,
+) -> (bool, usize, bool) {
+    (device_channels < plugin_channels, device_channels, !is_f32)
+}
+
+/// A built and started capture stream, or `None` (logged) when either step fails, so a capture
+/// device that refuses to run costs the session its input rather than its output.
+fn started_capture<S, B, P>(
+    built: Result<S, B>,
+    play: impl FnOnce(&S) -> Result<(), P>,
+) -> Option<S>
+where
+    B: std::fmt::Display,
+    P: std::fmt::Display,
+{
+    let stream = match built {
+        Ok(stream) => stream,
+        Err(err) => {
+            nih_error!("Could not create the capture stream, running without audio input: {err:#}");
+            return None;
+        }
+    };
+    if let Err(err) = play(&stream) {
+        nih_error!("Could not start the capture stream, running without audio input: {err:#}");
+        return None;
+    }
+    Some(stream)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn through_the_backend(device: &[f32], device_channels: usize, frames: usize) -> Vec<Vec<f32>> {
+        let mut ring = Vec::new();
+        fold_input_frames(device, device_channels, 2, |sample| ring.push(sample));
+        let mut storage = vec![vec![f32::NAN; frames]; 2];
+        let mut popped = ring.into_iter();
+        deinterleave_frames(|| popped.next().unwrap(), &mut storage, 2, frames);
+        storage
+    }
+
+    #[test]
+    fn a_left_only_stereo_input_lands_in_the_left_channel_only() {
+        let device = [0.1, 0.0, 0.2, 0.0, 0.3, 0.0, 0.4, 0.0];
+        let storage = through_the_backend(&device, 2, 4);
+        assert_eq!(storage[0], vec![0.1, 0.2, 0.3, 0.4]);
+        assert_eq!(storage[1], vec![0.0; 4]);
+    }
+
+    #[test]
+    fn a_multichannel_device_feeds_its_first_two_channels_only() {
+        let device = [1.0, 2.0, 9.0, 9.0, 1.5, 2.5, 9.0, 9.0];
+        let storage = through_the_backend(&device, 4, 2);
+        assert_eq!(storage[0], vec![1.0, 1.5]);
+        assert_eq!(storage[1], vec![2.0, 2.5]);
+    }
+
+    #[test]
+    fn a_mono_device_drives_both_channels() {
+        let device = [0.25, -0.5, 0.75];
+        let storage = through_the_backend(&device, 1, 3);
+        assert_eq!(storage[0], vec![0.25, -0.5, 0.75]);
+        assert_eq!(storage[1], vec![0.25, -0.5, 0.75]);
+    }
+
+    #[test]
+    fn storage_channels_past_the_ring_are_silenced_and_extra_ring_channels_dropped() {
+        let mut wide = vec![vec![f32::NAN; 3]; 4];
+        let mut ring = [1.0f32, 2.0, 3.0, 4.0, 5.0, 6.0].into_iter();
+        deinterleave_frames(|| ring.next().unwrap(), &mut wide, 2, 3);
+        assert_eq!(wide[0], vec![1.0, 3.0, 5.0]);
+        assert_eq!(wide[1], vec![2.0, 4.0, 6.0]);
+        assert_eq!(wide[2], vec![0.0; 3]);
+        assert_eq!(wide[3], vec![0.0; 3]);
+
+        let mut narrow = vec![vec![f32::NAN; 2]; 1];
+        let mut ring = [1.0f32, 2.0, 3.0, 4.0].into_iter();
+        deinterleave_frames(|| ring.next().unwrap(), &mut narrow, 2, 2);
+        assert_eq!(narrow[0], vec![1.0, 3.0]);
+        assert!(ring.next().is_none(), "the ring must stay frame-aligned");
+    }
+
+    #[test]
+    fn a_partial_chunk_leaves_the_tail_of_the_period_alone() {
+        let mut storage = vec![vec![7.0f32; 4]; 2];
+        let mut ring = [1.0f32, 2.0].into_iter();
+        deinterleave_frames(|| ring.next().unwrap(), &mut storage, 2, 1);
+        assert_eq!(storage[0], vec![1.0, 7.0, 7.0, 7.0]);
+        assert_eq!(storage[1], vec![2.0, 7.0, 7.0, 7.0]);
+    }
+
+    #[test]
+    fn the_input_config_prefers_the_fewest_channels_that_cover_the_plugin() {
+        assert!(input_config_rank(2, 2, true) < input_config_rank(8, 2, true));
+        assert!(input_config_rank(8, 2, true) < input_config_rank(1, 2, true));
+        assert!(input_config_rank(2, 2, true) < input_config_rank(2, 2, false));
+    }
+
+    #[test]
+    fn integer_devices_convert_on_the_way_in() {
+        let device: [i16; 4] = [i16::MAX, 0, 0, i16::MIN];
+        let mut ring = Vec::new();
+        fold_input_frames(&device, 2, 2, |sample| ring.push(sample));
+        assert!((ring[0] - 1.0).abs() < 1.0e-4);
+        assert_eq!(ring[1], 0.0);
+        assert_eq!(ring[2], 0.0);
+        assert!((ring[3] + 1.0).abs() < 1.0e-4);
+    }
+
+    #[test]
+    fn a_capture_that_cannot_build_or_start_is_dropped_instead_of_ending_the_run() {
+        let started = |_: &u8| Ok::<(), &str>(());
+        let refused = |_: &u8| Err::<(), &str>("privacy switch off");
+        assert_eq!(started_capture(Ok::<u8, &str>(7), started), Some(7));
+        assert_eq!(
+            started_capture(Err::<u8, &str>("no such device"), started),
+            None
+        );
+        assert_eq!(started_capture(Ok::<u8, &str>(7), refused), None);
     }
 }
