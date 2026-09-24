@@ -149,8 +149,8 @@ impl BufferManager {
     /// Initialize the buffers using the host provided buffer pointers and return a reference to the
     /// created buffers that can be passed to `Plugin::process()`. This accounts for in-place main
     /// IO, missing channel pointers, null pointers, and mismatching channel counts. All
-    /// uninitialized buffer data (aux outputs, and main output channels with no matching input
-    /// channel) are filled with zeroes.
+    /// uninitialized buffer data (aux outputs, main output channels with no matching input channel,
+    /// and the whole main buffer when the host provides no main input) are filled with zeroes.
     ///
     /// `sample_offset` and `num_samples` can be used to slice a set of host channel pointers for
     /// sample accurate automation. If any of the outputs are missing because the host hasn't
@@ -252,6 +252,16 @@ impl BufferManager {
                     }
                 });
             }
+        } else if self.main_output_channel_pointers.is_some() {
+            // No main input from the host (VST3 `numInputs == 0` or a null input bus, CLAP
+            // `audio_inputs_count == 0` or null `data32`). The main buffer aliases the host's output
+            // memory, which still holds whatever the host left there, and a plugin reading its
+            // in-place input would take that for audio. Zero it, like the excess channels above.
+            self.main_buffer.set_slices(num_samples, |output_slices| {
+                for slice in output_slices.iter_mut() {
+                    slice.fill(0.0);
+                }
+            });
         }
 
         // Because NIH-plug's `Buffer` type is geared around in-place processing, auxiliary inputs
@@ -498,6 +508,67 @@ mod miri {
         for channel in aux_input_storage.iter().flat_map(|storage| storage.iter()) {
             for sample in channel {
                 assert!(*sample == 0.0);
+            }
+        }
+    }
+
+    #[test]
+    fn missing_main_input_zeroes_the_in_place_buffer() {
+        // The host's output memory still holds its last block. With no main input pointers that
+        // must not reach the plugin as input.
+        let mut main_io_storage = vec![vec![0.5f32; BUFFER_SIZE]; NUM_MAIN_OUTPUT_CHANNELS];
+        let mut aux_input_storage =
+            vec![vec![vec![0.0f32; BUFFER_SIZE]; NUM_AUX_CHANNELS]; NUM_AUX_PORTS];
+        let mut aux_output_storage =
+            vec![vec![vec![0.0f32; BUFFER_SIZE]; NUM_AUX_CHANNELS]; NUM_AUX_PORTS];
+
+        let mut main_io_channel_pointers: Vec<*mut f32> = main_io_storage
+            .iter_mut()
+            .map(|channel_slice| channel_slice.as_mut_ptr())
+            .collect();
+        let mut aux_input_channel_pointers: Vec<Vec<*mut f32>> = aux_input_storage
+            .iter_mut()
+            .map(|storage| storage.iter_mut().map(|c| c.as_mut_ptr()).collect())
+            .collect();
+        let mut aux_output_channel_pointers: Vec<Vec<*mut f32>> = aux_output_storage
+            .iter_mut()
+            .map(|storage| storage.iter_mut().map(|c| c.as_mut_ptr()).collect())
+            .collect();
+
+        let mut buffer_manager = BufferManager::for_audio_io_layout(BUFFER_SIZE, AUDIO_IO_LAYOUT);
+        let buffers = unsafe {
+            buffer_manager.create_buffers(0, BUFFER_SIZE, |buffer_sources| {
+                *buffer_sources.main_output_channel_pointers = Some(ChannelPointers {
+                    ptrs: NonNull::new(main_io_channel_pointers.as_mut_ptr()).unwrap(),
+                    num_channels: main_io_channel_pointers.len(),
+                });
+                for (source, pointers) in buffer_sources
+                    .aux_input_channel_pointers
+                    .iter_mut()
+                    .zip(aux_input_channel_pointers.iter_mut())
+                {
+                    *source = Some(ChannelPointers {
+                        ptrs: NonNull::new(pointers.as_mut_ptr()).unwrap(),
+                        num_channels: pointers.len(),
+                    });
+                }
+                for (source, pointers) in buffer_sources
+                    .aux_output_channel_pointers
+                    .iter_mut()
+                    .zip(aux_output_channel_pointers.iter_mut())
+                {
+                    *source = Some(ChannelPointers {
+                        ptrs: NonNull::new(pointers.as_mut_ptr()).unwrap(),
+                        num_channels: pointers.len(),
+                    });
+                }
+            })
+        };
+
+        assert_eq!(buffers.main_buffer.channels(), NUM_MAIN_OUTPUT_CHANNELS);
+        for channel_samples in buffers.main_buffer.iter_samples() {
+            for sample in channel_samples {
+                assert_eq!(*sample, 0.0);
             }
         }
     }
