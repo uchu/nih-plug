@@ -12,9 +12,9 @@ use std::thread;
 use std::time::Instant;
 
 use super::backend::{sleep_unless, Backend, RunOutcome};
-use super::recovery::{Action, Recovery};
 use super::config::WrapperConfig;
 use super::context::{WrapperGuiContext, WrapperInitContext, WrapperProcessContext};
+use super::recovery::{Action, Recovery};
 use crate::event_loop::{EventLoop, MainThreadExecutor, OsEventLoop};
 use crate::prelude::{
     AsyncExecutor, AudioIOLayout, BufferConfig, Editor, ParamFlags, ParamPtr, Params,
@@ -765,13 +765,20 @@ impl<P: Plugin, B: Backend<P>> Wrapper<P, B> {
                     nih_log!("A requested audio device is available again, switching to it");
                 }
                 Action::WaitForHardware => {
-                    nih_error!(
-                        "The audio stream keeps dying; waiting for the audio hardware to change \
-                         before trying again"
-                    );
-                    self.backend
-                        .borrow()
-                        .wait_for_device_change(&should_terminate, Recovery::HARDWARE_WAIT);
+                    if self.backend.borrow_mut().quarantine_requested() {
+                        nih_error!(
+                            "The audio stream keeps dying on a requested device; standing the \
+                             system default in and trying the device again later"
+                        );
+                    } else {
+                        nih_error!(
+                            "The audio stream keeps dying; waiting for the audio hardware to \
+                             change before trying again"
+                        );
+                        self.backend
+                            .borrow()
+                            .wait_for_device_change(&should_terminate, Recovery::HARDWARE_WAIT);
+                    }
                 }
             }
 

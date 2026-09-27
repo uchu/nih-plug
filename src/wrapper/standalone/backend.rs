@@ -76,4 +76,12 @@ pub trait Backend<P: Plugin>: 'static + Send + Sync {
     fn wait_for_device_change(&self, should_stop: &AtomicBool, max: Duration) {
         sleep_unless(should_stop, max);
     }
+
+    /// The stream keeps dying on a requested device: leave that device alone for a while and let
+    /// the next [`reinit()`][Self::reinit()] stand something else in. `false` when nothing
+    /// requested is open (the stand-in itself keeps dying), so the caller waits for the hardware
+    /// to change instead.
+    fn quarantine_requested(&mut self) -> bool {
+        false
+    }
 }

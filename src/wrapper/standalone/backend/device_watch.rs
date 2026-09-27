@@ -57,18 +57,19 @@ impl DeviceWatch {
     pub const FIRST_RETRY: Duration = Duration::from_secs(2);
     /// The longest pause between two probes of a device that keeps refusing.
     pub const MAX_RETRY: Duration = Duration::from_secs(15);
+    /// The pause before a device whose stream kept dying is tried again.
+    pub const QUARANTINE: Duration = Duration::from_secs(60);
 
     /// `absent` are the requested devices the host did not list at the attempt, `refused` the ones
     /// it listed but that would not open.
     pub fn new(absent: Vec<Wanted>, refused: Vec<Wanted>, now: Instant) -> Self {
-        let mut watched: Vec<Watched> = absent.into_iter().map(Watched::new).collect();
+        let mut watch = Self {
+            watched: absent.into_iter().map(Watched::new).collect(),
+        };
         for wanted in refused {
-            let mut entry = Watched::new(wanted);
-            entry.present = true;
-            entry.probe_failed(now);
-            watched.push(entry);
+            watch.refuse(wanted, now);
         }
-        Self { watched }
+        watch
     }
 
     /// Nothing to wait for: every requested device is open.
@@ -95,13 +96,41 @@ impl DeviceWatch {
         due
     }
 
-    /// The probe of `name` failed: try it again later, and later each time.
-    pub fn probe_failed(&mut self, name: &str, now: Instant) {
-        for entry in &mut self.watched {
-            if entry.wanted.name == name {
-                entry.probe_failed(now);
-            }
+    /// The probe of `wanted` failed: try it again later, and later each time.
+    pub fn probe_failed(&mut self, wanted: &Wanted, now: Instant) {
+        if let Some(entry) = self.entry(wanted) {
+            entry.probe_failed(now);
         }
+    }
+
+    /// A listed device that would not open, found out after the attempt (a capture that failed to
+    /// start): watched from now on like any refused device.
+    pub fn refuse(&mut self, wanted: Wanted, now: Instant) {
+        let entry = match self.entry(&wanted) {
+            Some(entry) => entry,
+            None => {
+                self.watched.push(Watched::new(wanted));
+                self.watched.last_mut().expect("just pushed")
+            }
+        };
+        entry.present = true;
+        entry.probe_failed(now);
+    }
+
+    /// The stream on `wanted` kept dying: leave it alone for [`QUARANTINE`](Self::QUARANTINE),
+    /// then probe it at the slowest pace. A replug ends the quarantine early.
+    pub fn quarantine(&mut self, wanted: &Wanted, now: Instant) {
+        if let Some(entry) = self.entry(wanted) {
+            entry.present = true;
+            entry.next_probe = Some(now + Self::QUARANTINE);
+            entry.retry = Self::MAX_RETRY;
+        }
+    }
+
+    fn entry(&mut self, wanted: &Wanted) -> Option<&mut Watched> {
+        self.watched
+            .iter_mut()
+            .find(|entry| entry.wanted == *wanted)
     }
 }
 
@@ -162,7 +191,7 @@ mod tests {
         let here = names(&["Speakers", "Apollo"]);
         let mut watch = DeviceWatch::new(vec![output("Apollo")], Vec::new(), t0);
         assert_eq!(watch.due(&here, t0 + secs(2)), vec![output("Apollo")]);
-        watch.probe_failed("Apollo", t0 + secs(2));
+        watch.probe_failed(&output("Apollo"), t0 + secs(2));
         assert!(watch
             .due(&here, t0 + secs(2) + DeviceWatch::FIRST_RETRY - secs(1))
             .is_empty());
@@ -183,7 +212,7 @@ mod tests {
         for gap in [secs(4), secs(8), secs(15), secs(15)] {
             assert!(watch.due(&here, due_at - secs(1)).is_empty());
             assert_eq!(watch.due(&here, due_at), vec![output("Apollo")]);
-            watch.probe_failed("Apollo", due_at);
+            watch.probe_failed(&output("Apollo"), due_at);
             due_at += gap;
         }
         assert!(watch.due(&here, due_at - secs(1)).is_empty());
@@ -197,11 +226,11 @@ mod tests {
         let gone = names(&["Speakers"]);
         let mut watch = DeviceWatch::new(Vec::new(), vec![output("Apollo")], t0);
         assert_eq!(watch.due(&here, t0 + secs(2)), vec![output("Apollo")]);
-        watch.probe_failed("Apollo", t0 + secs(2));
+        watch.probe_failed(&output("Apollo"), t0 + secs(2));
         // Next retry would be at 6 s; the device leaves before that.
         assert!(watch.due(&gone, t0 + secs(4)).is_empty());
         assert_eq!(watch.due(&here, t0 + secs(5)), vec![output("Apollo")]);
-        watch.probe_failed("Apollo", t0 + secs(5));
+        watch.probe_failed(&output("Apollo"), t0 + secs(5));
         assert!(watch.due(&here, t0 + secs(6)).is_empty());
         assert_eq!(watch.due(&here, t0 + secs(7)), vec![output("Apollo")]);
     }
@@ -225,7 +254,7 @@ mod tests {
             watch.due(&names(&["Speakers", "Mic"]), t0 + secs(2)),
             vec![input("Mic")]
         );
-        watch.probe_failed("Mic", t0 + secs(2));
+        watch.probe_failed(&input("Mic"), t0 + secs(2));
         assert_eq!(
             watch.due(&names(&["Speakers", "Mic", "Apollo"]), t0 + secs(3)),
             vec![output("Apollo")]
@@ -233,6 +262,79 @@ mod tests {
         assert_eq!(
             watch.due(&names(&["Speakers", "Mic", "Apollo"]), t0 + secs(4)),
             vec![output("Apollo"), input("Mic")]
+        );
+    }
+
+    #[test]
+    fn a_failed_probe_of_one_direction_leaves_the_other_direction_alone() {
+        let t0 = Instant::now();
+        let here = names(&["Speakers", "Apollo"]);
+        let mut watch = DeviceWatch::new(vec![output("Apollo"), input("Apollo")], Vec::new(), t0);
+        assert_eq!(
+            watch.due(&here, t0 + secs(2)),
+            vec![output("Apollo"), input("Apollo")]
+        );
+        watch.probe_failed(&output("Apollo"), t0 + secs(2));
+        assert_eq!(watch.due(&here, t0 + secs(3)), vec![input("Apollo")]);
+        watch.probe_failed(&input("Apollo"), t0 + secs(3));
+        assert_eq!(watch.due(&here, t0 + secs(4)), vec![output("Apollo")]);
+        assert_eq!(
+            watch.due(&here, t0 + secs(5)),
+            vec![output("Apollo"), input("Apollo")]
+        );
+    }
+
+    #[test]
+    fn a_device_refused_while_running_is_watched_like_a_refused_one() {
+        let t0 = Instant::now();
+        let here = names(&["Speakers", "Apollo"]);
+        let mut watch = DeviceWatch::new(Vec::new(), Vec::new(), t0);
+        assert!(watch.is_idle());
+        watch.refuse(input("Apollo"), t0);
+        assert!(!watch.is_idle());
+        assert!(watch.due(&here, t0 + secs(1)).is_empty());
+        assert_eq!(watch.due(&here, t0 + secs(2)), vec![input("Apollo")]);
+        // Refusing a device already watched restarts its pause, nothing more.
+        watch.refuse(input("Apollo"), t0 + secs(2));
+        assert_eq!(watch.due(&here, t0 + secs(3)).len(), 0);
+        assert_eq!(watch.due(&here, t0 + secs(6)), vec![input("Apollo")]);
+    }
+
+    #[test]
+    fn a_quarantined_device_waits_the_quarantine_out_then_backs_off_at_the_cap() {
+        let t0 = Instant::now();
+        let here = names(&["Speakers", "Apollo"]);
+        let mut watch = DeviceWatch::new(Vec::new(), vec![output("Apollo")], t0);
+        watch.quarantine(&output("Apollo"), t0);
+        assert!(watch
+            .due(&here, t0 + DeviceWatch::QUARANTINE - secs(1))
+            .is_empty());
+        assert_eq!(
+            watch.due(&here, t0 + DeviceWatch::QUARANTINE),
+            vec![output("Apollo")]
+        );
+        watch.probe_failed(&output("Apollo"), t0 + DeviceWatch::QUARANTINE);
+        assert!(watch
+            .due(
+                &here,
+                t0 + DeviceWatch::QUARANTINE + DeviceWatch::MAX_RETRY - secs(1)
+            )
+            .is_empty());
+        assert_eq!(
+            watch.due(&here, t0 + DeviceWatch::QUARANTINE + DeviceWatch::MAX_RETRY),
+            vec![output("Apollo")]
+        );
+    }
+
+    #[test]
+    fn a_quarantined_device_that_is_replugged_is_due_at_once() {
+        let t0 = Instant::now();
+        let mut watch = DeviceWatch::new(Vec::new(), vec![output("Apollo")], t0);
+        watch.quarantine(&output("Apollo"), t0);
+        assert!(watch.due(&names(&["Speakers"]), t0 + secs(4)).is_empty());
+        assert_eq!(
+            watch.due(&names(&["Speakers", "Apollo"]), t0 + secs(6)),
+            vec![output("Apollo")]
         );
     }
 }

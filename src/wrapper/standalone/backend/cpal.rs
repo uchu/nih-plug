@@ -35,6 +35,9 @@ const MIDI_EVENT_QUEUE_CAPACITY: usize = 2048;
 /// audible.
 const DEVICE_POLL_INTERVAL: Duration = Duration::from_secs(2);
 
+/// How long a probe waits for the first callback of the stream it started on a wanted device.
+const PROBE_FIRST_CALLBACK: Duration = Duration::from_secs(1);
+
 /// Uses CPAL for audio and midir for MIDI.
 pub struct CpalMidir {
     config: WrapperConfig,
@@ -50,6 +53,11 @@ pub struct CpalMidir {
 
     /// The requested devices that are not open, and when to try them again.
     watch: Mutex<DeviceWatch>,
+    /// What the stream is open on, as published to the host application.
+    in_use: Mutex<AudioDevicesInUse>,
+    /// Requested devices the stream kept dying on: the next restart stands something else in
+    /// for them and the watch leaves them alone for a while.
+    quarantined: Vec<Wanted>,
 }
 
 /// All data needed for a CPAL input or output stream.
@@ -93,12 +101,32 @@ enum Resolved {
     Open(CpalDevice),
 }
 
+/// The requested devices a start or restart could not open, by what happens to them next.
+#[derive(Default)]
+struct OpenedDevicesSoFar {
+    absent: Vec<Wanted>,
+    refused: Vec<Wanted>,
+    quarantined: Vec<Wanted>,
+}
+
+impl OpenedDevicesSoFar {
+    fn refused(&mut self, wanted: Wanted, quarantined: &[Wanted]) {
+        if quarantined.contains(&wanted) {
+            self.quarantined.push(wanted);
+        } else {
+            self.refused.push(wanted);
+        }
+    }
+}
+
 /// The devices a start or restart opened, and the requested ones it could not.
 struct OpenedDevices {
     output: CpalDevice,
     input: Option<CpalDevice>,
+    in_use: AudioDevicesInUse,
     absent: Vec<Wanted>,
     refused: Vec<Wanted>,
+    quarantined: Vec<Wanted>,
 }
 
 /// All data needed to create a Midir input stream.
@@ -197,46 +225,6 @@ impl<P: Plugin> Backend<P> for CpalMidir {
             let parker = Parker::new();
             let unparker = parker.unparker().clone();
 
-            // While another device stands in for a requested one, watch for it: a cheap name
-            // listing every couple of seconds on its own thread, so the stream is never held up,
-            // and a probe of the device once it is listed. The flag ends this run as
-            // `DeviceReturned` and the wrapper reinitializes onto the device; a probe that fails
-            // costs the stand-in stream nothing.
-            let device_returned = Arc::new(AtomicBool::new(false));
-            let watch_stop = Arc::new(AtomicBool::new(false));
-            if !self.watch.lock().is_idle() {
-                let backend: &Self = self;
-                let device_returned = device_returned.clone();
-                let watch_stop = watch_stop.clone();
-                let unparker = unparker.clone();
-                s.spawn(move || {
-                    while !sleep_unless(&watch_stop, DEVICE_POLL_INTERVAL) {
-                        let Ok(host) = cpal::host_from_id(backend.host_id) else {
-                            continue;
-                        };
-                        let due = backend
-                            .watch
-                            .lock()
-                            .due(&device_names(&host), Instant::now());
-                        let returned = due.iter().any(|wanted| {
-                            let opens = backend.opens(&host, wanted);
-                            if !opens {
-                                backend
-                                    .watch
-                                    .lock()
-                                    .probe_failed(&wanted.name, Instant::now());
-                            }
-                            opens
-                        });
-                        if returned {
-                            device_returned.store(true, Ordering::Release);
-                            unparker.unpark();
-                            break;
-                        }
-                    }
-                });
-            }
-
             let mut _input_stream: Option<Stream> = None;
             let mut input_rb_consumer: Option<rtrb::Consumer<f32>> = None;
             if let Some(input) = &self.input {
@@ -304,10 +292,20 @@ impl<P: Plugin> Backend<P> for CpalMidir {
                     // Playback is delayed one period if we're capturing audio so it has something
                     // to process, and the timeout keeps a wedged capture device from blocking this
                     // thread forever. Until the output stream exists only the capture `error_cb`
-                    // can raise `stream_error`, so a raised flag here is a refused start.
+                    // can raise `stream_error`, so a raised flag here is a refused start — and so
+                    // is a capture that started without a word but delivered nothing, which would
+                    // otherwise leave the output callback waiting on an empty ring.
                     || {
                         input_parker.park_timeout(Duration::from_secs(2));
-                        stream_error.load(Ordering::Acquire)
+                        let silent = || {
+                            input_rb_consumer
+                                .as_ref()
+                                .map_or(true, |rb| rb.slots() == 0)
+                        };
+                        if silent() {
+                            input_parker.park_timeout(Duration::from_millis(200));
+                        }
+                        stream_error.load(Ordering::Acquire) || silent()
                     },
                 );
                 if stream.is_none() {
@@ -317,6 +315,59 @@ impl<P: Plugin> Backend<P> for CpalMidir {
                     input_rb_consumer = None;
                 }
                 _input_stream = stream;
+            }
+
+            // The requested input opened its configuration but not a stream: refused, watched.
+            if self.input.is_some() && _input_stream.is_none() {
+                let refused = self.in_use.lock().input.take();
+                if let Some(name) = refused {
+                    self.in_use.lock().refused_input = Some(name.clone());
+                    self.watch.lock().refuse(
+                        Wanted {
+                            name,
+                            kind: Kind::Input,
+                        },
+                        Instant::now(),
+                    );
+                    publish_audio_devices_in_use(self.in_use.lock().clone());
+                }
+            }
+
+            // While another device stands in for a requested one, watch for it: a cheap name
+            // listing every couple of seconds on its own thread, so the stream is never held up,
+            // and a probe of the device once it is listed. The flag ends this run as
+            // `DeviceReturned` and the wrapper reinitializes onto the device; a probe that fails
+            // costs the stand-in stream nothing.
+            let device_returned = Arc::new(AtomicBool::new(false));
+            let watch_stop = Arc::new(AtomicBool::new(false));
+            if !self.watch.lock().is_idle() {
+                let backend: &Self = self;
+                let device_returned = device_returned.clone();
+                let watch_stop = watch_stop.clone();
+                let unparker = unparker.clone();
+                s.spawn(move || {
+                    while !sleep_unless(&watch_stop, DEVICE_POLL_INTERVAL) {
+                        let Ok(host) = cpal::host_from_id(backend.host_id) else {
+                            continue;
+                        };
+                        let due = backend
+                            .watch
+                            .lock()
+                            .due(&device_names(&host), Instant::now());
+                        let returned = due.iter().any(|wanted| {
+                            let opens = backend.opens(&host, wanted);
+                            if !opens {
+                                backend.watch.lock().probe_failed(wanted, Instant::now());
+                            }
+                            opens
+                        });
+                        if returned {
+                            device_returned.store(true, Ordering::Release);
+                            unparker.unpark();
+                            break;
+                        }
+                    }
+                });
             }
 
             // The output callback can read input events from this ringbuffer
@@ -569,10 +620,18 @@ impl<P: Plugin> Backend<P> for CpalMidir {
             &mut self.config,
             &self.audio_io_layout,
             Start::Restart,
+            &self.quarantined,
         )?;
+        self.quarantined.clear();
         self.output = opened.output;
         self.input = opened.input;
-        *self.watch.lock() = DeviceWatch::new(opened.absent, opened.refused, Instant::now());
+        let now = Instant::now();
+        let mut watch = DeviceWatch::new(opened.absent, opened.refused, now);
+        for wanted in &opened.quarantined {
+            watch.quarantine(wanted, now);
+        }
+        *self.watch.lock() = watch;
+        *self.in_use.lock() = opened.in_use;
         Ok(())
     }
 
@@ -588,6 +647,27 @@ impl<P: Plugin> Backend<P> for CpalMidir {
                 return;
             }
         }
+    }
+
+    fn quarantine_requested(&mut self) -> bool {
+        let in_use = self.in_use.lock().clone();
+        let quarantined: Vec<Wanted> = in_use
+            .output
+            .map(|name| Wanted {
+                name,
+                kind: Kind::Output,
+            })
+            .into_iter()
+            .chain(in_use.input.map(|name| Wanted {
+                name,
+                kind: Kind::Input,
+            }))
+            .collect();
+        if quarantined.is_empty() {
+            return false;
+        }
+        self.quarantined = quarantined;
+        true
     }
 }
 
@@ -626,7 +706,7 @@ impl CpalMidir {
 
         let mut config = config;
         let requested_sample_rate = config.sample_rate;
-        let opened = Self::open_devices(&host, &mut config, &audio_io_layout, Start::Launch)?;
+        let opened = Self::open_devices(&host, &mut config, &audio_io_layout, Start::Launch, &[])?;
         if (config.sample_rate - requested_sample_rate).abs() > 0.1 {
             nih_log!(
                 "Device native sample rate is {} Hz, using that instead of requested {} Hz",
@@ -742,6 +822,8 @@ impl CpalMidir {
                 opened.refused,
                 Instant::now(),
             )),
+            in_use: Mutex::new(opened.in_use),
+            quarantined: Vec::new(),
         })
     }
 
@@ -751,8 +833,11 @@ impl CpalMidir {
         self.config.sample_rate
     }
 
-    /// Whether a wanted device could open the session's stream right now: the same configuration
-    /// match a restart makes, on that one device alone, so it is cheap enough to run between polls.
+    /// Whether a wanted device could run the session's stream right now: the restart's own
+    /// resolution, then a silent stream built and started on that device and dropped as soon as
+    /// it delivers a callback. A device can match every configuration and still refuse a stream
+    /// (held exclusively by another application, not ready yet after a replug, a driver without
+    /// a clock), and only a stream shows it. Nothing here touches the stream that is playing.
     fn opens(&self, host: &cpal::Host, wanted: &Wanted) -> bool {
         let resolved = match wanted.kind {
             Kind::Output => Self::resolve_output(
@@ -767,49 +852,114 @@ impl CpalMidir {
                 &wanted.name,
                 &self.config,
                 main_channels(self.audio_io_layout.main_input_channels),
+                Start::Restart,
             ),
         };
-        matches!(resolved, Resolved::Open(_))
+        match resolved {
+            Resolved::Open(opened) => Self::stream_starts(&opened, wanted.kind),
+            Resolved::Refused(_) | Resolved::Absent => false,
+        }
+    }
+
+    fn stream_starts(opened: &CpalDevice, kind: Kind) -> bool {
+        let called = Arc::new(AtomicBool::new(false));
+        let failed = Arc::new(AtomicBool::new(false));
+        let error_cb = {
+            let failed = failed.clone();
+            move |_: cpal::StreamError| failed.store(true, Ordering::Release)
+        };
+        let stream = match kind {
+            Kind::Output => {
+                let called = called.clone();
+                opened.device.build_output_stream_raw(
+                    &opened.config,
+                    opened.sample_format,
+                    move |data: &mut cpal::Data, _: &cpal::OutputCallbackInfo| {
+                        data.bytes_mut().fill(0);
+                        called.store(true, Ordering::Release);
+                    },
+                    error_cb,
+                    None,
+                )
+            }
+            Kind::Input => {
+                let called = called.clone();
+                opened.device.build_input_stream_raw(
+                    &opened.config,
+                    opened.sample_format,
+                    move |_: &cpal::Data, _: &cpal::InputCallbackInfo| {
+                        called.store(true, Ordering::Release);
+                    },
+                    error_cb,
+                    None,
+                )
+            }
+        };
+        let Ok(stream) = stream else {
+            return false;
+        };
+        if stream.play().is_err() {
+            return false;
+        }
+        let deadline = Instant::now() + PROBE_FIRST_CALLBACK;
+        while Instant::now() < deadline {
+            if called.load(Ordering::Acquire) {
+                return true;
+            }
+            if failed.load(Ordering::Acquire) {
+                return false;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        false
     }
 
     /// Open the requested devices the way both a start and a restart do. A requested output that
     /// is not connected, or is connected but cannot run the stream, is stood in for by the system
     /// default; a requested input in either state leaves the run without capture (the output
-    /// callback hands the plugin silence). Both are logged, kept as wanted and watched for. Only
-    /// "no output device at all" is an error.
+    /// callback hands the plugin silence). Both are logged, kept as wanted and watched for. A
+    /// device in `quarantined` — its stream kept dying — is refused without an attempt. Only "no
+    /// output device at all" is an error.
     ///
     /// A start takes the opened output's native sample rate into `config`, so CoreAudio and WASAPI
     /// do no internal conversion; a restart keeps the session's rate, which the plugin cannot
-    /// change. What the stream is open on is published either way, so the host application's
-    /// status is true even while nothing could be opened.
+    /// change, and never switches a requested device's own rate to reach it. What the stream is
+    /// open on is published either way, so the host application's status is true even while
+    /// nothing could be opened.
     fn open_devices(
         host: &cpal::Host,
         config: &mut WrapperConfig,
         layout: &AudioIOLayout,
         start: Start,
+        quarantined: &[Wanted],
     ) -> Result<OpenedDevices> {
         let mut in_use = AudioDevicesInUse::default();
-        let mut absent = Vec::new();
-        let mut refused = Vec::new();
+        let mut opened = OpenedDevicesSoFar::default();
 
         let output_channels = main_channels(layout.main_output_channels);
         let mut output = None;
         if let Some(name) = config.output_device.clone() {
-            match Self::resolve_output(host, &name, config, output_channels, start) {
-                Resolved::Open(opened) => {
+            let wanted = Wanted {
+                name: name.clone(),
+                kind: Kind::Output,
+            };
+            let resolved = if quarantined.contains(&wanted) {
+                Resolved::Refused(anyhow::anyhow!("the stream on it keeps dying"))
+            } else {
+                Self::resolve_output(host, &name, config, output_channels, start)
+            };
+            match resolved {
+                Resolved::Open(device) => {
                     in_use.output = Some(name);
-                    output = Some(opened);
+                    output = Some(device);
                 }
                 Resolved::Refused(err) => {
                     nih_error!(
                         "Output device '{name}' cannot open the audio stream, playing through the \
                          system default until it can: {err:#}"
                     );
-                    in_use.refused_output = Some(name.clone());
-                    refused.push(Wanted {
-                        name,
-                        kind: Kind::Output,
-                    });
+                    in_use.refused_output = Some(name);
+                    opened.refused(wanted, quarantined);
                 }
                 Resolved::Absent => {
                     nih_log!(
@@ -817,10 +967,7 @@ impl CpalMidir {
                          default until it is back{}",
                         start.available(host)
                     );
-                    absent.push(Wanted {
-                        name,
-                        kind: Kind::Output,
-                    });
+                    opened.absent.push(wanted);
                 }
             }
         }
@@ -847,21 +994,27 @@ impl CpalMidir {
         let mut input = None;
         if let Some(name) = config.input_device.clone() {
             let input_channels = main_channels(layout.main_input_channels);
-            match Self::resolve_input(host, &name, config, input_channels) {
-                Resolved::Open(opened) => {
+            let wanted = Wanted {
+                name: name.clone(),
+                kind: Kind::Input,
+            };
+            let resolved = if quarantined.contains(&wanted) {
+                Resolved::Refused(anyhow::anyhow!("the stream on it keeps dying"))
+            } else {
+                Self::resolve_input(host, &name, config, input_channels, start)
+            };
+            match resolved {
+                Resolved::Open(device) => {
                     in_use.input = Some(name);
-                    input = Some(opened);
+                    input = Some(device);
                 }
                 Resolved::Refused(err) => {
                     nih_error!(
                         "Input device '{name}' cannot open the audio stream, audio input is off \
                          until it can: {err:#}"
                     );
-                    in_use.refused_input = Some(name.clone());
-                    refused.push(Wanted {
-                        name,
-                        kind: Kind::Input,
-                    });
+                    in_use.refused_input = Some(name);
+                    opened.refused(wanted, quarantined);
                 }
                 Resolved::Absent => {
                     nih_log!(
@@ -869,20 +1022,19 @@ impl CpalMidir {
                          back{}",
                         start.available(host)
                     );
-                    absent.push(Wanted {
-                        name,
-                        kind: Kind::Input,
-                    });
+                    opened.absent.push(wanted);
                 }
             }
         }
 
-        publish_audio_devices_in_use(in_use);
+        publish_audio_devices_in_use(in_use.clone());
         Ok(OpenedDevices {
             output,
             input,
-            absent,
-            refused,
+            in_use,
+            absent: opened.absent,
+            refused: opened.refused,
+            quarantined: opened.quarantined,
         })
     }
 
@@ -899,8 +1051,8 @@ impl CpalMidir {
             .unwrap_or_default()
     }
 
-    /// The first device listed under `name` that `open` accepts; refused when there are devices
-    /// by that name but none opens.
+    /// The first candidate that `open` accepts; refused when there are candidates but none opens,
+    /// absent when there are none.
     fn resolve(candidates: Vec<Device>, open: impl Fn(Device) -> Result<CpalDevice>) -> Resolved {
         let mut refused = None;
         for device in candidates {
@@ -922,7 +1074,20 @@ impl CpalMidir {
         num_output_channels: usize,
         start: Start,
     ) -> Resolved {
-        Self::resolve(Self::devices_named(host, name), |device| {
+        let candidates = Self::devices_named(host, name)
+            .into_iter()
+            .filter(|device| {
+                device
+                    .supported_output_configs()
+                    .map(|mut configs| configs.next().is_some())
+                    .unwrap_or(false)
+            })
+            .collect();
+        Self::resolve(candidates, |device| {
+            if start == Start::Restart {
+                let current = device.default_output_config().ok().map(|c| c.sample_rate());
+                Self::runs_at_session_rate(current, config)?;
+            }
             Self::open_output(device, config, num_output_channels, start)
         })
     }
@@ -932,10 +1097,46 @@ impl CpalMidir {
         name: &str,
         config: &WrapperConfig,
         num_input_channels: usize,
+        start: Start,
     ) -> Resolved {
-        Self::resolve(Self::devices_named(host, name), |device| {
+        let candidates = Self::devices_named(host, name)
+            .into_iter()
+            .filter(|device| {
+                device
+                    .supported_input_configs()
+                    .map(|mut configs| configs.next().is_some())
+                    .unwrap_or(false)
+            })
+            .collect();
+        Self::resolve(candidates, |device| {
+            if start == Start::Restart {
+                let current = device.default_input_config().ok().map(|c| c.sample_rate());
+                Self::runs_at_session_rate(current, config)?;
+            }
             Self::build_input_cpal_device(device, config, num_input_channels)
         })
+    }
+
+    /// A requested device that comes back mid-session has to run at the session's rate already.
+    /// Opening it at another rate would switch the device — system-wide on CoreAudio — under any
+    /// other application using it, so it is refused instead, with the reason.
+    fn runs_at_session_rate(
+        current: Option<cpal::SampleRate>,
+        config: &WrapperConfig,
+    ) -> Result<()> {
+        if let Some(rate) = current {
+            if (rate.0 as f32 - config.sample_rate).abs() > 0.1 {
+                anyhow::bail!(
+                    "the device runs at {} Hz while this session runs at {} Hz; a device is never \
+                     switched to another rate under other applications, so set it to {} Hz or \
+                     restart to adopt its rate",
+                    rate.0,
+                    config.sample_rate,
+                    config.sample_rate
+                );
+            }
+        }
+        Ok(())
     }
 
     /// The output configuration `device` runs the stream with: at its own native rate on a start
@@ -1509,7 +1710,10 @@ where
         return None;
     }
     if start_failed() {
-        nih_error!("The capture stream failed while starting, running without audio input");
+        nih_error!(
+            "The capture stream failed or delivered nothing while starting, running without audio \
+             input"
+        );
         return None;
     }
     Some(stream)
