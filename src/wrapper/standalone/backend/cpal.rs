@@ -6,7 +6,7 @@ use cpal::{
 use crossbeam::sync::{Parker, Unparker};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use midir::{
     MidiInput, MidiInputConnection, MidiInputPort, MidiOutput, MidiOutputConnection, MidiOutputPort,
 };
@@ -18,7 +18,9 @@ use std::ptr::NonNull;
 use std::thread::ScopedJoinHandle;
 
 use super::super::config::WrapperConfig;
-use super::{Backend, RunOutcome};
+use super::super::{publish_audio_devices_in_use, AudioDevicesInUse};
+use super::device_watch::DeviceWatch;
+use super::{sleep_unless, Backend, RunOutcome};
 use crate::midi::MidiResult;
 use crate::prelude::{
     AudioIOLayout, AuxiliaryBuffers, Buffer, MidiConfig, NoteEvent, Plugin, PluginNoteEvent,
@@ -27,6 +29,11 @@ use crate::prelude::{
 use crate::wrapper::util::buffer_management::{BufferManager, ChannelPointers};
 
 const MIDI_EVENT_QUEUE_CAPACITY: usize = 2048;
+
+/// How often the device NAMES are listed while a requested device is not open, or while waiting
+/// for the hardware to change. A plain listing: no configuration queries, so it costs nothing
+/// audible.
+const DEVICE_POLL_INTERVAL: Duration = Duration::from_secs(2);
 
 /// Uses CPAL for audio and midir for MIDI.
 pub struct CpalMidir {
@@ -40,6 +47,9 @@ pub struct CpalMidir {
 
     midi_input: Mutex<Option<MidirInputDevice>>,
     midi_output: Mutex<Option<MidirOutputDevice>>,
+
+    /// The requested devices that are not open, and when to try them again.
+    watch: Mutex<DeviceWatch>,
 }
 
 /// All data needed for a CPAL input or output stream.
@@ -144,6 +154,31 @@ impl<P: Plugin> Backend<P> for CpalMidir {
             // output spinning on an input ring buffer that will never fill up again).
             let parker = Parker::new();
             let unparker = parker.unparker().clone();
+
+            // While another device stands in for a requested one, watch for it: a cheap name
+            // listing every couple of seconds on its own thread, so the stream is never held up.
+            // The flag ends this run as `DeviceReturned` and the wrapper reinitializes onto it.
+            let device_returned = Arc::new(AtomicBool::new(false));
+            let watch_stop = Arc::new(AtomicBool::new(false));
+            if !self.watch.lock().is_idle() {
+                let watch = &self.watch;
+                let host_id = self.host_id;
+                let device_returned = device_returned.clone();
+                let watch_stop = watch_stop.clone();
+                let unparker = unparker.clone();
+                s.spawn(move || {
+                    while !sleep_unless(&watch_stop, DEVICE_POLL_INTERVAL) {
+                        let names = cpal::host_from_id(host_id)
+                            .map(|host| device_names(&host))
+                            .unwrap_or_default();
+                        if watch.lock().poll(&names, Instant::now()) {
+                            device_returned.store(true, Ordering::Release);
+                            unparker.unpark();
+                            break;
+                        }
+                    }
+                });
+            }
 
             let mut _input_stream: Option<Stream> = None;
             let mut input_rb_consumer: Option<rtrb::Consumer<f32>> = None;
@@ -414,12 +449,14 @@ impl<P: Plugin> Backend<P> for CpalMidir {
                     if stream_error.load(Ordering::Acquire)
                         || callback_stopped.load(Ordering::Acquire)
                         || should_stop.load(Ordering::SeqCst)
+                        || device_returned.load(Ordering::Acquire)
                     {
                         break;
                     }
                 }
             }
             drop(output_stream);
+            watch_stop.store(true, Ordering::Release);
 
             // The Midir API requires us to take things out of Options and transform between these
             // structs
@@ -447,12 +484,16 @@ impl<P: Plugin> Backend<P> for CpalMidir {
                 });
 
             // A stop requested by the process callback wins over a simultaneous stream error: the
-            // plugin already decided to shut down, so the caller must not try to recover.
-            if setup_failed
-                || (stream_error.load(Ordering::Acquire)
-                    && !callback_stopped.load(Ordering::Acquire))
-            {
+            // plugin already decided to shut down, so the caller must not try to recover. Either
+            // kind of stop also wins over a device that came back at the same moment.
+            let callback_stopped = callback_stopped.load(Ordering::Acquire);
+            if setup_failed || (stream_error.load(Ordering::Acquire) && !callback_stopped) {
                 RunOutcome::StreamFailed
+            } else if !callback_stopped
+                && !should_stop.load(Ordering::SeqCst)
+                && device_returned.load(Ordering::Acquire)
+            {
+                RunOutcome::DeviceReturned
             } else {
                 RunOutcome::Stopped
             }
@@ -464,31 +505,124 @@ impl<P: Plugin> Backend<P> for CpalMidir {
 
         // Unlike `new()` there is deliberately no native-sample-rate override here:
         // `self.config.sample_rate` is the rate the plugin and the wrapper were initialized with
-        // and cannot change mid-session. If the (new) device can't run at it, this fails and the
-        // caller decides whether to retry or give up. For a default-device selection this picks up
-        // whatever the *current* system default is; for a named device it retries that name, which
-        // succeeds once the device is plugged back in.
+        // and cannot change mid-session.
+        //
+        // A requested output that is not connected, or is connected but cannot run the session's
+        // stream, is stood in for by the system default — the same rule the launch path applies
+        // between two starts — and is watched for so the stream moves back onto it when it can.
+        // Only "no output device at all" is an error. For a default-device selection this picks
+        // up whatever the *current* system default is.
         let num_output_channels = self
             .audio_io_layout
             .main_output_channels
             .map(NonZeroU32::get)
             .unwrap_or_default() as usize;
-        let output_device = Self::find_output_device(&host, &self.config)?;
-        self.output = Self::build_output_cpal_device(output_device, &self.config, num_output_channels)?;
+        let mut wanted = Vec::new();
+        let mut in_use = AudioDevicesInUse::default();
 
-        if self.config.input_device.is_some() {
+        let requested_output = match &self.config.output_device {
+            Some(name) => match Self::named_output(&host, name)? {
+                Some(device) => {
+                    match Self::build_output_cpal_device(device, &self.config, num_output_channels)
+                    {
+                        Ok(output) => Some(output),
+                        Err(err) => {
+                            nih_error!(
+                                "Output device '{name}' cannot open the audio stream, playing \
+                                 through the system default until it can: {err:#}"
+                            );
+                            in_use.refused_output = Some(name.clone());
+                            None
+                        }
+                    }
+                }
+                None => {
+                    nih_log!(
+                        "Output device '{name}' is not connected, playing through the system \
+                         default until it is back"
+                    );
+                    None
+                }
+            },
+            None => None,
+        };
+        self.output = match requested_output {
+            Some(output) => {
+                in_use.output = self.config.output_device.clone();
+                output
+            }
+            None => {
+                wanted.extend(self.config.output_device.clone());
+                let device = host
+                    .default_output_device()
+                    .context("No default audio output device available")?;
+                Self::build_output_cpal_device(device, &self.config, num_output_channels)?
+            }
+        };
+
+        // A requested input that is not there, or cannot open, leaves the run without capture
+        // (the output callback hands the plugin silence) rather than taking the output down.
+        if let Some(name) = &self.config.input_device {
             let num_input_channels = self
                 .audio_io_layout
                 .main_input_channels
                 .map(NonZeroU32::get)
                 .unwrap_or_default() as usize;
-            self.input = Self::find_input_device(&host, &self.config)?
-                .map(|device| Self::build_input_cpal_device(device, &self.config, num_input_channels))
-                .transpose()?;
+            self.input = match Self::named_input(&host, name)? {
+                Some(device) => {
+                    match Self::build_input_cpal_device(device, &self.config, num_input_channels) {
+                        Ok(input) => {
+                            in_use.input = Some(name.clone());
+                            Some(input)
+                        }
+                        Err(err) => {
+                            nih_error!(
+                                "Input device '{name}' cannot open the audio stream, audio input \
+                                 is off until it can: {err:#}"
+                            );
+                            in_use.refused_input = Some(name.clone());
+                            wanted.push(name.clone());
+                            None
+                        }
+                    }
+                }
+                None => {
+                    nih_log!(
+                        "Input device '{name}' is not connected, audio input is off until it is \
+                         back"
+                    );
+                    wanted.push(name.clone());
+                    None
+                }
+            };
         }
 
+        *self.watch.lock() = DeviceWatch::new(wanted, device_names(&host), Instant::now());
+        publish_audio_devices_in_use(in_use);
         Ok(())
     }
+
+    fn wait_for_device_change(&self, should_stop: &AtomicBool, max: Duration) {
+        let Ok(host) = cpal::host_from_id(self.host_id) else {
+            sleep_unless(should_stop, max);
+            return;
+        };
+        let before = device_names(&host);
+        let deadline = Instant::now() + max;
+        while Instant::now() < deadline {
+            if sleep_unless(should_stop, DEVICE_POLL_INTERVAL) || device_names(&host) != before {
+                return;
+            }
+        }
+    }
+}
+
+/// Every device the host lists, by name. A plain listing — no configuration queries — so it is
+/// cheap enough to poll.
+fn device_names(host: &cpal::Host) -> Vec<String> {
+    host.devices()
+        .map(|devices| devices.filter_map(|device| device.name().ok()).collect())
+        .unwrap_or_default()
 }
 
 impl CpalMidir {
@@ -637,6 +771,13 @@ impl CpalMidir {
             None => None,
         };
 
+        publish_audio_devices_in_use(AudioDevicesInUse {
+            output: config.output_device.clone(),
+            input: input.as_ref().and(config.input_device.clone()),
+            refused_output: None,
+            refused_input: None,
+        });
+
         Ok(CpalMidir {
             config,
             audio_io_layout,
@@ -647,6 +788,8 @@ impl CpalMidir {
 
             midi_input: Mutex::new(midi_input),
             midi_output: Mutex::new(midi_output),
+
+            watch: Mutex::new(DeviceWatch::new(Vec::new(), Vec::new(), Instant::now())),
         })
     }
 
@@ -683,6 +826,22 @@ impl CpalMidir {
                 Ok(device)
             })
             .transpose()
+    }
+
+    /// The output device called `name`, if the host offers one that can play at all right now.
+    fn named_output(host: &cpal::Host, name: &str) -> Result<Option<Device>> {
+        Ok(host
+            .output_devices()
+            .context("No audio output devices available")?
+            .find(|d| d.name().as_deref().map(|n| n == name).unwrap_or(false)))
+    }
+
+    /// The input device called `name`, if the host offers one that can capture at all right now.
+    fn named_input(host: &cpal::Host, name: &str) -> Result<Option<Device>> {
+        Ok(host
+            .input_devices()
+            .context("No audio input devices available")?
+            .find(|d| d.name().as_deref().map(|n| n == name).unwrap_or(false)))
     }
 
     fn find_output_device(host: &cpal::Host, config: &WrapperConfig) -> Result<Device> {

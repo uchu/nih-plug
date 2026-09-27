@@ -1,6 +1,8 @@
 //! A standalone plugin target that directly connects to the system's audio and MIDI ports instead
 //! of relying on a plugin host. This is mostly useful for quickly testing GUI changes.
 
+use std::sync::RwLock;
+
 use clap::{CommandFactory, FromArgMatches};
 
 use self::backend::Backend;
@@ -12,7 +14,37 @@ use crate::prelude::Plugin;
 mod backend;
 mod config;
 mod context;
+mod recovery;
 mod wrapper;
+
+/// The audio devices the standalone's stream is open on right now.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct AudioDevicesInUse {
+    /// The output the stream plays through. `None` is the system default: what was asked for, or
+    /// standing in for a requested output that is not connected or could not open.
+    pub output: Option<String>,
+    /// The device audio input is read from. `None` is no capture: none was asked for, or the
+    /// requested input is not connected or could not open.
+    pub input: Option<String>,
+    /// A requested output that is connected but could not open the session's stream.
+    pub refused_output: Option<String>,
+    /// A requested input that is connected but could not open the session's stream.
+    pub refused_input: Option<String>,
+}
+
+static AUDIO_DEVICES_IN_USE: RwLock<Option<AudioDevicesInUse>> = RwLock::new(None);
+
+/// What the running standalone's audio stream is open on. `None` until a backend that names its
+/// devices (CPAL) has opened one. Follows the stream across an unplug, the stand-in and the return.
+pub fn audio_devices_in_use() -> Option<AudioDevicesInUse> {
+    AUDIO_DEVICES_IN_USE.read().ok().and_then(|slot| slot.clone())
+}
+
+pub(crate) fn publish_audio_devices_in_use(in_use: AudioDevicesInUse) {
+    if let Ok(mut slot) = AUDIO_DEVICES_IN_USE.write() {
+        *slot = Some(in_use);
+    }
+}
 
 /// Open an NIH-plug plugin as a standalone application. If the plugin has an editor, this will open
 /// the editor and block until the editor is closed. Otherwise this will block until SIGINT is

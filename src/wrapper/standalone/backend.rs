@@ -1,9 +1,11 @@
-use std::sync::atomic::AtomicBool;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use crate::prelude::{AuxiliaryBuffers, PluginNoteEvent, Transport};
 
 mod cpal;
+pub mod device_watch;
 mod dummy;
 mod jack;
 
@@ -22,6 +24,21 @@ pub enum RunOutcome {
     /// The audio stream failed, e.g. because the audio device was disconnected. The caller may try
     /// [`Backend::reinit()`] followed by another [`Backend::run()`] call to recover.
     StreamFailed,
+    /// A requested device that another device was standing in for is available again. Not a
+    /// failure: the caller should [`Backend::reinit()`] and [`Backend::run()`] again to move onto it.
+    DeviceReturned,
+}
+
+/// Sleep for `duration` in short slices. `true` when `should_stop` was raised meanwhile.
+pub(crate) fn sleep_unless(should_stop: &AtomicBool, duration: Duration) -> bool {
+    let deadline = Instant::now() + duration;
+    while Instant::now() < deadline {
+        if should_stop.load(Ordering::SeqCst) {
+            return true;
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    should_stop.load(Ordering::SeqCst)
 }
 
 /// An audio+MIDI backend for the standalone wrapper.
@@ -50,5 +67,13 @@ pub trait Backend<P: Plugin>: 'static + Send + Sync {
     /// support recovery return an error.
     fn reinit(&mut self) -> anyhow::Result<()> {
         anyhow::bail!("Audio device recovery is not supported by this backend")
+    }
+
+    /// Block until the audio devices on the host change, `max` has passed or `should_stop` is
+    /// raised. Used between failed [`reinit()`][Self::reinit()] attempts so a device that comes
+    /// back is picked up promptly without hammering the backend. Backends without a device list
+    /// simply wait.
+    fn wait_for_device_change(&self, should_stop: &AtomicBool, max: Duration) {
+        sleep_unless(should_stop, max);
     }
 }

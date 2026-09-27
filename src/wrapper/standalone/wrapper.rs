@@ -9,9 +9,10 @@ use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::thread;
-use std::time::{Duration, Instant};
+use std::time::Instant;
 
-use super::backend::{Backend, RunOutcome};
+use super::backend::{sleep_unless, Backend, RunOutcome};
+use super::recovery::{Action, Recovery};
 use super::config::WrapperConfig;
 use super::context::{WrapperGuiContext, WrapperInitContext, WrapperProcessContext};
 use crate::event_loop::{EventLoop, MainThreadExecutor, OsEventLoop};
@@ -627,21 +628,16 @@ impl<P: Plugin, B: Backend<P>> Wrapper<P, B> {
 
     /// The audio thread. This should be called from another thread, and it will run until
     /// `should_terminate` is `true`. If the audio stream dies (e.g. the device was disconnected),
-    /// this attempts to recover by reinitializing the backend — on the new system default device
-    /// when no specific device was requested — with bounded, interruptible backoff. If recovery
-    /// is impossible the thread exits and the application keeps running without audio.
+    /// this recovers by reinitializing the backend — which stands the system default in for a
+    /// requested device that is gone and moves back onto it when it returns — with interruptible
+    /// backoff (see [`Recovery`]). The application never ends up without audio for good: when
+    /// nothing can be opened it waits for the audio hardware to change and tries again.
     fn run_audio_thread(
         self: Arc<Self>,
         should_terminate: Arc<AtomicBool>,
         gui_task_sender: channel::Sender<GuiTask>,
     ) {
-        const MAX_RETRIES: u32 = 5;
-        const BACKOFF_MS: [u64; 5] = [250, 500, 1000, 2000, 4000];
-        /// A run that lasted at least this long counts as healthy, so a later stream failure (a
-        /// second unplug an hour later) starts with a fresh retry budget.
-        const STABLE_RUN_THRESHOLD: Duration = Duration::from_secs(10);
-
-        let mut failed_attempts = 0u32;
+        let mut recovery = Recovery::new();
         loop {
             let run_started = Instant::now();
             let outcome = {
@@ -752,48 +748,57 @@ impl<P: Plugin, B: Backend<P>> Wrapper<P, B> {
             if should_terminate.load(Ordering::SeqCst) {
                 break;
             }
-            match outcome {
+            let action = match outcome {
                 // The plugin or the user asked to stop; same behavior as before the restart loop
                 RunOutcome::Stopped => break,
-                RunOutcome::StreamFailed => {
-                    if run_started.elapsed() > STABLE_RUN_THRESHOLD {
-                        failed_attempts = 0;
+                RunOutcome::StreamFailed => recovery.stream_failed(run_started.elapsed()),
+                RunOutcome::DeviceReturned => recovery.device_returned(),
+            };
+            match action {
+                Action::Reinit { backoff } => {
+                    nih_error!("The audio stream died, attempting to recover in {backoff:?}");
+                    if sleep_unless(&should_terminate, backoff) {
+                        return;
                     }
-                    if failed_attempts >= MAX_RETRIES {
-                        nih_error!(
-                            "The audio stream died and could not be recovered after \
-                             {MAX_RETRIES} attempts. Audio is disabled; the application will \
-                             keep running."
-                        );
+                }
+                Action::ReinitNow => {
+                    nih_log!("A requested audio device is available again, switching to it");
+                }
+                Action::WaitForHardware => {
+                    nih_error!(
+                        "The audio stream keeps dying; waiting for the audio hardware to change \
+                         before trying again"
+                    );
+                    self.backend
+                        .borrow()
+                        .wait_for_device_change(&should_terminate, Recovery::HARDWARE_WAIT);
+                }
+            }
+
+            // Never `run()` on a backend whose devices are stale: reinitialize until it succeeds.
+            // A failure here (no output device at all, the audio API gone) is not a stream death;
+            // it waits for the hardware to change — capped, so a transient refusal is retried
+            // regardless — and tries again.
+            loop {
+                if should_terminate.load(Ordering::SeqCst) {
+                    return;
+                }
+                match self.backend.borrow_mut().reinit() {
+                    Ok(()) => {
+                        // The stream died mid-note; clear held voices and effect tails that
+                        // accumulated across the audio gap before the new stream starts.
+                        process_wrapper(|| self.plugin.lock().reset());
+                        nih_log!("Audio device reinitialized, resuming playback");
                         break;
                     }
-
-                    let backoff = Duration::from_millis(BACKOFF_MS[failed_attempts as usize]);
-                    failed_attempts += 1;
-                    nih_error!(
-                        "The audio stream died, attempting to recover in {backoff:?} (attempt \
-                         {failed_attempts}/{MAX_RETRIES})"
-                    );
-                    let deadline = Instant::now() + backoff;
-                    while Instant::now() < deadline {
-                        if should_terminate.load(Ordering::SeqCst) {
-                            return;
-                        }
-                        thread::sleep(Duration::from_millis(50));
-                    }
-
-                    match self.backend.borrow_mut().reinit() {
-                        Ok(()) => {
-                            // The stream died mid-note; clear held voices and effect tails that
-                            // accumulated across the audio gap before the new stream starts.
-                            process_wrapper(|| self.plugin.lock().reset());
-                            nih_log!("Audio device reinitialized, resuming playback");
-                        }
-                        // Fall through: the next `run()` attempt fails fast and consumes the
-                        // next retry slot
-                        Err(err) => {
-                            nih_error!("Could not reinitialize the audio backend: {err:#}")
-                        }
+                    Err(err) => {
+                        nih_error!(
+                            "Could not reinitialize the audio backend, waiting for an audio \
+                             device change: {err:#}"
+                        );
+                        self.backend
+                            .borrow()
+                            .wait_for_device_change(&should_terminate, Recovery::HARDWARE_WAIT);
                     }
                 }
             }
