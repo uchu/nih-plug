@@ -24,6 +24,16 @@ pub enum FloatRange {
     },
     /// A reversed range that goes from high to low instead of from low to high.
     Reversed(&'static FloatRange),
+    /// A shipped range kept bit-exact in the lower half of the knob, with the upper half reaching
+    /// past its old maximum. For `normalized <= 0.5` the value is `base` at `2 * normalized`;
+    /// halving and doubling are exact in floating point, so every value the base range could
+    /// hold normalizes and unnormalizes to exactly what it did before the extension. Above
+    /// 0.5 the range runs from `base`'s maximum to `max`, skewed by `factor` like `Skewed`.
+    Extended {
+        base: &'static FloatRange,
+        max: f32,
+        factor: f32,
+    },
 }
 
 /// A distribution for an integer parameter's range. All range endpoints are inclusive. Only linear
@@ -95,6 +105,15 @@ impl FloatRange {
                 }
             }
             FloatRange::Reversed(range) => 1.0 - range.normalize(plain),
+            FloatRange::Extended { base, max, factor } => {
+                let base_max = base.unnormalize(1.0);
+                if plain <= base_max {
+                    base.normalize(plain) * 0.5
+                } else {
+                    let proportion = (plain.min(*max) - base_max) / (max - base_max);
+                    0.5 + 0.5 * proportion.powf(*factor)
+                }
+            }
         }
     }
 
@@ -127,6 +146,14 @@ impl FloatRange {
                 (skewed_proportion * (max - min)) + min
             }
             FloatRange::Reversed(range) => range.unnormalize(1.0 - normalized),
+            FloatRange::Extended { base, max, factor } => {
+                if normalized <= 0.5 {
+                    base.unnormalize(normalized * 2.0)
+                } else {
+                    let base_max = base.unnormalize(1.0);
+                    base_max + (max - base_max) * ((normalized - 0.5) * 2.0).powf(factor.recip())
+                }
+            }
         }
     }
 
@@ -138,9 +165,11 @@ impl FloatRange {
         // range up into 50 segments, but if `self.step_size` would cause the range to be devided
         // into less than 50 segments then we'll use that.
         match self {
-            FloatRange::Linear { min, max }
-            | FloatRange::Skewed { min, max, .. }
-            | FloatRange::SymmetricalSkewed { min, max, .. } => {
+            FloatRange::Linear { .. }
+            | FloatRange::Skewed { .. }
+            | FloatRange::SymmetricalSkewed { .. }
+            | FloatRange::Extended { .. } => {
+                let (min, max) = self.plain_bounds();
                 let normalized_naive_step_size = if finer { 0.005 } else { 0.02 };
                 let naive_step =
                     self.unnormalize(self.normalize(from) - normalized_naive_step_size);
@@ -153,7 +182,7 @@ impl FloatRange {
                     Some(step_size) => from - step_size,
                     None => naive_step,
                 }
-                .clamp(*min, *max)
+                .clamp(min, max)
             }
             FloatRange::Reversed(range) => range.next_step(from, step_size, finer),
         }
@@ -164,9 +193,11 @@ impl FloatRange {
     pub fn next_step(&self, from: f32, step_size: Option<f32>, finer: bool) -> f32 {
         // See above
         match self {
-            FloatRange::Linear { min, max }
-            | FloatRange::Skewed { min, max, .. }
-            | FloatRange::SymmetricalSkewed { min, max, .. } => {
+            FloatRange::Linear { .. }
+            | FloatRange::Skewed { .. }
+            | FloatRange::SymmetricalSkewed { .. }
+            | FloatRange::Extended { .. } => {
+                let (min, max) = self.plain_bounds();
                 let normalized_naive_step_size = if finer { 0.005 } else { 0.02 };
                 let naive_step =
                     self.unnormalize(self.normalize(from) + normalized_naive_step_size);
@@ -178,7 +209,7 @@ impl FloatRange {
                     Some(step_size) => from + step_size,
                     None => naive_step,
                 }
-                .clamp(*min, *max)
+                .clamp(min, max)
             }
             FloatRange::Reversed(range) => range.previous_step(from, step_size, finer),
         }
@@ -187,10 +218,12 @@ impl FloatRange {
     /// Snap a value to a step size, clamping to the minimum and maximum value of the range.
     pub fn snap_to_step(&self, value: f32, step_size: f32) -> f32 {
         match self {
-            FloatRange::Linear { min, max }
-            | FloatRange::Skewed { min, max, .. }
-            | FloatRange::SymmetricalSkewed { min, max, .. } => {
-                ((value / step_size).round() * step_size).clamp(*min, *max)
+            FloatRange::Linear { .. }
+            | FloatRange::Skewed { .. }
+            | FloatRange::SymmetricalSkewed { .. }
+            | FloatRange::Extended { .. } => {
+                let (min, max) = self.plain_bounds();
+                ((value / step_size).round() * step_size).clamp(min, max)
             }
             FloatRange::Reversed(range) => range.snap_to_step(value, step_size),
         }
@@ -212,6 +245,33 @@ impl FloatRange {
                 );
             }
             FloatRange::Reversed(range) => range.assert_validity(),
+            FloatRange::Extended { base, max, factor } => {
+                base.assert_validity();
+                let base_max = base.unnormalize(1.0);
+                nih_debug_assert!(
+                    base_max < *max,
+                    "The extended range maximum ({}) needs to be greater than its base range's \
+                     maximum ({})",
+                    max,
+                    base_max
+                );
+                nih_debug_assert!(
+                    *factor > 0.0,
+                    "The extended range's skew factor ({}) needs to be positive",
+                    factor
+                );
+            }
+        }
+    }
+
+    /// The plain value bounds of the range, regardless of its direction.
+    fn plain_bounds(&self) -> (f32, f32) {
+        match self {
+            FloatRange::Linear { min, max }
+            | FloatRange::Skewed { min, max, .. }
+            | FloatRange::SymmetricalSkewed { min, max, .. } => (*min, *max),
+            FloatRange::Reversed(range) => range.plain_bounds(),
+            FloatRange::Extended { base, max, .. } => (base.unnormalize(0.0), *max),
         }
     }
 }
@@ -478,6 +538,123 @@ mod tests {
                 linear_range.unnormalize(0.25),
                 skewed_range.unnormalize(0.25)
             );
+        }
+    }
+
+    mod extended {
+        use super::*;
+
+        static BASE: FloatRange = FloatRange::Skewed {
+            min: 0.5,
+            max: 500.0,
+            factor: 0.25,
+        };
+        static EXTENDED: FloatRange = FloatRange::Extended {
+            base: &BASE,
+            max: 1000.0,
+            factor: 1.0,
+        };
+
+        #[test]
+        fn base_factor_matches_skew_factor() {
+            assert_eq!(FloatRange::skew_factor(-2.0), 0.25);
+        }
+
+        fn assert_embedded(plain: f32) {
+            assert_eq!(
+                EXTENDED.normalize(plain).to_bits(),
+                (BASE.normalize(plain) * 0.5).to_bits(),
+                "normalize({plain})"
+            );
+            assert_eq!(
+                EXTENDED.unnormalize(EXTENDED.normalize(plain)).to_bits(),
+                BASE.unnormalize(BASE.normalize(plain)).to_bits(),
+                "round trip of {plain}"
+            );
+        }
+
+        #[test]
+        fn base_half_is_bit_exact() {
+            for plain in [0.5, 500.0, 265.32462, 4.9999995, 5.0000005, 2.0000005] {
+                assert_embedded(plain);
+            }
+
+            let mut plain = 0.5f32;
+            let mut count = 0;
+            while plain < 500.0 {
+                assert_embedded(plain);
+                count += 1;
+                plain = f32::from_bits(plain.to_bits() + 97);
+            }
+            assert!(count >= 200_000, "only {count} values swept");
+
+            let steps = 250_000;
+            for i in 0..=steps {
+                let plain = 0.5 + 499.5 * (i as f32 / steps as f32);
+                assert_embedded(plain.min(500.0));
+            }
+        }
+
+        #[test]
+        fn halves_meet_at_the_base_maximum() {
+            assert_eq!(EXTENDED.normalize(500.0), 0.5);
+            assert_eq!(EXTENDED.unnormalize(0.5), 500.0);
+            assert_eq!(EXTENDED.unnormalize(1.0), 1000.0);
+            assert_eq!(EXTENDED.normalize(1000.0), 1.0);
+            assert_eq!(EXTENDED.normalize(2000.0), 1.0);
+            assert_eq!(EXTENDED.unnormalize(0.0), 0.5);
+            assert_eq!(EXTENDED.normalize(0.0), 0.0);
+
+            let mut previous = EXTENDED.unnormalize(0.0);
+            for i in 1..=1000 {
+                let value = EXTENDED.unnormalize(i as f32 * 1e-3);
+                assert!(value >= previous, "decreasing at {i}e-3");
+                assert!(i < 10 || value > previous, "not increasing at {i}e-3");
+                previous = value;
+            }
+        }
+
+        #[test]
+        fn upper_half_is_skewed() {
+            static SKEWED_UPPER: FloatRange = FloatRange::Extended {
+                base: &BASE,
+                max: 1000.0,
+                factor: 0.5,
+            };
+            assert_eq!(SKEWED_UPPER.unnormalize(0.75), 500.0 + 500.0 * 0.25);
+            assert_eq!(SKEWED_UPPER.normalize(625.0), 0.75);
+        }
+
+        #[test]
+        fn steps() {
+            let from = 750.0;
+            let next = EXTENDED.next_step(from, None, false);
+            assert!(next > from);
+            assert_eq!(EXTENDED.previous_step(next, None, false), from);
+
+            let from = 50.0;
+            let next = EXTENDED.next_step(from, None, false);
+            assert!(next > from);
+            assert!((EXTENDED.previous_step(next, None, false) - from).abs() < 1e-3);
+
+            assert_eq!(EXTENDED.next_step(999.0, Some(10.0), false), 1000.0);
+            assert_eq!(EXTENDED.previous_step(0.6, Some(10.0), false), 0.5);
+            assert_eq!(EXTENDED.next_step(700.0, Some(0.5), true), 705.0);
+            assert_eq!(EXTENDED.snap_to_step(2000.0, 1.0), 1000.0);
+        }
+
+        #[test]
+        fn reversed_extended() {
+            static REVERSED: FloatRange = FloatRange::Reversed(&EXTENDED);
+            assert_eq!(REVERSED.normalize(500.0), 0.5);
+            assert_eq!(REVERSED.unnormalize(0.0), 1000.0);
+            assert_eq!(REVERSED.unnormalize(1.0), 0.5);
+            assert_eq!(REVERSED.normalize(750.0), 1.0 - EXTENDED.normalize(750.0));
+            assert_eq!(
+                REVERSED.next_step(750.0, None, false),
+                EXTENDED.previous_step(750.0, None, false)
+            );
+            REVERSED.assert_validity();
         }
     }
 }

@@ -335,6 +335,10 @@ impl FloatParam {
                 | FloatRange::Skewed { min, max, .. }
                 | FloatRange::SymmetricalSkewed { min, max, .. },
             ) => *min == 0.0 || *max == 0.0 || min.signum() != max.signum(),
+            (SmoothingStyle::Logarithmic(_), FloatRange::Extended { base, max, .. }) => {
+                let min = base.unnormalize(0.0);
+                min == 0.0 || *max == 0.0 || min.signum() != max.signum()
+            }
             _ => false,
         };
         nih_debug_assert!(
