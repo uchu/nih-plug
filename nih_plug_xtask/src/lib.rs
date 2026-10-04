@@ -154,11 +154,8 @@ pub fn main_with_args(command_name: &str, args: impl IntoIterator<Item = String>
     }
 }
 
-/// Change the current directory into the Cargo workspace's root.
-///
-/// This is using a heuristic to find the workspace root. It considers all ancestor directories of
-/// either `CARGO_MANIFEST_DIR` or the current directory, and finds the leftmost one containing a
-/// `Cargo.toml` file.
+/// Change the current directory into the root of the Cargo workspace that contains either
+/// `CARGO_MANIFEST_DIR` or the current directory.
 pub fn chdir_workspace_root() -> Result<()> {
     // This is either the directory of the xtask binary when using `nih_plug_xtask` normally, or any
     // random project when using it through `cargo nih-plug`.
@@ -170,21 +167,25 @@ pub fn chdir_workspace_root() -> Result<()> {
              found",
         )?;
 
-    let workspace_root = project_dir
-        .ancestors()
-        .filter(|dir| dir.join("Cargo.toml").exists())
-        // The ancestors are ordered starting from `project_dir` going up to the filesystem root. So
-        // this is the leftmost matching ancestor.
-        .last()
+    std::env::set_current_dir(workspace_root(&project_dir)?)
+        .context("Could not change to workspace root directory")
+}
+
+/// The workspace `cargo build` would use from `project_dir`. Cargo resolves it, so a workspace
+/// nested inside another one (a git worktree inside the main checkout) is never confused with the
+/// enclosing one.
+fn workspace_root(project_dir: &Path) -> Result<PathBuf> {
+    let metadata = cargo_metadata::MetadataCommand::new()
+        .current_dir(project_dir)
+        .no_deps()
+        .exec()
         .with_context(|| {
             format!(
-                "Could not find a 'Cargo.toml' file in '{}' or any of its parent directories",
+                "Could not resolve the Cargo workspace containing '{}'",
                 project_dir.display()
             )
         })?;
-
-    std::env::set_current_dir(workspace_root)
-        .context("Could not change to workspace root directory")
+    Ok(metadata.workspace_root.into_std_path_buf())
 }
 
 /// Build one or more packages using the provided `cargo build` arguments. This should be called
@@ -848,5 +849,64 @@ pub fn maybe_codesign(bundle_home: &Path, target: CompilationTarget) {
             "WARNING: Could not self-sign '{}', it may fail to run depending on the environment",
             bundle_home.display()
         )
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn write(path: &Path, contents: &str) {
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(path, contents).unwrap();
+    }
+
+    fn workspace(dir: &Path, name: &str) {
+        write(
+            &dir.join("Cargo.toml"),
+            &format!(
+                "[package]\nname = \"{name}\"\nversion = \"0.1.0\"\nedition = \
+                 \"2021\"\n\n[workspace]\nmembers = [\"xtask\"]\n"
+            ),
+        );
+        write(&dir.join("src/lib.rs"), "");
+        write(
+            &dir.join("xtask/Cargo.toml"),
+            &format!(
+                "[package]\nname = \"{name}_xtask\"\nversion = \"0.1.0\"\nedition = \"2021\"\n"
+            ),
+        );
+        write(&dir.join("xtask/src/main.rs"), "fn main() {}\n");
+    }
+
+    /// A git worktree checked out inside the main checkout is a workspace nested in another
+    /// workspace; its xtask must resolve to the inner one, as `cargo build` does.
+    #[test]
+    fn a_workspace_nested_in_another_resolves_to_the_inner_one() {
+        let root = std::env::temp_dir().join(format!(
+            "nih_plug_xtask_nested_workspace_{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&root);
+        let outer = root.join("outer");
+        let inner = outer.join(".claude/worktrees/inner");
+        workspace(&outer, "outer");
+        workspace(&inner, "inner");
+
+        let resolve = |dir: &Path| {
+            workspace_root(dir)
+                .and_then(|p| Ok(p.canonicalize()?))
+                .map_err(|e| e.to_string())
+        };
+        let from_xtask = resolve(&inner.join("xtask"));
+        let from_src = resolve(&inner.join("src"));
+        let from_outer_xtask = resolve(&outer.join("xtask"));
+        let (inner, outer) = (inner.canonicalize(), outer.canonicalize());
+        let _ = fs::remove_dir_all(&root);
+
+        let (inner, outer) = (inner.unwrap(), outer.unwrap());
+        assert_eq!(from_xtask, Ok(inner.clone()));
+        assert_eq!(from_src, Ok(inner));
+        assert_eq!(from_outer_xtask, Ok(outer));
     }
 }

@@ -339,6 +339,7 @@ fn a_state_length_prefix_of_u64_max_is_refused() {
 fn a_zero_max_frames_activation_still_processes_in_bounds() {
     let rig = Rig::new();
     rig.activate(0);
+    assert_eq!(INIT_MAX_BUFFER.with(|m| m.get()), Some(1));
     rig.process(4, &[], None, 2);
     let lens: Vec<usize> = calls().iter().map(|c| c.samples).collect();
     assert_eq!(lens, vec![1, 1, 1, 1]);

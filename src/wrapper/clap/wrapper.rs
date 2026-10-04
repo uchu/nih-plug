@@ -1946,6 +1946,8 @@ impl<P: ClapPlugin> Wrapper<P> {
     ) -> bool {
         check_null_ptr!(false, plugin, (*plugin).plugin_data);
         let wrapper = &*((*plugin).plugin_data as *const Self);
+        // H7: a zero capacity would make the first block grow buffers on the audio thread
+        let max_frames_count = max_frames_count.max(1);
 
         let audio_io_layout = wrapper.current_audio_io_layout.load();
         let buffer_config = BufferConfig {

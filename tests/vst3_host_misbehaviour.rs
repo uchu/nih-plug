@@ -460,6 +460,7 @@ fn a_negative_max_block_size_still_activates_and_processes() {
         assert_eq!(w.setActive(1), kResultOk);
         assert_eq!(w.setProcessing(1), kResultOk);
     }
+    assert_eq!(INIT_MAX_BUFFER.with(|m| m.get()), Some(1));
     calls_of(&w).lock().unwrap().clear();
     let mut inb = HostBuffers::new(2, 4, 0.0);
     let outb = HostBuffers::new(2, 4, 0.0);

@@ -30,6 +30,8 @@ thread_local! {
     /// The wrapper constructs the plug-in itself, so the test reaches its log through this
     /// slot. Thread-local: every `#[test]` thread has its own log.
     pub static CALLS: Arc<Mutex<Vec<Call>>> = Arc::new(Mutex::new(Vec::new()));
+    /// `max_buffer_size` of the last `initialize` on this thread.
+    pub static INIT_MAX_BUFFER: Cell<Option<u32>> = const { Cell::new(None) };
 }
 
 #[derive(Params)]
@@ -75,6 +77,16 @@ impl Plugin for TestPlugin {
 
     fn params(&self) -> Arc<dyn Params> {
         self.params.clone()
+    }
+
+    fn initialize(
+        &mut self,
+        _audio_io_layout: &AudioIOLayout,
+        buffer_config: &BufferConfig,
+        _context: &mut impl InitContext<Self>,
+    ) -> bool {
+        INIT_MAX_BUFFER.with(|m| m.set(Some(buffer_config.max_buffer_size)));
+        true
     }
 
     fn process(
