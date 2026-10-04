@@ -294,40 +294,54 @@ impl<P: Plugin> Backend<P> for CpalMidir {
                 // A capture stream that cannot be built or started must not take the output down
                 // with it: the run goes on without audio input and the output callback hands the
                 // plugin silence. A capture error mid-session still ends the run via `error_cb`.
-                let stream = started_capture(
-                    build_input_streams!(
-                        input.sample_format,
-                        (SampleFormat::I8, i8),
-                        (SampleFormat::I16, i16),
-                        (SampleFormat::I32, i32),
-                        (SampleFormat::I64, i64),
-                        (SampleFormat::U8, u8),
-                        (SampleFormat::U16, u16),
-                        (SampleFormat::U32, u32),
-                        (SampleFormat::U64, u64),
-                        (SampleFormat::F32, f32),
-                        (SampleFormat::F64, f64)
-                    ),
-                    |stream: &Stream| stream.play(),
-                    // Playback is delayed one period if we're capturing audio so it has something
-                    // to process, and the timeout keeps a wedged capture device from blocking this
-                    // thread forever. Until the output stream exists only the capture `error_cb`
-                    // can raise `stream_error`, so a raised flag here is a refused start — and so
-                    // is a capture that started without a word but delivered nothing, which would
-                    // otherwise leave the output callback waiting on an empty ring.
-                    || {
-                        input_parker.park_timeout(Duration::from_secs(2));
-                        let silent = || {
-                            input_rb_consumer
-                                .as_ref()
-                                .map_or(true, |rb| rb.slots() == 0)
-                        };
-                        if silent() {
-                            input_parker.park_timeout(Duration::from_millis(200));
-                        }
-                        stream_error.load(Ordering::Acquire) || silent()
-                    },
+                let built = build_input_streams!(
+                    input.sample_format,
+                    (SampleFormat::I8, i8),
+                    (SampleFormat::I16, i16),
+                    (SampleFormat::I32, i32),
+                    (SampleFormat::I64, i64),
+                    (SampleFormat::U8, u8),
+                    (SampleFormat::U16, u16),
+                    (SampleFormat::U32, u32),
+                    (SampleFormat::U64, u64),
+                    (SampleFormat::F32, f32),
+                    (SampleFormat::F64, f64)
                 );
+                // cpal's ASIO output build holds the device's stream lock while it stops the
+                // running driver and recreates its buffers, and a playing capture callback takes
+                // that lock on the driver thread every period. The capture is therefore played
+                // only once the output exists, right before the output itself.
+                let stream = if self.duplex {
+                    started_capture(
+                        built,
+                        |_: &Stream| Ok::<(), cpal::PlayStreamError>(()),
+                        || false,
+                    )
+                } else {
+                    started_capture(
+                        built,
+                        |stream: &Stream| stream.play(),
+                        // Playback is delayed one period if we're capturing audio so it has
+                        // something to process, and the timeout keeps a wedged capture device from
+                        // blocking this thread forever. Until the output stream exists only the
+                        // capture `error_cb` can raise `stream_error`, so a raised flag here is a
+                        // refused start — and so is a capture that started without a word but
+                        // delivered nothing, which would otherwise leave the output callback
+                        // waiting on an empty ring.
+                        || {
+                            input_parker.park_timeout(Duration::from_secs(2));
+                            let silent = || {
+                                input_rb_consumer
+                                    .as_ref()
+                                    .map_or(true, |rb| rb.slots() == 0)
+                            };
+                            if silent() {
+                                input_parker.park_timeout(Duration::from_millis(200));
+                            }
+                            stream_error.load(Ordering::Acquire) || silent()
+                        },
+                    )
+                };
                 if stream.is_none() {
                     // The capture stream is gone and can no longer raise the flag, so a start
                     // failure it reported must not end the run
@@ -555,6 +569,11 @@ impl<P: Plugin> Backend<P> for CpalMidir {
                 (SampleFormat::F64, f64)
             ) {
                 Ok(stream) => {
+                    if self.duplex {
+                        if let Some(Err(err)) = _input_stream.as_ref().map(Stream::play) {
+                            nih_error!("Could not start the capture stream: {err:#}");
+                        }
+                    }
                     // TODO: Wait a period before doing this when also reading the input
                     if let Err(err) = stream.play() {
                         nih_error!("Error trying to start the output stream: {err:#}");
@@ -826,7 +845,7 @@ impl DeviceUse {
         match self {
             DeviceUse::Shared => requested,
             DeviceUse::Duplex { period_cap } => {
-                let clamped = clamp_period(requested, range);
+                let clamped = clamp_period(period_cap.unwrap_or(requested), range);
                 period_cap.map_or(clamped, |cap| clamped.min(cap))
             }
         }
@@ -903,9 +922,9 @@ pub(crate) fn duplex_pop(consumer: &mut rtrb::Consumer<f32>, underruns: &AtomicU
     })
 }
 
-/// Discards all but the newest `keep` samples. The capture runs alone between its start and the
-/// output's, so the output's first period would otherwise play that backlog and carry it as
-/// latency for the rest of the run.
+/// Discards all but the newest `keep` samples. The capture can run alone for a period between its
+/// start and the output's, so the output's first period would otherwise play that backlog and
+/// carry it as latency for the rest of the run.
 pub(crate) fn duplex_discard_backlog(consumer: &mut rtrb::Consumer<f32>, keep: usize) {
     let stale = consumer.slots().saturating_sub(keep);
     if let Ok(chunk) = consumer.read_chunk(stale) {
@@ -1497,15 +1516,17 @@ impl CpalMidir {
                 ),
                 Start::Restart => {}
             }
-            let range = *current.buffer_size();
-            let period = device_use.period(config.period_size, range);
-            if period < clamp_period(period, range) {
-                nih_log!(
-                    "The driver's smallest buffer is now larger than this session's {period} \
-                     samples; relaunch to use it"
-                );
+            if device_use.is_duplex() {
+                let range = *current.buffer_size();
+                let period = device_use.period(config.period_size, range);
+                if period < clamp_period(period, range) {
+                    nih_log!(
+                        "The driver's smallest buffer is now larger than this session's {period} \
+                         samples; relaunch to use it"
+                    );
+                }
+                config.period_size = period;
             }
-            config.period_size = period;
         }
         Self::build_output_cpal_device(device, &config, num_output_channels)
     }
@@ -2315,7 +2336,17 @@ mod tests {
         };
         assert_eq!(restart.period(512, range(1024, 2048)), 512);
         assert_eq!(restart.period(512, range(64, 256)), 256);
-        assert_eq!(restart.period(256, range(64, 2048)), 256);
+        assert_eq!(restart.period(256, range(64, 2048)), 512);
+    }
+
+    #[test]
+    fn a_duplex_restart_returns_to_the_launch_period_once_the_driver_allows_it() {
+        let restart = DeviceUse::Duplex {
+            period_cap: Some(512),
+        };
+        let shrunk = restart.period(512, range(64, 256));
+        assert_eq!(shrunk, 256);
+        assert_eq!(restart.period(shrunk, range(64, 2048)), 512);
     }
 
     #[test]
