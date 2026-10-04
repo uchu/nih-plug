@@ -12,7 +12,7 @@ use rtrb::RingBuffer;
 use std::borrow::Borrow;
 use std::num::NonZeroU32;
 use std::ptr::NonNull;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::thread::ScopedJoinHandle;
 use std::time::{Duration, Instant};
@@ -44,6 +44,17 @@ pub struct CpalMidir {
     audio_io_layout: AudioIOLayout,
     /// Needed to re-select devices in `reinit()` after the audio stream died.
     host_id: cpal::HostId,
+    /// The host the devices were opened through, kept for `reinit()`: an ASIO host remembers the
+    /// driver it loaded, so its enumeration hands that driver back and refuses every other one,
+    /// where a fresh host would load (and so unload) drivers under the running one (A7).
+    host: cpal::Host,
+    /// A single-device duplex host, see `single_device_duplex`.
+    duplex: bool,
+    /// The period the wrapper was initialized with; a duplex restart never exceeds it.
+    launch_period: u32,
+    /// Duplex input samples dropped on a full ring, and output samples silenced on an empty one.
+    overflows: Arc<AtomicU64>,
+    underruns: Arc<AtomicU64>,
 
     input: Option<CpalDevice>,
     output: CpalDevice,
@@ -196,6 +207,9 @@ impl<P: Plugin> Backend<P> for CpalMidir {
         // wakeup came from `should_stop`.
         let stream_error = Arc::new(AtomicBool::new(false));
         let callback_stopped = Arc::new(AtomicBool::new(false));
+        // A duplex driver never reports a dead stream, so the output callback stamps this and the
+        // wait below watches it (A6).
+        let liveness = Liveness::new();
         // So this is a lot of fun. There are up to four separate streams here, all using their own
         // callbacks. The audio output stream acts as the primary stream, and everything else either
         // sends data to it or (in the case of the MIDI output stream) receives data from it using
@@ -235,10 +249,16 @@ impl<P: Plugin> Backend<P> for CpalMidir {
                     .main_input_channels
                     .map(NonZeroU32::get)
                     .unwrap_or(0) as usize;
-                let (rb_producer, rb_consumer) = RingBuffer::new(
-                    (self.output.config.channels as usize).max(ring_channels)
-                        * self.config.period_size as usize,
-                );
+                let period = self.config.period_size as usize;
+                // A duplex ring holds whole frames, so a full one drops whole frames, and two
+                // periods of them: the driver's period is fixed and both callbacks run once per
+                // period, input first (A5).
+                let capacity = if self.duplex {
+                    ring_channels * period * 2
+                } else {
+                    (self.output.config.channels as usize).max(ring_channels) * period
+                };
+                let (rb_producer, rb_consumer) = RingBuffer::new(capacity);
                 input_rb_consumer = Some(rb_consumer);
 
                 let input_parker = Parker::new();
@@ -340,7 +360,7 @@ impl<P: Plugin> Backend<P> for CpalMidir {
             // costs the stand-in stream nothing.
             let device_returned = Arc::new(AtomicBool::new(false));
             let watch_stop = Arc::new(AtomicBool::new(false));
-            if !self.watch.lock().is_idle() {
+            if !self.duplex && !self.watch.lock().is_idle() {
                 let backend: &Self = self;
                 let device_returned = device_returned.clone();
                 let watch_stop = watch_stop.clone();
@@ -504,6 +524,7 @@ impl<P: Plugin> Backend<P> for CpalMidir {
                                 // also need it to terminate the thread
                                 midi_output_rb_producer.clone(),
                                 cb,
+                                liveness.clone(),
                             ),
                             error_cb,
                             None,
@@ -552,6 +573,8 @@ impl<P: Plugin> Backend<P> for CpalMidir {
             // request when the device is already dead and no further callbacks or stream errors
             // will arrive (previously that combination made the application hang on exit).
             if !setup_failed {
+                // The first callback gets the whole timeout
+                liveness.stamp();
                 loop {
                     parker.park_timeout(Duration::from_millis(100));
                     if stream_error.load(Ordering::Acquire)
@@ -561,10 +584,28 @@ impl<P: Plugin> Backend<P> for CpalMidir {
                     {
                         break;
                     }
+                    if self.duplex && liveness.expired() {
+                        nih_error!(
+                            "No callback from the ASIO driver for {DUPLEX_LIVENESS_TIMEOUT_MS} \
+                             ms, restarting the stream"
+                        );
+                        stream_error.store(true, Ordering::Release);
+                        break;
+                    }
                 }
             }
             drop(output_stream);
             watch_stop.store(true, Ordering::Release);
+            if self.duplex {
+                let overflows = self.overflows.swap(0, Ordering::Relaxed);
+                let underruns = self.underruns.swap(0, Ordering::Relaxed);
+                if overflows + underruns > 0 {
+                    nih_log!(
+                        "Duplex ring: {overflows} input samples dropped, {underruns} output \
+                         samples without input"
+                    );
+                }
+            }
 
             // The Midir API requires us to take things out of Options and transform between these
             // structs
@@ -609,7 +650,13 @@ impl<P: Plugin> Backend<P> for CpalMidir {
     }
 
     fn reinit(&mut self) -> Result<()> {
-        let host = cpal::host_from_id(self.host_id).context("The Audio API is unavailable")?;
+        if self.duplex {
+            // A7: the input shares the output's driver; drop it first so no second handle
+            // outlives the restart. The output `CpalDevice` stays alive and keeps its driver
+            // loaded: the kept host's enumeration then returns that driver and skips the others,
+            // so a restart always lands on the same driver. Another driver needs a relaunch (A10).
+            self.input = None;
+        }
 
         // Unlike `new()` there is deliberately no native-sample-rate override here:
         // `self.config.sample_rate` is the rate the plugin and the wrapper were initialized with
@@ -619,13 +666,14 @@ impl<P: Plugin> Backend<P> for CpalMidir {
             let in_use = self.in_use.lock();
             (in_use.outputs.clone(), in_use.inputs.clone())
         };
+        let device_use = self.device_use();
         let opened = Self::open_devices(
-            &host,
+            &self.host,
             &mut self.config,
             &self.audio_io_layout,
             Start::Restart,
             &self.quarantined,
-            false,
+            device_use,
             listed,
         )?;
         self.quarantined.clear();
@@ -642,6 +690,11 @@ impl<P: Plugin> Backend<P> for CpalMidir {
     }
 
     fn wait_for_device_change(&self, should_stop: &AtomicBool, max: Duration) {
+        if self.duplex {
+            // A7: listing loads every ASIO driver; wait instead and let `reinit()` try again.
+            sleep_unless(should_stop, max);
+            return;
+        }
         let Ok(host) = cpal::host_from_id(self.host_id) else {
             sleep_unless(should_stop, max);
             return;
@@ -656,6 +709,11 @@ impl<P: Plugin> Backend<P> for CpalMidir {
     }
 
     fn quarantine_requested(&mut self) -> bool {
+        if self.duplex {
+            // A restart can only land on the driver that is loaded, so there is nothing to stand
+            // in for it: wait for the hardware instead.
+            return false;
+        }
         let in_use = self.in_use.lock().clone();
         let quarantined: Vec<Wanted> = in_use
             .output
@@ -732,14 +790,142 @@ fn names_of(devices: Option<impl Iterator<Item = Device>>) -> Vec<String> {
     )
 }
 
+/// Whether this host runs input and output on one device and one driver thread (ASIO). Decides
+/// the ring policy and the watch policy (spec A2, A5–A7).
+fn single_device_duplex(host_id: cpal::HostId) -> bool {
+    #[cfg(all(target_os = "windows", feature = "asio"))]
+    {
+        host_id == cpal::HostId::Asio
+    }
+    #[cfg(not(all(target_os = "windows", feature = "asio")))]
+    {
+        let _ = host_id;
+        false
+    }
+}
+
+/// How a start or restart treats the output device's own settings.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum DeviceUse {
+    /// WASAPI and CoreAudio: the period as requested, and a restart refuses a device that runs at
+    /// another rate rather than switch it under other applications.
+    Shared,
+    /// A single-device duplex driver (ASIO), which this application alone uses: the period
+    /// follows the driver's buffer-size range, capped on a restart at the wrapper's
+    /// `max_buffer_size`, and a restart sets the driver back to the session's rate (A4, A6).
+    Duplex { period_cap: Option<u32> },
+}
+
+impl DeviceUse {
+    fn is_duplex(self) -> bool {
+        matches!(self, DeviceUse::Duplex { .. })
+    }
+
+    /// The period the stream asks the device for.
+    fn period(self, requested: u32, range: cpal::SupportedBufferSize) -> u32 {
+        match self {
+            DeviceUse::Shared => requested,
+            DeviceUse::Duplex { period_cap } => {
+                let clamped = clamp_period(requested, range);
+                period_cap.map_or(clamped, |cap| clamped.min(cap))
+            }
+        }
+    }
+}
+
+/// The period a duplex driver is asked for: the request clamped into the driver's range. cpal
+/// hands `BufferSize::Fixed` to ASIO checking only the maximum (A4).
+pub(crate) fn clamp_period(requested: u32, range: cpal::SupportedBufferSize) -> u32 {
+    match range {
+        cpal::SupportedBufferSize::Range { min, max } if min <= max => requested.clamp(min, max),
+        _ => requested,
+    }
+}
+
+/// How many input channels to open on a duplex driver: the fewest that cover the plugin, else the
+/// most the driver has; `None` when the plugin wants none or the driver has none.
+pub(crate) fn duplex_input_channels(wanted: u16, available: &[u16]) -> Option<u16> {
+    if wanted == 0 {
+        return None;
+    }
+    let covering = available.iter().copied().filter(|&c| c >= wanted).min();
+    covering.or_else(|| available.iter().copied().max())
+}
+
+/// No error callback ever fires on ASIO (cpal ignores it), so silence is the signal (A6).
+const DUPLEX_LIVENESS_TIMEOUT_MS: u64 = 2000;
+
+pub(crate) fn liveness_expired(now_ms: u64, last_ms: u64) -> bool {
+    now_ms.saturating_sub(last_ms) > DUPLEX_LIVENESS_TIMEOUT_MS
+}
+
+/// When the output callback last ran, in milliseconds since the run started.
+#[derive(Clone)]
+struct Liveness {
+    run_started: Instant,
+    last_callback: Arc<AtomicU64>,
+}
+
+impl Liveness {
+    fn new() -> Self {
+        Self {
+            run_started: Instant::now(),
+            last_callback: Arc::new(AtomicU64::new(0)),
+        }
+    }
+
+    fn now_ms(&self) -> u64 {
+        self.run_started.elapsed().as_millis() as u64
+    }
+
+    fn stamp(&self) {
+        self.last_callback.store(self.now_ms(), Ordering::Relaxed);
+    }
+
+    fn expired(&self) -> bool {
+        liveness_expired(self.now_ms(), self.last_callback.load(Ordering::Relaxed))
+    }
+}
+
+/// Both duplex callbacks share the driver thread, so a full ring means the output has not drained
+/// yet: drop and count, never spin (A5).
+pub(crate) fn duplex_push(producer: &mut rtrb::Producer<f32>, sample: f32, overflows: &AtomicU64) {
+    if producer.push(sample).is_err() {
+        overflows.fetch_add(1, Ordering::Relaxed);
+    }
+}
+
+/// An empty duplex ring on the output side is silence for this sample, counted (A5).
+pub(crate) fn duplex_pop(consumer: &mut rtrb::Consumer<f32>, underruns: &AtomicU64) -> f32 {
+    consumer.pop().unwrap_or_else(|_| {
+        underruns.fetch_add(1, Ordering::Relaxed);
+        0.0
+    })
+}
+
+/// Discards all but the newest `keep` samples. The capture runs alone between its start and the
+/// output's, so the output's first period would otherwise play that backlog and carry it as
+/// latency for the rest of the run.
+pub(crate) fn duplex_discard_backlog(consumer: &mut rtrb::Consumer<f32>, keep: usize) {
+    let stale = consumer.slots().saturating_sub(keep);
+    if let Ok(chunk) = consumer.read_chunk(stale) {
+        chunk.commit_all();
+    }
+}
+
 impl CpalMidir {
     /// Initialize the backend with the specified host. Returns an error if this failed for whatever
     /// reason.
     pub fn new<P: Plugin>(config: WrapperConfig, cpal_host_id: cpal::HostId) -> Result<Self> {
         let audio_io_layout = config.audio_io_layout_or_exit::<P>();
         let host = cpal::host_from_id(cpal_host_id).context("The Audio API is unavailable")?;
+        let duplex = single_device_duplex(cpal_host_id);
 
-        if config.input_device.is_none() && audio_io_layout.main_input_channels.is_some() {
+        if duplex {
+            if config.input_device.is_some() {
+                nih_log!("ASIO: '--input-device' is ignored, the driver carries both directions");
+            }
+        } else if config.input_device.is_none() && audio_io_layout.main_input_channels.is_some() {
             nih_log!(
                 "Audio inputs are not connected automatically to prevent feedback. Use the \
                  '--input-device' option to choose an input device."
@@ -761,7 +947,11 @@ impl CpalMidir {
             &audio_io_layout,
             Start::Launch,
             &[],
-            false,
+            if duplex {
+                DeviceUse::Duplex { period_cap: None }
+            } else {
+                DeviceUse::Shared
+            },
             Default::default(),
         )?;
         if (config.sample_rate - requested_sample_rate).abs() > 0.1 {
@@ -863,10 +1053,16 @@ impl CpalMidir {
             None => None,
         };
 
+        let launch_period = config.period_size;
         Ok(CpalMidir {
             config,
             audio_io_layout,
             host_id: cpal_host_id,
+            host,
+            duplex,
+            launch_period,
+            overflows: Arc::new(AtomicU64::new(0)),
+            underruns: Arc::new(AtomicU64::new(0)),
 
             input: opened.input,
             output: opened.output,
@@ -895,6 +1091,18 @@ impl CpalMidir {
         self.config.period_size
     }
 
+    /// How a restart opens the output: a duplex driver follows its range up to the period the
+    /// wrapper was initialized with.
+    fn device_use(&self) -> DeviceUse {
+        if self.duplex {
+            DeviceUse::Duplex {
+                period_cap: Some(self.launch_period),
+            }
+        } else {
+            DeviceUse::Shared
+        }
+    }
+
     /// Whether a wanted device could run the session's stream right now: the restart's own
     /// resolution, then a silent stream built and started on that device and dropped as soon as
     /// it delivers a callback. A device can match every configuration and still refuse a stream
@@ -908,6 +1116,7 @@ impl CpalMidir {
                 &self.config,
                 main_channels(self.audio_io_layout.main_output_channels),
                 Start::Restart,
+                self.device_use(),
             ),
             Kind::Input => Self::resolve_input(
                 host,
@@ -988,15 +1197,20 @@ impl CpalMidir {
     /// change, and never switches a requested device's own rate to reach it. What the stream is
     /// open on is published either way, so the host application's status is true even while
     /// nothing could be opened.
+    ///
+    /// A duplex driver carries both directions: its period is adopted into `config` (A4) and the
+    /// input, when the plugin has one and the driver offers input channels, is the output's own
+    /// device (A2); `--input-device` plays no part.
     fn open_devices(
         host: &cpal::Host,
         config: &mut WrapperConfig,
         layout: &AudioIOLayout,
         start: Start,
         quarantined: &[Wanted],
-        duplex: bool,
+        device_use: DeviceUse,
         listed: (Vec<String>, Vec<String>),
     ) -> Result<OpenedDevices> {
+        let duplex = device_use.is_duplex();
         let (outputs, inputs) = device_lists(start, duplex, listed, || {
             names_of(host.output_devices().ok())
         });
@@ -1017,7 +1231,7 @@ impl CpalMidir {
             let resolved = if quarantined.contains(&wanted) {
                 Resolved::Refused(anyhow::anyhow!("the stream on it keeps dying"))
             } else {
-                Self::resolve_output(host, &name, config, output_channels, start)
+                Self::resolve_output(host, &name, config, output_channels, start, device_use)
             };
             match resolved {
                 Resolved::Open(device) => {
@@ -1048,7 +1262,9 @@ impl CpalMidir {
                 let result = host
                     .default_output_device()
                     .context("No default audio output device available")
-                    .and_then(|device| Self::open_output(device, config, output_channels, start));
+                    .and_then(|device| {
+                        Self::open_output(device, config, output_channels, start, device_use)
+                    });
                 match result {
                     Ok(output) => output,
                     Err(err) => {
@@ -1061,9 +1277,53 @@ impl CpalMidir {
         if start == Start::Launch {
             config.sample_rate = output.config.sample_rate.0 as f32;
         }
+        if let (true, cpal::BufferSize::Fixed(period)) = (duplex, output.config.buffer_size) {
+            if period != config.period_size {
+                nih_log!(
+                    "A period of {} samples is outside the driver's range, using {period}",
+                    config.period_size
+                );
+                config.period_size = period;
+            }
+        }
 
         let mut input = None;
-        if let Some(name) = config.input_device.clone() {
+        if duplex {
+            let wanted = main_channels(layout.main_input_channels) as u16;
+            let rate = output.config.sample_rate;
+            let configs: Vec<_> = output
+                .device
+                .supported_input_configs()
+                .map(|configs| {
+                    configs
+                        .filter(|c| c.min_sample_rate() <= rate && rate <= c.max_sample_rate())
+                        .collect()
+                })
+                .unwrap_or_default();
+            let available: Vec<u16> = configs.iter().map(|c| c.channels()).collect();
+            match duplex_input_channels(wanted, &available) {
+                Some(channels) => {
+                    let sample_format = configs
+                        .iter()
+                        .find(|c| c.channels() == channels)
+                        .map_or(output.sample_format, |c| c.sample_format());
+                    input = Some(CpalDevice {
+                        device: output.device.clone(),
+                        config: StreamConfig {
+                            channels,
+                            sample_rate: rate,
+                            buffer_size: output.config.buffer_size,
+                        },
+                        sample_format,
+                    });
+                    in_use.input = in_use.output.clone().or_else(|| output.device.name().ok());
+                }
+                None if wanted > 0 => {
+                    nih_log!("The ASIO driver offers no input channels, audio input is off")
+                }
+                None => {}
+            }
+        } else if let Some(name) = config.input_device.clone() {
             let input_channels = main_channels(layout.main_input_channels);
             let wanted = Wanted {
                 name: name.clone(),
@@ -1144,6 +1404,7 @@ impl CpalMidir {
         config: &WrapperConfig,
         num_output_channels: usize,
         start: Start,
+        device_use: DeviceUse,
     ) -> Resolved {
         let candidates = Self::devices_named(host, name)
             .into_iter()
@@ -1155,11 +1416,11 @@ impl CpalMidir {
             })
             .collect();
         Self::resolve(candidates, |device| {
-            if start == Start::Restart {
+            if start == Start::Restart && device_use == DeviceUse::Shared {
                 let current = device.default_output_config().ok().map(|c| c.sample_rate());
                 Self::runs_at_session_rate(current, config)?;
             }
-            Self::open_output(device, config, num_output_channels, start)
+            Self::open_output(device, config, num_output_channels, start, device_use)
         })
     }
 
@@ -1211,22 +1472,41 @@ impl CpalMidir {
     }
 
     /// The output configuration `device` runs the stream with: at its own native rate on a start
-    /// (the rate the session then adopts), at the session's rate on a restart.
+    /// (the rate the session then adopts), at the session's rate on a restart. A duplex driver's
+    /// period follows its buffer-size range (`DeviceUse::period`).
     fn open_output(
         device: Device,
         config: &WrapperConfig,
         num_output_channels: usize,
         start: Start,
+        device_use: DeviceUse,
     ) -> Result<CpalDevice> {
-        let sample_rate = match start {
-            Start::Launch => device
-                .default_output_config()
-                .map(|c| c.sample_rate().0 as f32)
-                .unwrap_or(config.sample_rate),
-            Start::Restart => config.sample_rate,
+        let current = match (start, device_use) {
+            (Start::Restart, DeviceUse::Shared) => None,
+            _ => device.default_output_config().ok(),
         };
         let mut config = config.clone();
-        config.sample_rate = sample_rate;
+        if let Some(current) = &current {
+            let driver_rate = current.sample_rate().0 as f32;
+            match start {
+                Start::Launch => config.sample_rate = driver_rate,
+                Start::Restart if (driver_rate - config.sample_rate).abs() > 0.1 => nih_log!(
+                    "ASIO driver rate changed to {driver_rate} Hz; restarting at the session rate \
+                     of {} Hz, the new rate applies at the next launch",
+                    config.sample_rate
+                ),
+                Start::Restart => {}
+            }
+            let range = *current.buffer_size();
+            let period = device_use.period(config.period_size, range);
+            if period < clamp_period(period, range) {
+                nih_log!(
+                    "The driver's smallest buffer is now larger than this session's {period} \
+                     samples; relaunch to use it"
+                );
+            }
+            config.period_size = period;
+        }
         Self::build_output_cpal_device(device, &config, num_output_channels)
     }
 
@@ -1365,6 +1645,8 @@ impl CpalMidir {
         // output data callback
         #[cfg(target_os = "windows")]
         let mut input_thread_promoted = false;
+        let duplex = self.duplex;
+        let overflows = self.overflows.clone();
         let device_channels = self
             .input
             .as_ref()
@@ -1380,16 +1662,21 @@ impl CpalMidir {
             // thread at cpal's silently-broken NORMAL priority would be a
             // priority inversion: a real-time spinner starved of the very
             // samples it waits for.
+            // A duplex capture runs on the driver's own thread, which nothing spins on.
             #[cfg(target_os = "windows")]
-            if !input_thread_promoted {
+            if !duplex && !input_thread_promoted {
                 input_thread_promoted = true;
                 super::super::wrapper::promote_audio_thread();
             }
 
-            // If for whatever reason the input callback is fired twice before an output callback,
-            // then just spin on this until the push succeeds
             fold_input_frames(data, device_channels, plugin_channels, |sample| {
-                while input_rb_producer.push(sample).is_err() {}
+                if duplex {
+                    duplex_push(&mut input_rb_producer, sample, &overflows);
+                } else {
+                    // If for whatever reason the input callback is fired twice before an output
+                    // callback, then just spin on this until the push succeeds
+                    while input_rb_producer.push(sample).is_err() {}
+                }
             });
 
             // The run function is blocked until a single period has been processed here. After this
@@ -1429,6 +1716,7 @@ impl CpalMidir {
             ) -> bool
             + 'static
             + Send,
+        liveness: Liveness,
     ) -> impl FnMut(&mut [T], &OutputCallbackInfo) + Send + 'static
     where
         P: Plugin,
@@ -1503,7 +1791,24 @@ impl CpalMidir {
         // Can't borrow from `self` in the callback
         let config = self.config.clone();
         let mut num_processed_samples = 0usize;
+        let duplex = self.duplex;
+        let overflows = self.overflows.clone();
+        let underruns = self.underruns.clone();
+        let mut backlog_discarded = false;
         move |data, _info| {
+            liveness.stamp();
+            if duplex && !backlog_discarded {
+                backlog_discarded = true;
+                // The capture callback runs first in every driver period, so from here on the
+                // ring holds exactly the period being processed. What it dropped before the
+                // output started is not an xrun.
+                if let Some(input_rb_consumer) = &mut input_rb_consumer {
+                    let frames = data.len() / device_output_channels.max(1);
+                    duplex_discard_backlog(input_rb_consumer, frames * num_input_channels);
+                }
+                overflows.store(0, Ordering::Relaxed);
+            }
+
             // CoreAudio and other backends may deliver more samples per callback than the
             // configured period size. On macOS this reliably happens right after the default
             // output device changes to a device with a different sample rate or a larger IO
@@ -1529,6 +1834,14 @@ impl CpalMidir {
                 // Because of that we'll never need to reinitialize these, and the output storage is
                 // write-only (with `BufferManager` always zeroing them out when creating the buffers).
                 match &mut input_rb_consumer {
+                    Some(input_rb_consumer) if duplex => {
+                        deinterleave_frames(
+                            || duplex_pop(input_rb_consumer, &underruns),
+                            &mut main_io_storage,
+                            num_input_channels,
+                            chunk_size,
+                        );
+                    }
                     Some(input_rb_consumer) => {
                         // Keep spinning on this if the output callback somehow outpaces the input
                         // callback
@@ -1935,6 +2248,88 @@ mod tests {
             started_capture(Ok::<u8, &str>(7), refused, not_waited_for),
             None
         );
+    }
+
+    #[test]
+    fn a_full_duplex_ring_drops_and_counts_instead_of_spinning() {
+        let (mut producer, mut consumer) = rtrb::RingBuffer::<f32>::new(2);
+        let overflows = AtomicU64::new(0);
+        duplex_push(&mut producer, 1.0, &overflows);
+        duplex_push(&mut producer, 2.0, &overflows);
+        duplex_push(&mut producer, 3.0, &overflows);
+        assert_eq!(overflows.load(Ordering::Relaxed), 1);
+        let underruns = AtomicU64::new(0);
+        assert_eq!(duplex_pop(&mut consumer, &underruns), 1.0);
+        assert_eq!(duplex_pop(&mut consumer, &underruns), 2.0);
+        assert_eq!(duplex_pop(&mut consumer, &underruns), 0.0);
+        assert_eq!(underruns.load(Ordering::Relaxed), 1);
+    }
+
+    #[test]
+    fn the_first_output_period_keeps_only_the_newest_input_period() {
+        let (mut producer, mut consumer) = rtrb::RingBuffer::<f32>::new(8);
+        for sample in 1..=6 {
+            producer.push(sample as f32).unwrap();
+        }
+        duplex_discard_backlog(&mut consumer, 2);
+        assert_eq!(consumer.pop(), Ok(5.0));
+        assert_eq!(consumer.pop(), Ok(6.0));
+        assert!(consumer.pop().is_err());
+
+        producer.push(7.0).unwrap();
+        duplex_discard_backlog(&mut consumer, 4);
+        assert_eq!(consumer.pop(), Ok(7.0), "a short backlog is kept whole");
+    }
+
+    #[test]
+    fn liveness_expires_after_the_timeout_and_not_before() {
+        assert!(!liveness_expired(2000, 0));
+        assert!(liveness_expired(2001, 0));
+        assert!(!liveness_expired(5, 10), "clock skew never trips it");
+    }
+
+    fn range(min: u32, max: u32) -> cpal::SupportedBufferSize {
+        cpal::SupportedBufferSize::Range { min, max }
+    }
+
+    #[test]
+    fn period_is_clamped_into_the_driver_range() {
+        assert_eq!(clamp_period(64, range(128, 2048)), 128);
+        assert_eq!(clamp_period(4096, range(128, 2048)), 2048);
+        assert_eq!(clamp_period(512, range(128, 2048)), 512);
+        assert_eq!(clamp_period(512, cpal::SupportedBufferSize::Unknown), 512);
+        assert_eq!(clamp_period(512, range(2048, 128)), 512);
+    }
+
+    #[test]
+    fn a_shared_device_keeps_the_requested_period() {
+        assert_eq!(DeviceUse::Shared.period(64, range(128, 2048)), 64);
+    }
+
+    #[test]
+    fn a_duplex_restart_follows_the_driver_but_never_past_the_wrapper_buffer() {
+        let launch = DeviceUse::Duplex { period_cap: None };
+        assert_eq!(launch.period(64, range(128, 2048)), 128);
+        let restart = DeviceUse::Duplex {
+            period_cap: Some(512),
+        };
+        assert_eq!(restart.period(512, range(1024, 2048)), 512);
+        assert_eq!(restart.period(512, range(64, 256)), 256);
+        assert_eq!(restart.period(256, range(64, 2048)), 256);
+    }
+
+    #[test]
+    fn duplex_input_takes_the_smallest_config_that_covers_the_plugin_or_the_largest_there_is() {
+        assert_eq!(duplex_input_channels(2, &[1, 2, 8]), Some(2));
+        assert_eq!(duplex_input_channels(2, &[8, 1]), Some(8));
+        assert_eq!(duplex_input_channels(2, &[1]), Some(1));
+        assert_eq!(duplex_input_channels(2, &[]), None);
+        assert_eq!(duplex_input_channels(0, &[2]), None);
+    }
+
+    #[test]
+    fn only_asio_is_a_single_device_duplex_host() {
+        assert!(!single_device_duplex(cpal::default_host().id()));
     }
 
     #[test]
