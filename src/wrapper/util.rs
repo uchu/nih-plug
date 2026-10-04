@@ -283,6 +283,38 @@ impl Drop for ScopedFtz {
     }
 }
 
+/// A count the host handed over as `int32`. Negative is a host bug and reads as zero so it
+/// can never become a huge `usize` (H7).
+pub fn host_count(n: i32) -> usize {
+    n.max(0) as usize
+}
+
+/// Hard ceiling on a state blob read from a host stream (H2). Plug-in state is JSON in the
+/// tens of kilobytes; anything past this is a corrupt or hostile stream, not a preset.
+pub const MAX_STATE_BYTES: usize = 64 * 1024 * 1024;
+
+pub fn state_length_is_sane(len: u64) -> bool {
+    len <= MAX_STATE_BYTES as u64
+}
+
+/// Where the current block ends (H5): the buffer end, never more than `max_buffer_size`
+/// samples past `block_start`, and cut earlier at `event_split` when that lies inside the
+/// block. A split at or before `block_start` is ignored (it cannot shorten a block to zero).
+pub fn split_block_end(
+    block_start: usize,
+    total_len: usize,
+    max_buffer_size: usize,
+    event_split: Option<usize>,
+) -> usize {
+    let by_size = block_start
+        .saturating_add(max_buffer_size.max(1))
+        .min(total_len);
+    match event_split {
+        Some(at) if at > block_start && at < by_size => at,
+        _ => by_size,
+    }
+}
+
 #[cfg(test)]
 mod miri {
     use std::ffi::CStr;
@@ -309,5 +341,45 @@ mod miri {
             unsafe { CStr::from_ptr(dest.as_ptr()) }.to_str(),
             Ok("Hello")
         );
+    }
+}
+
+#[cfg(test)]
+mod host_bounds {
+    use super::*;
+
+    #[test]
+    fn negative_host_counts_read_as_zero() {
+        assert_eq!(host_count(-1), 0);
+        assert_eq!(host_count(0), 0);
+        assert_eq!(host_count(512), 512);
+    }
+
+    #[test]
+    fn state_length_law() {
+        assert!(state_length_is_sane(0));
+        assert!(state_length_is_sane(MAX_STATE_BYTES as u64));
+        assert!(!state_length_is_sane(MAX_STATE_BYTES as u64 + 1));
+        assert!(!state_length_is_sane(u64::MAX));
+    }
+
+    #[test]
+    fn block_end_is_the_buffer_end_within_max() {
+        assert_eq!(split_block_end(0, 256, 512, None), 256);
+        assert_eq!(split_block_end(0, 4096, 512, None), 512);
+        assert_eq!(split_block_end(3584, 4096, 512, None), 4096);
+        assert_eq!(split_block_end(3600, 4096, 512, None), 4096);
+    }
+
+    #[test]
+    fn an_event_split_inside_the_cap_wins_and_one_past_it_does_not() {
+        assert_eq!(split_block_end(0, 4096, 512, Some(100)), 100);
+        assert_eq!(split_block_end(0, 4096, 512, Some(1500)), 512);
+        assert_eq!(split_block_end(0, 256, 512, Some(0)), 256);
+    }
+
+    #[test]
+    fn a_zero_max_never_yields_an_empty_block() {
+        assert_eq!(split_block_end(0, 64, 0, None), 1);
     }
 }
