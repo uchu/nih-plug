@@ -23,8 +23,9 @@ use vst3::Steinberg::Vst::{
     TChar, UnitID, UnitInfo,
 };
 use vst3::Steinberg::{
-    int16, int32, kInvalidArgument, kNoInterface, kResultFalse, kResultOk, tresult, uint32,
-    FIDString, FUnknown, IBStream, IBStreamTrait, IPlugView, IPluginBaseTrait, TBool, TUID,
+    int16, int32, kInvalidArgument, kNoInterface, kNotInitialized, kResultFalse, kResultOk,
+    tresult, uint32, FIDString, FUnknown, IBStream, IBStreamTrait, IPlugView, IPluginBaseTrait,
+    TBool, TUID,
 };
 use vst3::{Class, ComRef, ComWrapper};
 use widestring::U16CStr;
@@ -407,14 +408,17 @@ impl<P: Vst3Plugin> IComponentTrait for Wrapper<P> {
                         buffer_config.max_buffer_size as usize,
                         audio_io_layout,
                     );
+                    self.inner.is_active.store(true, Ordering::SeqCst);
 
                     kResultOk
                 } else {
+                    self.inner.is_active.store(false, Ordering::SeqCst);
                     kResultFalse
                 }
             }
             (true, None) => kResultFalse,
             (false, _) => {
+                self.inner.is_active.store(false, Ordering::SeqCst);
                 self.inner.plugin.lock().deactivate();
 
                 kResultOk
@@ -974,12 +978,12 @@ impl<P: Vst3Plugin> IAudioProcessorTrait for Wrapper<P> {
         process_wrapper(|| {
             // We need to handle incoming automation first
             let data = &*data;
-            let sample_rate = self
-                .inner
-                .current_buffer_config
-                .load()
-                .expect("Process call without prior setup call")
-                .sample_rate;
+            // H3: a host that processes before `setupProcessing` is told so instead of
+            // taking the process down with it.
+            let Some(buffer_config) = self.inner.current_buffer_config.load() else {
+                return kNotInitialized;
+            };
+            let sample_rate = buffer_config.sample_rate;
 
             nih_debug_assert!(data.numInputs >= 0 && data.numOutputs >= 0);
             nih_debug_assert_eq!(
@@ -988,7 +992,9 @@ impl<P: Vst3Plugin> IAudioProcessorTrait for Wrapper<P> {
             );
             nih_debug_assert!(data.numSamples >= 0);
 
-            let total_buffer_len = data.numSamples as usize;
+            let total_buffer_len = host_count(data.numSamples);
+            let num_inputs = host_count(data.numInputs);
+            let num_outputs = host_count(data.numOutputs);
 
             let current_audio_io_layout = self.inner.current_audio_io_layout.load();
             let has_main_input = current_audio_io_layout.main_input_channels.is_some();
@@ -1002,9 +1008,19 @@ impl<P: Vst3Plugin> IAudioProcessorTrait for Wrapper<P> {
             //       and instead only set the number of channels to 0. In that case the
             //       'buffer_is_valid' check from below should still prevent audio processing.
             let mut is_param_flush = total_buffer_len == 0;
-            if (data.numOutputs == 0 || data.outputs.is_null())
+            if (num_outputs == 0
+                || data.outputs.is_null()
+                || (*data.outputs).__field0.channelBuffers32.is_null())
                 && (has_main_output || !current_audio_io_layout.aux_output_ports.is_empty())
             {
+                is_param_flush = true;
+            }
+
+            // H3: audio before a successful `setActive(true)` has no buffer manager to run
+            // on. The host gets silence, and the call is still served as a flush so the
+            // parameter changes it carries are not lost.
+            if !is_param_flush && !self.inner.is_active.load(Ordering::SeqCst) {
+                zero_host_outputs(data, num_outputs, total_buffer_len);
                 is_param_flush = true;
             }
 
@@ -1267,7 +1283,7 @@ impl<P: Vst3Plugin> IAudioProcessorTrait for Wrapper<P> {
                     let mut buffer_manager = self.inner.buffer_manager.borrow_mut();
                     let buffers =
                         buffer_manager.create_buffers(block_start, block_len, |buffer_source| {
-                            if data.numOutputs > 0
+                            if num_outputs > 0
                                 && !data.outputs.is_null()
                                 && !(*data.outputs).__field0.channelBuffers32.is_null()
                                 && has_main_output
@@ -1283,7 +1299,7 @@ impl<P: Vst3Plugin> IAudioProcessorTrait for Wrapper<P> {
                                     Some(ChannelPointers { ptrs, num_channels });
                             }
 
-                            if data.numInputs > 0
+                            if num_inputs > 0
                                 && !data.inputs.is_null()
                                 && !(*data.inputs).__field0.channelBuffers32.is_null()
                                 && has_main_input
@@ -1320,7 +1336,7 @@ impl<P: Vst3Plugin> IAudioProcessorTrait for Wrapper<P> {
                                     // not catch that (a non-null empty array passes), and the
                                     // `channelBuffers32` NonNull check below happens after the
                                     // read. The CLAP wrapper already bounds this correctly.
-                                    if aux_input_idx >= data.numInputs as usize {
+                                    if aux_input_idx >= num_inputs {
                                         break;
                                     }
 
@@ -1350,7 +1366,7 @@ impl<P: Vst3Plugin> IAudioProcessorTrait for Wrapper<P> {
                                     // `numOutputs` entries is `numOutputs - 1`. This one at
                                     // least bounds against the right array, unlike the aux
                                     // input loop above.
-                                    if aux_output_idx >= data.numOutputs as usize {
+                                    if aux_output_idx >= num_outputs {
                                         break;
                                     }
 
@@ -1955,5 +1971,25 @@ impl<P: Vst3Plugin> IUnitInfoTrait for Wrapper<P> {
         _data: *mut IBStream,
     ) -> tresult {
         kInvalidArgument
+    }
+}
+
+/// Silence every output channel the host provided, bounded by the host's own counts.
+unsafe fn zero_host_outputs(data: &ProcessData, num_outputs: usize, num_samples: usize) {
+    if data.outputs.is_null() {
+        return;
+    }
+    for bus_idx in 0..num_outputs {
+        let bus = &*data.outputs.add(bus_idx);
+        let ptrs = bus.__field0.channelBuffers32;
+        if ptrs.is_null() {
+            continue;
+        }
+        for ch in 0..host_count(bus.numChannels) {
+            let ptr = *ptrs.add(ch);
+            if !ptr.is_null() {
+                std::slice::from_raw_parts_mut(ptr, num_samples).fill(0.0);
+            }
+        }
     }
 }

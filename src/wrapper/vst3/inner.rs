@@ -67,6 +67,9 @@ pub(crate) struct WrapperInner<P: Vst3Plugin> {
     /// Whether the plugin is currently processing audio. In other words, the last state
     /// `IAudioProcessor::setActive()` has been called with.
     pub is_processing: AtomicBool,
+    /// Set by a successful `setActive(true)`, cleared by `setActive(false)`. Audio before
+    /// activation has no buffer manager to run on (H3).
+    pub is_active: AtomicBool,
     /// The current audio IO layout. Modified through `IAudioProcessor::setBusArrangements()` after
     /// matching the proposed bus arrangement to one of the supported ones. The plugin's first audio
     /// IO layout is chosen as the default. Because of the way VST3 works it's not possible to
@@ -327,6 +330,7 @@ impl<P: Vst3Plugin> WrapperInner<P> {
             event_loop: AtomicRefCell::new(None),
 
             is_processing: AtomicBool::new(false),
+            is_active: AtomicBool::new(false),
             // Some hosts, like the current version of Bitwig and Ardour at the time of writing,
             // will try using the plugin's default not yet initialized bus arrangement. Because of
             // that, we'll always initialize this configuration even before the host requests a

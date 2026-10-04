@@ -225,6 +225,84 @@ impl IBStreamTrait for TestStream {
     }
 }
 
+/// One parameter's automation points for a `process` call: `(sample_offset, normalized)`.
+pub struct TestParamQueue {
+    pub id: ParamID,
+    pub points: Vec<(i32, f64)>,
+}
+
+impl Class for TestParamQueue {
+    type Interfaces = (IParamValueQueue,);
+}
+
+impl IParamValueQueueTrait for TestParamQueue {
+    unsafe fn getParameterId(&self) -> ParamID {
+        self.id
+    }
+
+    unsafe fn getPointCount(&self) -> int32 {
+        self.points.len() as int32
+    }
+
+    unsafe fn getPoint(&self, index: int32, offset: *mut int32, value: *mut ParamValue) -> tresult {
+        match usize::try_from(index).ok().and_then(|i| self.points.get(i)) {
+            Some(&(o, v)) => {
+                *offset = o;
+                *value = v;
+                kResultOk
+            }
+            None => kInvalidArgument,
+        }
+    }
+
+    unsafe fn addPoint(&self, _offset: int32, _value: ParamValue, _index: *mut int32) -> tresult {
+        kNotImplemented
+    }
+}
+
+/// A host-side `IParameterChanges` carrying the given queues.
+pub struct TestParamChanges {
+    pub queues: Vec<ComWrapper<TestParamQueue>>,
+}
+
+impl TestParamChanges {
+    pub fn single(id: ParamID, points: Vec<(i32, f64)>) -> ComWrapper<Self> {
+        ComWrapper::new(Self {
+            queues: vec![ComWrapper::new(TestParamQueue { id, points })],
+        })
+    }
+}
+
+impl Class for TestParamChanges {
+    type Interfaces = (IParameterChanges,);
+}
+
+impl IParameterChangesTrait for TestParamChanges {
+    unsafe fn getParameterCount(&self) -> int32 {
+        self.queues.len() as int32
+    }
+
+    unsafe fn getParameterData(&self, index: int32) -> *mut IParamValueQueue {
+        usize::try_from(index)
+            .ok()
+            .and_then(|i| self.queues.get(i))
+            .and_then(|q| q.as_com_ref::<IParamValueQueue>())
+            .map_or(std::ptr::null_mut(), |r| r.as_ptr())
+    }
+
+    unsafe fn addParameterData(
+        &self,
+        _id: *const ParamID,
+        _index: *mut int32,
+    ) -> *mut IParamValueQueue {
+        std::ptr::null_mut()
+    }
+}
+
+pub fn param_changes_ptr(changes: &ComWrapper<TestParamChanges>) -> *mut IParameterChanges {
+    changes.as_com_ref::<IParameterChanges>().unwrap().as_ptr()
+}
+
 pub fn stream_ptr(stream: &ComWrapper<TestStream>) -> *mut IBStream {
     stream.as_com_ref::<IBStream>().unwrap().as_ptr()
 }

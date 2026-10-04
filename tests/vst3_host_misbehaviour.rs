@@ -138,3 +138,88 @@ fn set_state_while_another_thread_processes_does_not_panic() {
     unsafe { assert!((w.getParamNormalized(gain_id(&w)) - 0.6).abs() < 1e-6) };
     assert!(blocks.load(Ordering::Relaxed) > 0);
 }
+
+fn setup_only(w: &Wrapper<TestPlugin>) {
+    let mut setup = ProcessSetup {
+        processMode: ProcessModes_::kRealtime as i32,
+        symbolicSampleSize: SymbolicSampleSizes_::kSample32 as i32,
+        maxSamplesPerBlock: 512,
+        sampleRate: 48000.0,
+    };
+    unsafe { assert_eq!(w.setupProcessing(&mut setup), kResultOk) };
+}
+
+#[test]
+fn process_before_setup_processing_is_not_initialized() {
+    let w = new_wrapper();
+    let mut outb = HostBuffers::new(2, 64, 1.0);
+    let mut outputs = [outb.bus];
+    let mut data = process_data(64, &mut [], &mut outputs);
+    unsafe { assert_eq!(w.process(&mut data), kNotInitialized) };
+    let _ = &mut outb;
+}
+
+#[test]
+fn audio_before_set_active_is_silence_not_a_crash() {
+    let w = new_wrapper();
+    setup_only(&w);
+    let outb = HostBuffers::new(2, 64, 1.0);
+    let mut outputs = [outb.bus];
+    let mut data = process_data(64, &mut [], &mut outputs);
+    unsafe { assert_eq!(w.process(&mut data), kResultOk) };
+    assert!(outb.channels[0].iter().all(|&x| x == 0.0));
+    assert!(outb.channels[1].iter().all(|&x| x == 0.0));
+    assert!(calls_of(&w).lock().unwrap().is_empty());
+}
+
+#[test]
+fn a_zero_sample_flush_is_served_before_activation() {
+    let w = new_wrapper();
+    setup_only(&w);
+    let mut data = process_data(0, &mut [], &mut []);
+    unsafe { assert_eq!(w.process(&mut data), kResultOk) };
+}
+
+#[test]
+fn audio_after_set_active_false_is_silence_again() {
+    let w = new_wrapper();
+    unsafe { setup_and_activate(&w, 256) };
+    unsafe { assert_eq!(w.setActive(0), kResultOk) };
+    calls_of(&w).lock().unwrap().clear();
+    let outb = HostBuffers::new(2, 64, 1.0);
+    let mut outputs = [outb.bus];
+    let mut data = process_data(64, &mut [], &mut outputs);
+    unsafe { assert_eq!(w.process(&mut data), kResultOk) };
+    assert!(outb.channels[0].iter().all(|&x| x == 0.0));
+    assert!(outb.channels[1].iter().all(|&x| x == 0.0));
+    assert!(calls_of(&w).lock().unwrap().is_empty());
+}
+
+#[test]
+fn a_null_output_channel_array_is_a_flush() {
+    let w = new_wrapper();
+    unsafe { setup_and_activate(&w, 256) };
+    calls_of(&w).lock().unwrap().clear();
+    let mut bus: AudioBusBuffers = unsafe { std::mem::zeroed() };
+    bus.numChannels = 2;
+    let mut outputs = [bus];
+    let mut data = process_data(128, &mut [], &mut outputs);
+    unsafe { assert_eq!(w.process(&mut data), kResultOk) };
+    assert!(calls_of(&w).lock().unwrap().is_empty());
+}
+
+#[test]
+fn parameter_changes_in_audio_before_activation_still_apply() {
+    let w = new_wrapper();
+    setup_only(&w);
+    let id = gain_id(&w);
+    let changes = TestParamChanges::single(id, vec![(0, 0.125)]);
+    let outb = HostBuffers::new(2, 64, 1.0);
+    let mut outputs = [outb.bus];
+    let mut data = process_data(64, &mut [], &mut outputs);
+    data.inputParameterChanges = param_changes_ptr(&changes);
+    unsafe { assert_eq!(w.process(&mut data), kResultOk) };
+    assert!(outb.channels[0].iter().all(|&x| x == 0.0));
+    unsafe { assert!((w.getParamNormalized(id) - 0.125).abs() < 1e-6) };
+    assert!(calls_of(&w).lock().unwrap().is_empty());
+}
