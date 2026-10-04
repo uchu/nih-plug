@@ -66,7 +66,7 @@ fn an_endless_stream_is_refused_at_the_size_ceiling() {
     s.seekable = false;
     let s = s.into_com();
     unsafe { assert_eq!(IComponentTrait::setState(&w, stream_ptr(&s)), kResultFalse) };
-    assert!(s.delivered.get() >= 64 * 1024 * 1024);
+    assert_eq!(s.delivered.get(), 64 * 1024 * 1024 + 1);
 }
 
 #[test]

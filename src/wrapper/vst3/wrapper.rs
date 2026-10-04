@@ -43,7 +43,7 @@ use crate::wrapper::state;
 use crate::wrapper::util::buffer_management::{BufferManager, ChannelPointers};
 use crate::wrapper::util::{
     clamp_input_event_timing, clamp_output_event_timing, host_count, process_wrapper,
-    state_length_is_sane,
+    state_length_is_sane, MAX_STATE_BYTES,
 };
 
 pub struct Wrapper<P: Vst3Plugin> {
@@ -432,17 +432,25 @@ impl<P: Vst3Plugin> IComponentTrait for Wrapper<P> {
         // its preset header), and a short read is not the end of the stream.
         const CHUNK: usize = 16 * 1024;
         let mut read_buffer: Vec<u8> = Vec::new();
+        const LIMIT: usize = MAX_STATE_BYTES + 1;
         loop {
-            read_buffer.reserve(CHUNK);
+            // Amortised growth capped one byte past the ceiling: an endless stream is refused
+            // without the buffer ever holding more than the law allows
+            let want = CHUNK.min(LIMIT - read_buffer.len());
+            let needed = read_buffer.len() + want;
+            if read_buffer.capacity() < needed {
+                let target = (read_buffer.capacity() * 2).clamp(needed, LIMIT);
+                read_buffer.reserve_exact(target - read_buffer.len());
+            }
             let mut num_bytes_read: int32 = 0;
             let result = state.read(
                 read_buffer.as_mut_ptr().add(read_buffer.len()) as *mut c_void,
-                CHUNK as int32,
+                want as int32,
                 &mut num_bytes_read,
             );
             // SAFETY: the host wrote at most `got` bytes into the reserved tail, and `got` is
             // clamped to what was offered
-            let got = host_count(num_bytes_read).min(CHUNK);
+            let got = host_count(num_bytes_read).min(want);
             read_buffer.set_len(read_buffer.len() + got);
             if !state_length_is_sane(read_buffer.len() as u64) {
                 nih_debug_assert_failure!("State stream exceeds the size ceiling, refusing it");
