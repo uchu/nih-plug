@@ -395,7 +395,7 @@ fn a_latency_change_while_active_requests_a_restart_and_never_calls_changed_outs
     host.run_main_thread_callback();
 
     assert_eq!(host.log.changed_elsewhere.load(Ordering::SeqCst), 0);
-    assert!(host.log.restart_requests.load(Ordering::SeqCst) >= 1);
+    assert_eq!(host.log.restart_requests.load(Ordering::SeqCst), 1);
     host.deactivate();
 }
 
@@ -454,5 +454,25 @@ fn a_latency_change_while_inactive_waits_for_the_next_activate() {
     host.activate();
     assert_eq!(host.log.changed_in_activate.load(Ordering::SeqCst), 1);
     assert_eq!(host.log.changed_elsewhere.load(Ordering::SeqCst), 0);
+    host.deactivate();
+}
+
+#[test]
+fn a_latency_initialize_reports_is_announced_without_a_restart_request() {
+    let source = Host::new();
+    source.activate();
+    source.play_on_audio_thread(true);
+    source.deactivate();
+    let state = source.save_state();
+
+    let host = Host::new();
+    host.load_state(state);
+    host.run_main_thread_callback();
+    host.activate();
+
+    assert_eq!(host.latency(), LOOKAHEAD);
+    assert_eq!(host.log.changed_in_activate.load(Ordering::SeqCst), 1);
+    assert_eq!(host.log.changed_elsewhere.load(Ordering::SeqCst), 0);
+    assert_eq!(host.log.restart_requests.load(Ordering::SeqCst), 0);
     host.deactivate();
 }

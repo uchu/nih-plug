@@ -133,6 +133,30 @@ fn a_state_load_off_the_main_thread_rescans_on_the_main_thread() {
 }
 
 #[test]
+fn a_gui_state_load_rescans_values_exactly_once() {
+    let source = Rig::new();
+    source.activate(256);
+    let gain = source.gain_param_id();
+    source.process(
+        64,
+        &[support::clap_rig::param_value(gain, 0, 0.25)],
+        None,
+        2,
+    );
+    let state = source.wrapper.get_state_object();
+
+    let host = Host::<support::TestPlugin>::new();
+    host.rig.wrapper.set_state_object_from_gui(state);
+    host.run_main_thread_callback();
+
+    assert_eq!(host.rig.param_value(gain), 0.25);
+    assert_eq!(
+        host.rescans(),
+        vec![(CLAP_PARAM_RESCAN_VALUES, std::thread::current().id())]
+    );
+}
+
+#[test]
 fn a_failed_or_refused_state_load_requests_no_rescan() {
     let state = changed_state();
     let host = Host::<support::TestPlugin>::new();
