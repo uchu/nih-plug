@@ -350,3 +350,65 @@ fn a_zero_channel_main_output_is_a_flush() {
     assert!(calls_of(&w).lock().unwrap().is_empty());
     let _ = (&mut inb, &mut outb);
 }
+
+#[test]
+fn a_4096_block_against_max_512_is_eight_blocks_with_the_note_in_the_right_one() {
+    use ProcessContext_::StatesAndFlags_::*;
+    let w = new_wrapper();
+    unsafe { setup_and_activate(&w, 512) };
+    calls_of(&w).lock().unwrap().clear();
+    let events = TestEventList::new(vec![note_on(60, 1500)]).into_com();
+    let mut inb = HostBuffers::new(2, 4096, 0.0);
+    let outb = HostBuffers::new(2, 4096, 0.0);
+    let mut inputs = [inb.bus];
+    let mut outputs = [outb.bus];
+    let mut data = process_data(4096, &mut inputs, &mut outputs);
+    data.inputEvents = event_list_ptr(&events);
+    // 120 bpm from bar 0: every size split must advance `pos_beats`, not only sample-accurate
+    // ones (H5).
+    let mut ctx: ProcessContext = unsafe { std::mem::zeroed() };
+    ctx.state = kTempoValid | kProjectTimeMusicValid;
+    ctx.sampleRate = 48000.0;
+    ctx.tempo = 120.0;
+    ctx.projectTimeMusic = 0.0;
+    ctx.projectTimeSamples = 0;
+    data.processContext = &mut ctx;
+    unsafe { assert_eq!(w.process(&mut data), kResultOk) };
+    let calls = calls_of(&w).lock().unwrap().clone();
+    assert_eq!(calls.len(), 8);
+    assert!(calls.iter().all(|c| c.samples == 512));
+    assert_eq!(calls[2].notes, vec![(60, 476)]);
+    assert!(calls
+        .iter()
+        .enumerate()
+        .all(|(i, c)| c.notes.is_empty() || i == 2));
+    assert_eq!(calls[1].pos_samples, Some(512));
+    let beats_per_block = 512.0 / 48000.0 / 60.0 * 120.0;
+    assert!((calls[1].pos_beats.unwrap() - beats_per_block).abs() < 1e-9);
+    assert!((calls[7].pos_beats.unwrap() - 7.0 * beats_per_block).abs() < 1e-9);
+    assert!(outb.channels[0].iter().all(|&s| s == 0.5));
+    let _ = &mut inb;
+}
+
+#[test]
+fn a_bigger_max_announced_while_active_still_splits_by_the_allocated_size() {
+    let w = new_wrapper();
+    unsafe { setup_and_activate(&w, 512) };
+    let mut setup = ProcessSetup {
+        processMode: ProcessModes_::kRealtime as i32,
+        symbolicSampleSize: SymbolicSampleSizes_::kSample32 as i32,
+        maxSamplesPerBlock: 4096,
+        sampleRate: 48000.0,
+    };
+    unsafe { assert_eq!(w.setupProcessing(&mut setup), kResultOk) };
+    calls_of(&w).lock().unwrap().clear();
+    let inb = HostBuffers::new(2, 4096, 0.0);
+    let outb = HostBuffers::new(2, 4096, 0.0);
+    let mut inputs = [inb.bus];
+    let mut outputs = [outb.bus];
+    assert_eq!(run_once(&w, &mut inputs, &mut outputs, 4096), kResultOk);
+    let calls = calls_of(&w).lock().unwrap().clone();
+    assert_eq!(calls.len(), 8);
+    assert!(calls.iter().all(|c| c.samples == 512));
+    assert!(outb.channels[0].iter().all(|&s| s == 0.5));
+}

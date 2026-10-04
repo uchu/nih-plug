@@ -385,3 +385,62 @@ pub fn new_wrapper() -> Wrapper<TestPlugin> {
 pub fn calls_of(_wrapper: &Wrapper<TestPlugin>) -> Arc<Mutex<Vec<Call>>> {
     CALLS.with(|c| c.clone())
 }
+
+/// A host-side `IEventList` handing the given events to `process`.
+pub struct TestEventList {
+    pub events: Vec<Event>,
+}
+
+impl TestEventList {
+    pub fn new(events: Vec<Event>) -> Self {
+        Self { events }
+    }
+
+    pub fn into_com(self) -> ComWrapper<Self> {
+        ComWrapper::new(self)
+    }
+}
+
+impl Class for TestEventList {
+    type Interfaces = (IEventList,);
+}
+
+impl IEventListTrait for TestEventList {
+    unsafe fn getEventCount(&self) -> int32 {
+        self.events.len() as int32
+    }
+
+    unsafe fn getEvent(&self, index: int32, e: *mut Event) -> tresult {
+        match usize::try_from(index).ok().and_then(|i| self.events.get(i)) {
+            Some(ev) => {
+                *e = *ev;
+                kResultOk
+            }
+            None => kInvalidArgument,
+        }
+    }
+
+    unsafe fn addEvent(&self, _e: *mut Event) -> tresult {
+        kNotImplemented
+    }
+}
+
+pub fn event_list_ptr(events: &ComWrapper<TestEventList>) -> *mut IEventList {
+    events.as_com_ref::<IEventList>().unwrap().as_ptr()
+}
+
+pub fn note_on(pitch: i16, sample_offset: i32) -> Event {
+    let mut e: Event = unsafe { std::mem::zeroed() };
+    e.busIndex = 0;
+    e.sampleOffset = sample_offset;
+    e.r#type = Event_::EventTypes_::kNoteOnEvent as u16;
+    e.__field0.noteOn = NoteOnEvent {
+        channel: 0,
+        pitch,
+        tuning: 0.0,
+        velocity: 0.8,
+        length: 0,
+        noteId: -1,
+    };
+    e
+}

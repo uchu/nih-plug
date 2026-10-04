@@ -44,7 +44,7 @@ use crate::wrapper::state;
 use crate::wrapper::util::buffer_management::{BufferManager, ChannelPointers};
 use crate::wrapper::util::{
     clamp_input_event_timing, clamp_output_event_timing, host_count, process_wrapper,
-    state_length_is_sane, MAX_STATE_BYTES,
+    split_block_end, state_length_is_sane, MAX_STATE_BYTES,
 };
 
 pub struct Wrapper<P: Vst3Plugin> {
@@ -1227,6 +1227,14 @@ impl<P: Vst3Plugin> IAudioProcessorTrait for Wrapper<P> {
                 })
             });
 
+            // The capacity the buffer manager was allocated with, not the current buffer config:
+            // a host may call `setupProcessing` with a larger maximum while the plug-in is active.
+            // A flush hands no audio to the plug-in, so it is not split by size.
+            let max_block_len = if is_param_flush {
+                total_buffer_len
+            } else {
+                self.inner.buffer_manager.borrow().max_buffer_size()
+            };
             let mut block_start = 0usize;
             let mut block_end;
             let mut event_start_idx = 0;
@@ -1242,7 +1250,11 @@ impl<P: Vst3Plugin> IAudioProcessorTrait for Wrapper<P> {
                     let mut input_events = self.inner.input_events.borrow_mut();
                     input_events.clear();
 
-                    block_end = total_buffer_len;
+                    // H5: the plug-in is never handed more samples than its buffers were
+                    // allocated for, whatever the host sends. Events past this block's end wait
+                    // for the block that contains them.
+                    block_end = split_block_end(block_start, total_buffer_len, max_block_len, None);
+                    let mut next_event_idx = process_events.len();
                     for event_idx in event_start_idx..process_events.len() {
                         match &process_events[event_idx] {
                             ProcessEvent::ParameterChange {
@@ -1250,12 +1262,14 @@ impl<P: Vst3Plugin> IAudioProcessorTrait for Wrapper<P> {
                                 hash,
                                 normalized_value,
                             } => {
-                                // If this parameter change happens after the start of this block, then
-                                // we'll split the block here and handle this parameter change after
-                                // we've processed this block
-                                if *timing != block_start as u32 {
-                                    event_start_idx = event_idx;
-                                    block_end = *timing as usize;
+                                if *timing as usize != block_start {
+                                    next_event_idx = event_idx;
+                                    block_end = split_block_end(
+                                        block_start,
+                                        total_buffer_len,
+                                        max_block_len,
+                                        Some(*timing as usize),
+                                    );
                                     break;
                                 }
 
@@ -1266,6 +1280,11 @@ impl<P: Vst3Plugin> IAudioProcessorTrait for Wrapper<P> {
                                 );
                             }
                             ProcessEvent::NoteEvent(event) => {
+                                if event.timing() as usize >= block_end {
+                                    next_event_idx = event_idx;
+                                    break;
+                                }
+
                                 // We need to make sure to compensate the event for any block splitting,
                                 // since we had to create the event object beforehand
                                 let mut event = event.clone();
@@ -1274,6 +1293,7 @@ impl<P: Vst3Plugin> IAudioProcessorTrait for Wrapper<P> {
                             }
                         }
                     }
+                    event_start_idx = next_event_idx;
                 }
 
                 let result = if is_param_flush {
@@ -1432,10 +1452,7 @@ impl<P: Vst3Plugin> IAudioProcessorTrait for Wrapper<P> {
                         transport.pos_samples =
                             Some(context.projectTimeSamples + block_start as i64);
                         if context.state & kProjectTimeMusicValid as u32 != 0 {
-                            if P::SAMPLE_ACCURATE_AUTOMATION
-                                && block_start > 0
-                                && (context.state & kTempoValid as u32 != 0)
-                            {
+                            if block_start > 0 && (context.state & kTempoValid as u32 != 0) {
                                 transport.pos_beats = Some(
                                     context.projectTimeMusic
                                         + (block_start as f64 / sample_rate as f64 / 60.0
@@ -1447,7 +1464,7 @@ impl<P: Vst3Plugin> IAudioProcessorTrait for Wrapper<P> {
                         }
 
                         if context.state & kBarPositionValid as u32 != 0 {
-                            if P::SAMPLE_ACCURATE_AUTOMATION && block_start > 0 {
+                            if block_start > 0 {
                                 // The transport object knows how to recompute this from the other information
                                 transport.bar_start_pos_beats =
                                     match transport.bar_start_pos_beats() {
