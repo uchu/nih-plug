@@ -50,6 +50,8 @@ pub struct BufferManager {
     main_output_scratch: Vec<Vec<f32>>,
     /// The same for every auxiliary output port.
     aux_output_scratch: Vec<Vec<Vec<f32>>>,
+    /// The capacity every scratch and aux storage buffer was allocated with.
+    max_buffer_size: usize,
 }
 
 // SAFETY: The raw pointers in the `ChannelPointers` fields/vectors are only used as scratch storage
@@ -149,7 +151,15 @@ impl BufferManager {
                 .iter()
                 .map(|n| vec![vec![0.0; max_buffer_size]; n.get() as usize])
                 .collect(),
+            max_buffer_size,
         }
+    }
+
+    /// The block length this manager was allocated for. Wrappers split host blocks by this value
+    /// rather than by the current buffer config, which a host may change while the plugin is
+    /// active.
+    pub fn max_buffer_size(&self) -> usize {
+        self.max_buffer_size
     }
 
     /// Initialize the buffers using the host provided buffer pointers and return a reference to the
@@ -178,6 +188,8 @@ impl BufferManager {
         num_samples: usize,
         set_buffer_sources: impl FnOnce(&mut BufferSource),
     ) -> Buffers<'a, 'buffer> {
+        nih_debug_assert!(num_samples <= self.max_buffer_size());
+
         // Make sure the caller can't forget to unset previously set values
         self.main_input_channel_pointers = None;
         self.main_output_channel_pointers = None;
@@ -778,5 +790,11 @@ mod miri {
             assert_eq!(slice.len(), 512);
             assert!(slice.iter().all(|&x| x == 0.0));
         }
+    }
+
+    #[test]
+    fn reports_the_capacity_it_was_allocated_with() {
+        let buffer_manager = BufferManager::for_audio_io_layout(BUFFER_SIZE, AUDIO_IO_LAYOUT);
+        assert_eq!(buffer_manager.max_buffer_size(), BUFFER_SIZE);
     }
 }
