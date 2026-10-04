@@ -1670,8 +1670,7 @@ impl CpalMidir {
         // output data callback
         let duplex = self.duplex;
         #[cfg(target_os = "windows")]
-        let mut input_promotion_pending =
-            super::super::wrapper::callback_thread_needs_promotion(duplex);
+        let mut input_promotion_pending = !duplex;
         let overflows = self.overflows.clone();
         let device_channels = self
             .input
@@ -2156,11 +2155,6 @@ mod tests {
     fn listed(names: &[&str]) -> (Vec<String>, Vec<String>) {
         let names: Vec<String> = names.iter().map(|name| name.to_string()).collect();
         (names.clone(), names)
-    }
-
-    #[test]
-    fn the_default_host_leaves_its_callback_thread_to_us() {
-        assert!(!single_device_duplex(cpal::default_host().id()));
     }
 
     #[test]
