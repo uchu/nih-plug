@@ -834,3 +834,127 @@ fn an_absurd_maximum_block_size_is_capped_and_longer_blocks_are_split() {
     assert_eq!(lens, vec![1 << 16, 70_000 - (1 << 16)]);
     let _ = (&mut inb, &mut outb);
 }
+
+fn bar_starts_of_a_split_2048_block(
+    music: Option<f64>,
+    bar: f64,
+    samples: i64,
+) -> Vec<(Option<f64>, Option<f64>)> {
+    use ProcessContext_::StatesAndFlags_::*;
+    let w = new_wrapper();
+    unsafe { setup_and_activate(&w, 512) };
+    calls_of(&w).lock().unwrap().clear();
+    let mut inb = HostBuffers::new(2, 2048, 0.0);
+    let mut outb = HostBuffers::new(2, 2048, 0.0);
+    let mut inputs = [inb.bus];
+    let mut outputs = [outb.bus];
+    let mut data = process_data(2048, &mut inputs, &mut outputs);
+    let mut ctx: ProcessContext = unsafe { std::mem::zeroed() };
+    ctx.state = kTempoValid | kBarPositionValid | kTimeSigValid;
+    if let Some(m) = music {
+        ctx.state |= kProjectTimeMusicValid;
+        ctx.projectTimeMusic = m;
+    }
+    ctx.sampleRate = 48000.0;
+    ctx.tempo = 120.0;
+    ctx.timeSigNumerator = 3;
+    ctx.timeSigDenominator = 4;
+    ctx.barPositionMusic = bar;
+    ctx.projectTimeSamples = samples;
+    data.processContext = &mut ctx;
+    unsafe { assert_eq!(w.process(&mut data), kResultOk) };
+    let out = calls_of(&w)
+        .lock()
+        .unwrap()
+        .iter()
+        .map(|c| (c.pos_beats, c.bar_start_pos_beats))
+        .collect();
+    let _ = (&mut inb, &mut outb);
+    out
+}
+
+#[test]
+fn size_splits_keep_bar_lines_in_pre_roll_after_a_pickup_and_from_samples_alone() {
+    // 512 samples at 120 bpm / 48 kHz = 0.02133 beats; 3/4 bars of 3 beats
+    let b = 512.0 / 48000.0 / 60.0 * 120.0;
+    // pre-roll inside bar -3..0, crossing 0 in block 3
+    let r = bar_starts_of_a_split_2048_block(Some(-0.05), -3.0, -1200);
+    let bars: Vec<f64> = r.iter().map(|c| c.1.unwrap()).collect();
+    let expect: Vec<f64> = (0..4)
+        .map(|i| {
+            if -0.05 + i as f64 * b >= 0.0 {
+                0.0
+            } else {
+                -3.0
+            }
+        })
+        .collect();
+    assert_eq!(bars, expect, "{r:?}");
+    // pickup: host bar at 1.0 (3/4 after a 1-beat pickup), position 3.99 crosses into bar at 4.0
+    let r = bar_starts_of_a_split_2048_block(Some(3.99), 1.0, 0);
+    let bars: Vec<f64> = r.iter().map(|c| c.1.unwrap()).collect();
+    assert_eq!(bars, vec![1.0, 4.0, 4.0, 4.0], "{r:?}");
+    // samples + tempo only: 95_000 samples = 3.958 beats, host bar 1.0
+    let r = bar_starts_of_a_split_2048_block(None, 1.0, 95_000);
+    let bars: Vec<f64> = r.iter().map(|c| c.1.unwrap()).collect();
+    assert_eq!(bars, vec![1.0, 1.0, 4.0, 4.0], "{r:?}");
+}
+
+#[test]
+fn a_negative_parameter_point_offset_lands_on_the_first_sample() {
+    let w = new_saa_wrapper();
+    unsafe { setup_and_activate(&w, 256) };
+    let gain = gain_id(&w);
+    calls_of_any().lock().unwrap().clear();
+    let changes = ComWrapper::new(TestParamChanges {
+        queues: vec![ComWrapper::new(TestParamQueue {
+            id: gain,
+            points: vec![(-1, 0.75)],
+        })],
+    });
+    let mut inb = HostBuffers::new(2, 64, 0.0);
+    let mut outb = HostBuffers::new(2, 64, 0.0);
+    let mut inputs = [inb.bus];
+    let mut outputs = [outb.bus];
+    let mut data = process_data(64, &mut inputs, &mut outputs);
+    data.inputParameterChanges = param_changes_ptr(&changes);
+    unsafe { assert_eq!(w.process(&mut data), kResultOk) };
+    let calls = calls_of_any().lock().unwrap().clone();
+    let got: Vec<(usize, f32)> = calls.iter().map(|c| (c.samples, c.gain)).collect();
+    assert_eq!(got, vec![(64, 1.5)]);
+    let _ = (&mut inb, &mut outb);
+}
+
+#[test]
+fn a_midi_cc_queued_before_a_parameter_at_the_same_sample_stays_inside_its_block() {
+    let w = new_saa_wrapper();
+    unsafe { setup_and_activate(&w, 512) };
+    let gain = gain_id(&w);
+    calls_of_any().lock().unwrap().clear();
+    let changes = ComWrapper::new(TestParamChanges {
+        queues: vec![
+            ComWrapper::new(TestParamQueue {
+                id: midi_cc_0_id(&w),
+                points: vec![(100, 0.5)],
+            }),
+            ComWrapper::new(TestParamQueue {
+                id: gain,
+                points: vec![(100, 0.75)],
+            }),
+        ],
+    });
+    let mut inb = HostBuffers::new(2, 512, 0.0);
+    let mut outb = HostBuffers::new(2, 512, 0.0);
+    let mut inputs = [inb.bus];
+    let mut outputs = [outb.bus];
+    let mut data = process_data(512, &mut inputs, &mut outputs);
+    data.inputParameterChanges = param_changes_ptr(&changes);
+    unsafe { assert_eq!(w.process(&mut data), kResultOk) };
+    let calls = calls_of_any().lock().unwrap().clone();
+    let got: Vec<(usize, Vec<u32>)> = calls
+        .iter()
+        .map(|c| (c.samples, c.event_timings.clone()))
+        .collect();
+    assert_eq!(got, vec![(100, vec![]), (412, vec![0])]);
+    let _ = (&mut inb, &mut outb);
+}

@@ -13,6 +13,8 @@ use std::ffi::c_void;
 use std::num::NonZeroU32;
 use std::sync::{Arc, Mutex};
 
+pub mod clap_rig;
+
 /// One `process` call as the plug-in saw it.
 #[derive(Clone, Debug, PartialEq)]
 pub struct Call {
@@ -27,6 +29,7 @@ pub struct Call {
     pub aux_len: usize,
     /// The gain parameter's value when the block started.
     pub gain: f32,
+    pub event_timings: Vec<u32>,
 }
 
 thread_local! {
@@ -35,6 +38,7 @@ thread_local! {
     pub static CALLS: Arc<Mutex<Vec<Call>>> = Arc::new(Mutex::new(Vec::new()));
     /// `max_buffer_size` of the last `initialize` on this thread.
     pub static INIT_MAX_BUFFER: Cell<Option<u32>> = const { Cell::new(None) };
+    pub static INIT_MIN_BUFFER: Cell<Option<Option<u32>>> = const { Cell::new(None) };
 }
 
 #[derive(Params)]
@@ -52,7 +56,9 @@ fn record<P: Plugin>(
     context: &mut impl ProcessContext<P>,
 ) -> ProcessStatus {
     let mut notes = Vec::new();
+    let mut event_timings = Vec::new();
     while let Some(event) = context.next_event() {
+        event_timings.push(event.timing());
         if let NoteEvent::NoteOn { note, timing, .. } = event {
             notes.push((note, timing));
         }
@@ -80,6 +86,7 @@ fn record<P: Plugin>(
         bar_number: context.transport().bar_number,
         aux_len: aux0.len(),
         gain: params.gain.value(),
+        event_timings,
     });
     ProcessStatus::Normal
 }
@@ -137,6 +144,7 @@ macro_rules! test_plugin {
                 _context: &mut impl InitContext<Self>,
             ) -> bool {
                 INIT_MAX_BUFFER.with(|m| m.set(Some(buffer_config.max_buffer_size)));
+                INIT_MIN_BUFFER.with(|m| m.set(Some(buffer_config.min_buffer_size)));
                 true
             }
 

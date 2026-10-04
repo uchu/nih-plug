@@ -97,6 +97,7 @@ use crate::wrapper::util::buffer_management::{BufferManager, ChannelPointers};
 use crate::wrapper::util::{
     bar_after_split, clamp_input_event_timing, clamp_output_event_timing, hash_param_id,
     host_max_block_size, process_wrapper, split_block_end, state_length_is_sane, strlcpy,
+    MAX_BLOCK_SIZE,
 };
 
 /// How many output parameter changes we can store in our output parameter change queue. Storing
@@ -1015,6 +1016,9 @@ impl<P: ClapPlugin> Wrapper<P> {
         let is_last_block = block_end_cap >= total_buffer_len;
         let block_len = block_end_cap.saturating_sub(current_sample_idx);
         let num_events = clap_call! { in_=>size(in_) };
+        // Events before this index were already checked for a splitting event queued after them
+        // at the same sample
+        let mut same_time_scanned_until = 0u32;
         for event_idx in (resume_from_event_idx as u32)..num_events {
             let event: *const clap_event_header = clap_call! { in_=>get(in_, event_idx) };
             if event.is_null() {
@@ -1031,6 +1035,24 @@ impl<P: ClapPlugin> Wrapper<P> {
                     }
                 } else if stop_predicate(event) {
                     return Some((time, event_idx as usize));
+                } else if event_idx >= same_time_scanned_until {
+                    // A splitting event the host queued after this one at the same sample starts
+                    // a block there, and this one belongs to that block, not to the one ending
+                    // at its own timing
+                    let mut next_idx = event_idx + 1;
+                    while next_idx < num_events {
+                        let next = clap_call! { in_=>get(in_, next_idx) };
+                        if !next.is_null() {
+                            if (*next).time as usize != time {
+                                break;
+                            }
+                            if stop_predicate(next) {
+                                return Some((time, event_idx as usize));
+                            }
+                        }
+                        next_idx += 1;
+                    }
+                    same_time_scanned_until = next_idx;
                 }
             }
 
@@ -1955,12 +1977,16 @@ impl<P: ClapPlugin> Wrapper<P> {
         let wrapper = &*((*plugin).plugin_data as *const Self);
         // H7: a zero capacity would make the first block grow buffers on the audio thread, and
         // an absurd one would abort on allocation; H5 splits whatever exceeds it
+        let host_max_frames_count = max_frames_count;
         let max_frames_count = host_max_block_size(max_frames_count);
+        // Once the cap splits host blocks, the tail of a split can be any length
+        let min_buffer_size = (host_max_frames_count <= MAX_BLOCK_SIZE)
+            .then_some(min_frames_count.min(max_frames_count));
 
         let audio_io_layout = wrapper.current_audio_io_layout.load();
         let buffer_config = BufferConfig {
             sample_rate: sample_rate as f32,
-            min_buffer_size: Some(min_frames_count),
+            min_buffer_size,
             max_buffer_size: max_frames_count,
             process_mode: wrapper.current_process_mode.load(),
         };

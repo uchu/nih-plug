@@ -1036,6 +1036,13 @@ impl<P: Vst3Plugin> IAudioProcessorTrait for Wrapper<P> {
                 is_param_flush = true;
             }
 
+            // The plug-in lock comes before every wrapper-owned cell on every path, flushes
+            // included: `setActive` replaces the buffer manager under it, and a flush the host
+            // overlaps with a process call waits for that call instead of colliding with it.
+            // NOTE: `parking_lot`'s mutexes sometimes allocate because of their use of thread
+            //       locals
+            let mut plugin = permit_alloc(|| self.inner.plugin.lock());
+
             // H3: audio before a successful `setActive(true)` has no buffer manager to run
             // on. The host gets silence, and the call is still served as a flush so the
             // parameter changes it carries are not lost.
@@ -1236,34 +1243,19 @@ impl<P: Vst3Plugin> IAudioProcessorTrait for Wrapper<P> {
             }
 
             // And then we'll make sure everything is in the right order
-            // NOTE: It's important that this sort is stable, because parameter changes need to be
-            //       processed before note events. Otherwise you'll get out of bounds note events
-            //       with block splitting when the note event occurs at one index after the end (or
-            //       on the exclusive end index) of the block.
+            // NOTE: Parameter changes sort before note events at the same timing, whatever order
+            //       the host queued them in (MIDI CCs arrive through the parameter queues too).
+            //       Otherwise a note at the exact end index of a split block would be handed to
+            //       that block, out of bounds. The sort is stable so the host's order holds within
+            //       each kind.
             // FIXME: Apparently stable sort allcoates if the slice is large enough. This should be
             //        fixed at some point.
             permit_alloc(|| {
                 process_events.sort_by_key(|event| match event {
-                    ProcessEvent::ParameterChange { timing, .. } => *timing,
-                    ProcessEvent::NoteEvent(event) => event.timing(),
+                    ProcessEvent::ParameterChange { timing, .. } => (*timing, 0u8),
+                    ProcessEvent::NoteEvent(event) => (event.timing(), 1u8),
                 })
             });
-
-            // The plug-in lock is taken before the buffer manager is touched and held across every
-            // block: `setActive` replaces the buffer manager under the same lock, so a host that
-            // toggles activation while a process call is in flight waits instead of colliding.
-            let mut plugin_guard = if is_param_flush {
-                None
-            } else {
-                // NOTE: `parking_lot`'s mutexes sometimes allocate because of their use of
-                //       thread locals
-                Some(permit_alloc(|| self.inner.plugin.lock()))
-            };
-            if plugin_guard.is_some() && !self.inner.is_active.load(Ordering::SeqCst) {
-                plugin_guard = None;
-                zero_host_outputs(data, num_outputs, total_buffer_len);
-                is_param_flush = true;
-            }
 
             // The capacity the buffer manager was allocated with, not the current buffer config:
             // a host may call `setupProcessing` with a larger maximum while the plug-in is active.
@@ -1526,9 +1518,7 @@ impl<P: Vst3Plugin> IAudioProcessorTrait for Wrapper<P> {
                         }
                     }
 
-                    let result = if let (true, Some(plugin)) =
-                        (buffer_is_valid, plugin_guard.as_mut())
-                    {
+                    let result = if buffer_is_valid {
                         let mut aux = AuxiliaryBuffers {
                             inputs: buffers.aux_inputs,
                             outputs: buffers.aux_outputs,
@@ -1781,8 +1771,10 @@ impl<P: Vst3Plugin> IAudioProcessorTrait for Wrapper<P> {
                     block_start = block_end;
                 }
             };
-            // `set_state_inner()` below takes the plug-in lock itself
-            drop(plugin_guard);
+            // `set_state_inner()` below takes the plug-in lock itself. The cells go first: the
+            // next process call may take the lock the moment it is released.
+            drop(process_events);
+            drop(plugin);
 
             // After processing audio, we'll check if the editor has sent us updated plugin state.
             // We'll restore that here on the audio thread to prevent changing the values during the
