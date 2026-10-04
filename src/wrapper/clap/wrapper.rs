@@ -1819,7 +1819,14 @@ impl<P: ClapPlugin> Wrapper<P> {
             }
         }
 
-        // After the state has been updated, notify the host about the new parameter values
+        self.request_param_values_rescan();
+    }
+
+    /// CLAP hosts cache parameter values, so every load that replaces them ends in
+    /// `clap_host_params::rescan(CLAP_PARAM_RESCAN_VALUES)`. That call is main-thread only: on
+    /// the main thread it runs before this returns, elsewhere it is queued for the host's next
+    /// main-thread callback.
+    fn request_param_values_rescan(&self) {
         let task_posted = self.schedule_gui(Task::RescanParamValues);
         nih_debug_assert!(task_posted, "The task queue is full, dropping task...");
     }
@@ -3440,6 +3447,7 @@ impl<P: ClapPlugin> Wrapper<P> {
         if success {
             let task_posted = wrapper.schedule_gui(Task::ParameterValuesChanged);
             nih_debug_assert!(task_posted, "The task queue is full, dropping task...");
+            wrapper.request_param_values_rescan();
         }
 
         success
@@ -3550,6 +3558,7 @@ impl<P: ClapPlugin> Wrapper<P> {
                 let success = wrapper.set_state_inner(&mut state);
                 if success {
                     nih_trace!("Loaded state ({} bytes)", read_buffer.len());
+                    wrapper.request_param_values_rescan();
                 }
 
                 success

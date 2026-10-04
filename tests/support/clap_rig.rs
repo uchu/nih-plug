@@ -3,18 +3,53 @@
 use super::{calls_of_any, HostBuffers, TestPlugin};
 use clap_sys::audio_buffer::clap_audio_buffer;
 use clap_sys::events::*;
+use clap_sys::ext::state::{clap_plugin_state, CLAP_EXT_STATE};
 use clap_sys::fixedpoint::CLAP_BEATTIME_FACTOR;
 use clap_sys::host::clap_host;
 use clap_sys::plugin::clap_plugin;
 use clap_sys::process::*;
+use clap_sys::stream::{clap_istream, clap_ostream};
 use clap_sys::version::CLAP_VERSION;
 use nih_plug::prelude::ClapPlugin;
 use nih_plug::wrapper::clap::Wrapper;
+use std::cell::{Cell, RefCell};
 use std::ffi::{c_char, c_void};
 use std::sync::Arc;
 
+/// `clap_host::get_extension`, which a test swaps to offer host extensions.
+pub type GetExtension = unsafe extern "C" fn(*const clap_host, *const c_char) -> *const c_void;
+
 unsafe extern "C" fn host_get_extension(_h: *const clap_host, _id: *const c_char) -> *const c_void {
     std::ptr::null()
+}
+
+unsafe extern "C" fn write_state(
+    stream: *const clap_ostream,
+    buffer: *const c_void,
+    size: u64,
+) -> i64 {
+    let bytes = &*((*stream).ctx as *const RefCell<Vec<u8>>);
+    let chunk = std::slice::from_raw_parts(buffer as *const u8, size as usize);
+    bytes.borrow_mut().extend_from_slice(chunk);
+    size as i64
+}
+
+struct StateReader<'a> {
+    bytes: &'a [u8],
+    pos: Cell<usize>,
+}
+
+unsafe extern "C" fn read_state(
+    stream: *const clap_istream,
+    buffer: *mut c_void,
+    size: u64,
+) -> i64 {
+    let reader = &*((*stream).ctx as *const StateReader);
+    let pos = reader.pos.get();
+    let n = (reader.bytes.len() - pos).min(size as usize);
+    std::ptr::copy_nonoverlapping(reader.bytes.as_ptr().add(pos), buffer as *mut u8, n);
+    reader.pos.set(pos + n);
+    n as i64
 }
 
 unsafe extern "C" fn host_noop(_h: *const clap_host) {}
@@ -131,14 +166,19 @@ impl Rig {
 
 impl<P: ClapPlugin> Rig<P> {
     pub fn build() -> Self {
+        Self::with_host(std::ptr::null_mut(), host_get_extension)
+    }
+
+    /// A host whose `host_data` and `get_extension` the test supplies.
+    pub fn with_host(host_data: *mut c_void, get_extension: GetExtension) -> Self {
         let host = Box::new(clap_host {
             clap_version: CLAP_VERSION,
-            host_data: std::ptr::null_mut(),
+            host_data,
             name: c"test host".as_ptr(),
             vendor: c"nih-plug fork tests".as_ptr(),
             url: c"".as_ptr(),
             version: c"0.0.0".as_ptr(),
-            get_extension: Some(host_get_extension),
+            get_extension: Some(get_extension),
             request_restart: Some(host_noop),
             request_process: Some(host_noop),
             request_callback: Some(host_noop),
@@ -164,6 +204,55 @@ impl<P: ClapPlugin> Rig<P> {
             let mut info: clap_param_info = std::mem::zeroed();
             assert!(((*ext).get_info.unwrap())(p, 0, &mut info));
             info.id
+        }
+    }
+
+    /// `init()` alone: the instance queries the host's extensions and stays inactive.
+    pub fn init(&self) {
+        let p = self.plugin();
+        unsafe { assert!(((*p).init.unwrap())(p)) };
+    }
+
+    fn state_ext(&self) -> *const clap_plugin_state {
+        let p = self.plugin();
+        unsafe {
+            ((*p).get_extension.unwrap())(p, CLAP_EXT_STATE.as_ptr()) as *const clap_plugin_state
+        }
+    }
+
+    pub fn save_state(&self) -> Vec<u8> {
+        let bytes = RefCell::new(Vec::new());
+        let stream = clap_ostream {
+            ctx: &bytes as *const RefCell<Vec<u8>> as *mut c_void,
+            write: Some(write_state),
+        };
+        unsafe { assert!(((*self.state_ext()).save.unwrap())(self.plugin(), &stream)) };
+        bytes.into_inner()
+    }
+
+    /// `clap_plugin_state::load()` over `bytes`; the stream ends where they do.
+    pub fn load_state(&self, bytes: &[u8]) -> bool {
+        let reader = StateReader {
+            bytes,
+            pos: Cell::new(0),
+        };
+        let stream = clap_istream {
+            ctx: &reader as *const StateReader as *mut c_void,
+            read: Some(read_state),
+        };
+        unsafe { ((*self.state_ext()).load.unwrap())(self.plugin(), &stream) }
+    }
+
+    /// What `clap_plugin_params::get_value()` reports (the wrapper's CLAP values are normalized).
+    pub fn param_value(&self, param_id: u32) -> f64 {
+        use clap_sys::ext::params::{clap_plugin_params, CLAP_EXT_PARAMS};
+        let p = self.plugin();
+        unsafe {
+            let ext = ((*p).get_extension.unwrap())(p, CLAP_EXT_PARAMS.as_ptr())
+                as *const clap_plugin_params;
+            let mut value = 0.0;
+            assert!(((*ext).get_value.unwrap())(p, param_id, &mut value));
+            value
         }
     }
 
