@@ -104,9 +104,7 @@ impl ProviderInstance {
     }
 }
 
-unsafe extern "C" fn provider_init(
-    provider: *const clap_preset_discovery_provider,
-) -> bool {
+unsafe extern "C" fn provider_init(provider: *const clap_preset_discovery_provider) -> bool {
     if provider.is_null() {
         return false;
     }
@@ -130,9 +128,7 @@ unsafe extern "C" fn provider_init(
     true
 }
 
-unsafe extern "C" fn provider_destroy(
-    provider: *const clap_preset_discovery_provider,
-) {
+unsafe extern "C" fn provider_destroy(provider: *const clap_preset_discovery_provider) {
     if !provider.is_null() {
         let instance_ptr = (*provider).provider_data as *mut ProviderInstance;
         if !instance_ptr.is_null() {
@@ -161,12 +157,19 @@ unsafe extern "C" fn provider_get_metadata(
     };
 
     for entry in &entries {
-        let name = CString::new(entry.name.as_str()).unwrap_or_default();
-        let load_key = CString::new(entry.load_key.as_str()).unwrap_or_default();
+        // An interior NUL cannot cross the C ABI, and an empty stand-in key would collide.
+        let (Ok(name), Ok(load_key)) = (
+            CString::new(entry.name.as_str()),
+            CString::new(entry.load_key.as_str()),
+        ) else {
+            continue;
+        };
 
         if let Some(begin_preset) = receiver.begin_preset {
+            // CLAP: once `begin_preset()` returns false the provider must stop calling back
+            // into the receiver.
             if !begin_preset(metadata_receiver, name.as_ptr(), load_key.as_ptr()) {
-                continue;
+                break;
             }
         }
 
