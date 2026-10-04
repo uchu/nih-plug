@@ -30,6 +30,12 @@ pub struct AudioDevicesInUse {
     pub refused_output: Option<String>,
     /// A requested input that is connected but could not open the session's stream.
     pub refused_input: Option<String>,
+    /// Every output the host listed when the stream was opened (spec A3): the app's pickers read
+    /// these instead of enumerating on their own, which on ASIO would load and unload every
+    /// driver under a running stream. Empty on hosts that are not duplex.
+    pub outputs: Vec<String>,
+    /// Every input the host listed when the stream was opened; on a duplex host, the outputs.
+    pub inputs: Vec<String>,
 }
 
 static AUDIO_DEVICES_IN_USE: RwLock<Option<AudioDevicesInUse>> = RwLock::new(None);

@@ -621,6 +621,7 @@ impl<P: Plugin> Backend<P> for CpalMidir {
             &self.audio_io_layout,
             Start::Restart,
             &self.quarantined,
+            false,
         )?;
         self.quarantined.clear();
         self.output = opened.output;
@@ -683,6 +684,27 @@ fn device_names(host: &cpal::Host) -> Vec<String> {
         .unwrap_or_default()
 }
 
+/// Device names as a picker wants them: no blanks, no duplicates, host order kept.
+pub(crate) fn dedupe_names(names: Vec<String>) -> Vec<String> {
+    let mut out: Vec<String> = Vec::with_capacity(names.len());
+    for name in names {
+        if !name.trim().is_empty() && !out.contains(&name) {
+            out.push(name);
+        }
+    }
+    out
+}
+
+fn names_of(devices: Option<impl Iterator<Item = Device>>) -> Vec<String> {
+    dedupe_names(
+        devices
+            .into_iter()
+            .flatten()
+            .filter_map(|device| device.name().ok())
+            .collect(),
+    )
+}
+
 impl CpalMidir {
     /// Initialize the backend with the specified host. Returns an error if this failed for whatever
     /// reason.
@@ -706,7 +728,14 @@ impl CpalMidir {
 
         let mut config = config;
         let requested_sample_rate = config.sample_rate;
-        let opened = Self::open_devices(&host, &mut config, &audio_io_layout, Start::Launch, &[])?;
+        let opened = Self::open_devices(
+            &host,
+            &mut config,
+            &audio_io_layout,
+            Start::Launch,
+            &[],
+            false,
+        )?;
         if (config.sample_rate - requested_sample_rate).abs() > 0.1 {
             nih_log!(
                 "Device native sample rate is {} Hz, using that instead of requested {} Hz",
@@ -937,8 +966,23 @@ impl CpalMidir {
         layout: &AudioIOLayout,
         start: Start,
         quarantined: &[Wanted],
+        duplex: bool,
     ) -> Result<OpenedDevices> {
-        let mut in_use = AudioDevicesInUse::default();
+        // A3: one enumeration, on a duplex (ASIO) host only, before any driver is loaded.
+        // The input list IS the output list (a driver is both) and a second listing would
+        // load every driver again. WASAPI/CoreAudio get no listing here at all: the default
+        // path never listed devices, and a full listing costs seconds on CoreAudio.
+        let (outputs, inputs) = if duplex {
+            let names = names_of(host.output_devices().ok());
+            (names.clone(), names)
+        } else {
+            (Vec::new(), Vec::new())
+        };
+        let mut in_use = AudioDevicesInUse {
+            outputs,
+            inputs,
+            ..Default::default()
+        };
         let mut opened = OpenedDevicesSoFar::default();
 
         let output_channels = main_channels(layout.main_output_channels);
@@ -1735,6 +1779,17 @@ mod tests {
         let mut popped = ring.into_iter();
         deinterleave_frames(|| popped.next().unwrap(), &mut storage, 2, frames);
         storage
+    }
+
+    #[test]
+    fn names_of_drops_blank_and_duplicate_names() {
+        let names = dedupe_names(vec![
+            "A".to_string(),
+            "".to_string(),
+            "A".to_string(),
+            "B".to_string(),
+        ]);
+        assert_eq!(names, vec!["A".to_string(), "B".to_string()]);
     }
 
     #[test]
