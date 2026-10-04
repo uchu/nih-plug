@@ -412,3 +412,177 @@ fn a_bigger_max_announced_while_active_still_splits_by_the_allocated_size() {
     assert!(calls.iter().all(|c| c.samples == 512));
     assert!(outb.channels[0].iter().all(|&s| s == 0.5));
 }
+
+#[test]
+fn a_negative_sample_count_is_a_flush() {
+    let w = new_wrapper();
+    unsafe { setup_and_activate(&w, 256) };
+    calls_of(&w).lock().unwrap().clear();
+    let mut outb = HostBuffers::new(2, 64, 0.0);
+    let mut outputs = [outb.bus];
+    let mut data = process_data(-5, &mut [], &mut outputs);
+    data.numInputs = -3;
+    unsafe { assert_eq!(w.process(&mut data), kResultOk) };
+    assert!(calls_of(&w).lock().unwrap().is_empty());
+    let _ = &mut outb;
+}
+
+#[test]
+fn a_negative_output_count_is_a_flush() {
+    let w = new_wrapper();
+    unsafe { setup_and_activate(&w, 256) };
+    calls_of(&w).lock().unwrap().clear();
+    let mut outb = HostBuffers::new(2, 64, 0.0);
+    let mut outputs = [outb.bus];
+    let mut data = process_data(64, &mut [], &mut outputs);
+    data.numOutputs = -1;
+    unsafe { assert_eq!(w.process(&mut data), kResultOk) };
+    assert!(calls_of(&w).lock().unwrap().is_empty());
+    let _ = &mut outb;
+}
+
+#[test]
+fn a_negative_max_block_size_still_activates_and_processes() {
+    let w = new_wrapper();
+    let mut setup = ProcessSetup {
+        processMode: ProcessModes_::kRealtime as i32,
+        symbolicSampleSize: SymbolicSampleSizes_::kSample32 as i32,
+        maxSamplesPerBlock: -1,
+        sampleRate: 48000.0,
+    };
+    unsafe {
+        assert_eq!(w.setupProcessing(&mut setup), kResultOk);
+        assert_eq!(w.setActive(1), kResultOk);
+        assert_eq!(w.setProcessing(1), kResultOk);
+    }
+    calls_of(&w).lock().unwrap().clear();
+    let mut inb = HostBuffers::new(2, 4, 0.0);
+    let outb = HostBuffers::new(2, 4, 0.0);
+    let mut inputs = [inb.bus];
+    let mut outputs = [outb.bus];
+    assert_eq!(run_once(&w, &mut inputs, &mut outputs, 4), kResultOk);
+    assert!(outb.channels[0].iter().all(|&x| x == 0.5));
+    assert!(calls_of(&w).lock().unwrap().iter().all(|c| c.samples == 1));
+    let _ = &mut inb;
+}
+
+fn sysex_event(size: u32, bytes: *const u8) -> Event {
+    let mut e: Event = unsafe { std::mem::zeroed() };
+    e.r#type = Event_::EventTypes_::kDataEvent as u16;
+    e.__field0.data = DataEvent {
+        size,
+        r#type: 0,
+        bytes,
+    };
+    e
+}
+
+#[test]
+fn a_sysex_event_with_null_bytes_is_ignored() {
+    let w = new_wrapper();
+    unsafe { setup_and_activate(&w, 256) };
+    calls_of(&w).lock().unwrap().clear();
+    let events =
+        TestEventList::new(vec![sysex_event(3, std::ptr::null()), note_on(60, 10)]).into_com();
+    let mut inb = HostBuffers::new(2, 64, 0.0);
+    let mut outb = HostBuffers::new(2, 64, 0.0);
+    let mut inputs = [inb.bus];
+    let mut outputs = [outb.bus];
+    let mut data = process_data(64, &mut inputs, &mut outputs);
+    data.inputEvents = event_list_ptr(&events);
+    unsafe { assert_eq!(w.process(&mut data), kResultOk) };
+    let calls = calls_of(&w).lock().unwrap().clone();
+    assert_eq!(calls.len(), 1);
+    assert_eq!(calls[0].notes, vec![(60, 10)]);
+    let _ = (&mut inb, &mut outb);
+}
+
+#[test]
+fn a_sysex_event_with_zero_size_is_ignored() {
+    let w = new_wrapper();
+    unsafe { setup_and_activate(&w, 256) };
+    calls_of(&w).lock().unwrap().clear();
+    let bytes = [0x90u8, 60, 100];
+    let events = TestEventList::new(vec![sysex_event(0, bytes.as_ptr())]).into_com();
+    let mut inb = HostBuffers::new(2, 64, 0.0);
+    let mut outb = HostBuffers::new(2, 64, 0.0);
+    let mut inputs = [inb.bus];
+    let mut outputs = [outb.bus];
+    let mut data = process_data(64, &mut inputs, &mut outputs);
+    data.inputEvents = event_list_ptr(&events);
+    unsafe { assert_eq!(w.process(&mut data), kResultOk) };
+    let calls = calls_of(&w).lock().unwrap().clone();
+    assert_eq!(calls.len(), 1);
+    assert!(calls[0].notes.is_empty());
+    let _ = (&mut inb, &mut outb);
+}
+
+#[test]
+fn a_negative_channel_count_on_the_main_output_is_a_flush() {
+    let w = new_wrapper();
+    unsafe { setup_and_activate(&w, 256) };
+    calls_of(&w).lock().unwrap().clear();
+    let mut outb = HostBuffers::new(2, 64, 1.0);
+    outb.bus.numChannels = -1;
+    let mut outputs = [outb.bus];
+    let mut data = process_data(64, &mut [], &mut outputs);
+    unsafe { assert_eq!(w.process(&mut data), kResultOk) };
+    assert!(calls_of(&w).lock().unwrap().is_empty());
+    let _ = &mut outb;
+}
+
+#[test]
+fn a_negative_channel_count_on_an_aux_input_is_zero_channels() {
+    let w = new_wrapper();
+    unsafe { setup_and_activate(&w, 256) };
+    calls_of(&w).lock().unwrap().clear();
+    let mut inb = HostBuffers::new(2, 64, 0.0);
+    let mut auxb = HostBuffers::new(2, 64, 0.125);
+    auxb.bus.numChannels = -1;
+    let mut outb = HostBuffers::new(2, 64, 0.0);
+    let mut inputs = [inb.bus, auxb.bus];
+    let mut outputs = [outb.bus];
+    assert_eq!(run_once(&w, &mut inputs, &mut outputs, 64), kResultOk);
+    // Zero channels, not `usize::MAX` of them: the aux reads as silence.
+    assert!(outb.channels[0].iter().all(|&x| x == 0.5));
+    assert_eq!(calls_of(&w).lock().unwrap().len(), 1);
+    let _ = (&mut inb, &mut auxb, &mut outb);
+}
+
+#[test]
+fn a_negative_channel_count_on_the_main_input_is_no_input() {
+    let w = new_wrapper();
+    unsafe { setup_and_activate(&w, 256) };
+    calls_of(&w).lock().unwrap().clear();
+    // No channel memory at all behind a bus that claims -1 channels.
+    let mut inb = HostBuffers::new(0, 64, 0.0);
+    inb.bus.numChannels = -1;
+    let mut outb = HostBuffers::new(2, 64, 1.0);
+    let mut inputs = [inb.bus];
+    let mut outputs = [outb.bus];
+    assert_eq!(run_once(&w, &mut inputs, &mut outputs, 64), kResultOk);
+    assert!(outb.channels[0].iter().all(|&x| x == 0.5));
+    assert_eq!(calls_of(&w).lock().unwrap().len(), 1);
+    let _ = (&mut inb, &mut outb);
+}
+
+#[test]
+fn an_event_the_host_fails_to_hand_over_is_skipped() {
+    let w = new_wrapper();
+    unsafe { setup_and_activate(&w, 256) };
+    calls_of(&w).lock().unwrap().clear();
+    let mut list = TestEventList::new(vec![note_on(60, 10)]);
+    list.phantom = 1;
+    let events = list.into_com();
+    let mut inb = HostBuffers::new(2, 64, 0.0);
+    let mut outb = HostBuffers::new(2, 64, 0.0);
+    let mut inputs = [inb.bus];
+    let mut outputs = [outb.bus];
+    let mut data = process_data(64, &mut inputs, &mut outputs);
+    data.inputEvents = event_list_ptr(&events);
+    unsafe { assert_eq!(w.process(&mut data), kResultOk) };
+    let calls = calls_of(&w).lock().unwrap().clone();
+    assert_eq!(calls.len(), 1);
+    assert_eq!(calls[0].notes, vec![(60, 10)]);
+    let _ = (&mut inb, &mut outb);
+}

@@ -389,11 +389,13 @@ pub fn calls_of(_wrapper: &Wrapper<TestPlugin>) -> Arc<Mutex<Vec<Call>>> {
 /// A host-side `IEventList` handing the given events to `process`.
 pub struct TestEventList {
     pub events: Vec<Event>,
+    /// Indices past the real events that `getEventCount` still reports (`getEvent` fails).
+    pub phantom: usize,
 }
 
 impl TestEventList {
     pub fn new(events: Vec<Event>) -> Self {
-        Self { events }
+        Self { events, phantom: 0 }
     }
 
     pub fn into_com(self) -> ComWrapper<Self> {
@@ -407,7 +409,7 @@ impl Class for TestEventList {
 
 impl IEventListTrait for TestEventList {
     unsafe fn getEventCount(&self) -> int32 {
-        self.events.len() as int32
+        (self.events.len() + self.phantom) as int32
     }
 
     unsafe fn getEvent(&self, index: int32, e: *mut Event) -> tresult {

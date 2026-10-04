@@ -914,7 +914,7 @@ impl<P: Vst3Plugin> IAudioProcessorTrait for Wrapper<P> {
         self.inner.current_buffer_config.store(Some(BufferConfig {
             sample_rate: setup.sampleRate as f32,
             min_buffer_size: None,
-            max_buffer_size: setup.maxSamplesPerBlock as u32,
+            max_buffer_size: host_count(setup.maxSamplesPerBlock).max(1) as u32,
             process_mode: self.inner.current_process_mode.load(),
         }));
 
@@ -1132,6 +1132,10 @@ impl<P: Vst3Plugin> IAudioProcessorTrait for Wrapper<P> {
                     for i in 0..num_events {
                         let result = events.getEvent(i, event.as_mut_ptr());
                         nih_debug_assert_eq!(result, kResultOk);
+                        // On failure `event` is uninitialized or still holds the previous one.
+                        if result != kResultOk {
+                            continue;
+                        }
 
                         let event = event.assume_init();
                         let timing = clamp_input_event_timing(
@@ -1200,9 +1204,12 @@ impl<P: Vst3Plugin> IAudioProcessorTrait for Wrapper<P> {
                             // 0 = kMidiSysEx
                             let event = event.__field0.data;
 
+                            // H7: a data event without data is a host bug; skip it.
+                            if event.bytes.is_null() || event.size == 0 {
+                                continue;
+                            }
                             // `NoteEvent::from_midi` prints some tracing if parsing fails, which is
                             // not necessarily an error
-                            assert!(!event.bytes.is_null());
                             let sysex_buffer =
                                 std::slice::from_raw_parts(event.bytes, event.size as usize);
                             if let Ok(note_event) = NoteEvent::from_midi(timing, sysex_buffer) {
@@ -1318,7 +1325,7 @@ impl<P: Vst3Plugin> IAudioProcessorTrait for Wrapper<P> {
                                     audio_output.__field0.channelBuffers32 as *mut *mut f32,
                                 )
                                 .unwrap();
-                                let num_channels = audio_output.numChannels as usize;
+                                let num_channels = host_count(audio_output.numChannels);
 
                                 *buffer_source.main_output_channel_pointers =
                                     Some(ChannelPointers { ptrs, num_channels });
@@ -1334,7 +1341,7 @@ impl<P: Vst3Plugin> IAudioProcessorTrait for Wrapper<P> {
                                     audio_input.__field0.channelBuffers32 as *mut *mut f32,
                                 )
                                 .unwrap();
-                                let num_channels = audio_input.numChannels as usize;
+                                let num_channels = host_count(audio_input.numChannels);
 
                                 *buffer_source.main_input_channel_pointers =
                                     Some(ChannelPointers { ptrs, num_channels });
@@ -1370,7 +1377,7 @@ impl<P: Vst3Plugin> IAudioProcessorTrait for Wrapper<P> {
                                         audio_input.__field0.channelBuffers32 as *mut *mut f32,
                                     ) {
                                         Some(ptrs) => {
-                                            let num_channels = audio_input.numChannels as usize;
+                                            let num_channels = host_count(audio_input.numChannels);
 
                                             *aux_input_channel_pointers =
                                                 Some(ChannelPointers { ptrs, num_channels });
@@ -1400,7 +1407,7 @@ impl<P: Vst3Plugin> IAudioProcessorTrait for Wrapper<P> {
                                         audio_output.__field0.channelBuffers32 as *mut *mut f32,
                                     ) {
                                         Some(ptrs) => {
-                                            let num_channels = audio_output.numChannels as usize;
+                                            let num_channels = host_count(audio_output.numChannels);
 
                                             *aux_output_channel_pointers =
                                                 Some(ChannelPointers { ptrs, num_channels });
