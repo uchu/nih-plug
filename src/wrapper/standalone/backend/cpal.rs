@@ -615,6 +615,10 @@ impl<P: Plugin> Backend<P> for CpalMidir {
         // `self.config.sample_rate` is the rate the plugin and the wrapper were initialized with
         // and cannot change mid-session. For a default-device selection this picks up whatever
         // the *current* system default is.
+        let listed = {
+            let in_use = self.in_use.lock();
+            (in_use.outputs.clone(), in_use.inputs.clone())
+        };
         let opened = Self::open_devices(
             &host,
             &mut self.config,
@@ -622,6 +626,7 @@ impl<P: Plugin> Backend<P> for CpalMidir {
             Start::Restart,
             &self.quarantined,
             false,
+            listed,
         )?;
         self.quarantined.clear();
         self.output = opened.output;
@@ -695,6 +700,28 @@ pub(crate) fn dedupe_names(names: Vec<String>) -> Vec<String> {
     out
 }
 
+/// The output and input lists to publish (spec A3). A duplex (ASIO) host is listed once, at
+/// launch, before any driver is loaded; the input list IS the output list, since a driver is both
+/// and a second listing would load every driver again. A restart carries `listed` (the launch
+/// lists) over: the running driver stays loaded through it, and while one is loaded ASIO lists
+/// only that driver. WASAPI and CoreAudio are never listed here: the default path never listed
+/// devices, and a full listing costs seconds on CoreAudio.
+fn device_lists(
+    start: Start,
+    duplex: bool,
+    listed: (Vec<String>, Vec<String>),
+    enumerate: impl FnOnce() -> Vec<String>,
+) -> (Vec<String>, Vec<String>) {
+    match start {
+        Start::Restart => listed,
+        Start::Launch if duplex => {
+            let names = enumerate();
+            (names.clone(), names)
+        }
+        Start::Launch => (Vec::new(), Vec::new()),
+    }
+}
+
 fn names_of(devices: Option<impl Iterator<Item = Device>>) -> Vec<String> {
     dedupe_names(
         devices
@@ -735,6 +762,7 @@ impl CpalMidir {
             Start::Launch,
             &[],
             false,
+            Default::default(),
         )?;
         if (config.sample_rate - requested_sample_rate).abs() > 0.1 {
             nih_log!(
@@ -967,17 +995,11 @@ impl CpalMidir {
         start: Start,
         quarantined: &[Wanted],
         duplex: bool,
+        listed: (Vec<String>, Vec<String>),
     ) -> Result<OpenedDevices> {
-        // A3: one enumeration, on a duplex (ASIO) host only, before any driver is loaded.
-        // The input list IS the output list (a driver is both) and a second listing would
-        // load every driver again. WASAPI/CoreAudio get no listing here at all: the default
-        // path never listed devices, and a full listing costs seconds on CoreAudio.
-        let (outputs, inputs) = if duplex {
-            let names = names_of(host.output_devices().ok());
-            (names.clone(), names)
-        } else {
-            (Vec::new(), Vec::new())
-        };
+        let (outputs, inputs) = device_lists(start, duplex, listed, || {
+            names_of(host.output_devices().ok())
+        });
         let mut in_use = AudioDevicesInUse {
             outputs,
             inputs,
@@ -1790,6 +1812,40 @@ mod tests {
             "B".to_string(),
         ]);
         assert_eq!(names, vec!["A".to_string(), "B".to_string()]);
+    }
+
+    fn listed(names: &[&str]) -> (Vec<String>, Vec<String>) {
+        let names: Vec<String> = names.iter().map(|name| name.to_string()).collect();
+        (names.clone(), names)
+    }
+
+    #[test]
+    fn a_duplex_launch_lists_the_host_once() {
+        let mut calls = 0;
+        let lists = device_lists(Start::Launch, true, Default::default(), || {
+            calls += 1;
+            vec!["A".to_string(), "B".to_string()]
+        });
+        assert_eq!(calls, 1);
+        assert_eq!(lists, listed(&["A", "B"]));
+    }
+
+    #[test]
+    fn a_duplex_restart_carries_the_launch_lists_without_listing() {
+        let lists = device_lists(Start::Restart, true, listed(&["A", "B"]), || {
+            panic!("a restart must not list the host while its driver is loaded")
+        });
+        assert_eq!(lists, listed(&["A", "B"]));
+    }
+
+    #[test]
+    fn a_host_that_is_not_duplex_never_lists() {
+        for start in [Start::Launch, Start::Restart] {
+            let lists = device_lists(start, false, Default::default(), || {
+                panic!("only a duplex host is listed")
+            });
+            assert_eq!(lists, listed(&[]));
+        }
     }
 
     #[test]
