@@ -1005,13 +1005,18 @@ impl<P: Vst3Plugin> IAudioProcessorTrait for Wrapper<P> {
             // NOTE: VST3 hosts may trigger a 'parameter flush' by calling the process function for
             //       0 input samples. If this is the case then we'll only handle events and skip all
             //       audio processing. Some hosts, like Ableton Live, implement this in a broken way
-            //       and instead only set the number of channels to 0. In that case the
-            //       'buffer_is_valid' check from below should still prevent audio processing.
+            //       and instead only set the number of channels to 0, which is caught here
+            //       too: the buffer manager backs missing output channels with scratch storage,
+            //       so empty slices no longer stop it.
             let mut is_param_flush = total_buffer_len == 0;
-            if (num_outputs == 0
+            let output_buffers_missing = num_outputs == 0
                 || data.outputs.is_null()
-                || (*data.outputs).__field0.channelBuffers32.is_null())
-                && (has_main_output || !current_audio_io_layout.aux_output_ports.is_empty())
+                || (*data.outputs).__field0.channelBuffers32.is_null();
+            let main_output_has_no_channels =
+                has_main_output && !output_buffers_missing && (*data.outputs).numChannels <= 0;
+            if main_output_has_no_channels
+                || (output_buffers_missing
+                    && (has_main_output || !current_audio_io_layout.aux_output_ports.is_empty()))
             {
                 is_param_flush = true;
             }

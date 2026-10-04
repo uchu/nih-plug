@@ -223,3 +223,130 @@ fn parameter_changes_in_audio_before_activation_still_apply() {
     unsafe { assert!((w.getParamNormalized(id) - 0.125).abs() < 1e-6) };
     assert!(calls_of(&w).lock().unwrap().is_empty());
 }
+
+fn run_once(
+    w: &Wrapper<TestPlugin>,
+    inputs: &mut [AudioBusBuffers],
+    outputs: &mut [AudioBusBuffers],
+    n: i32,
+) -> tresult {
+    let mut data = process_data(n, inputs, outputs);
+    unsafe { w.process(&mut data) }
+}
+
+#[test]
+fn a_six_channel_host_output_bus_gets_two_channels_of_audio_and_four_of_silence() {
+    let w = new_wrapper();
+    unsafe { setup_and_activate(&w, 256) };
+    let mut inb = HostBuffers::new(2, 64, 0.0);
+    let mut outb = HostBuffers::new(6, 64, 1.0);
+    let mut inputs = [inb.bus];
+    let mut outputs = [outb.bus];
+    assert_eq!(run_once(&w, &mut inputs, &mut outputs, 64), kResultOk);
+    assert!(outb.channels[0].iter().all(|&x| x == 0.5));
+    assert!(outb.channels[1].iter().all(|&x| x == 0.25));
+    for ch in 2..6 {
+        assert!(outb.channels[ch].iter().all(|&x| x == 0.0), "channel {ch}");
+    }
+    let _ = (&mut inb, &mut outb);
+}
+
+#[test]
+fn a_mono_host_output_still_runs_the_plugin_and_gets_channel_0() {
+    let w = new_wrapper();
+    unsafe { setup_and_activate(&w, 256) };
+    calls_of(&w).lock().unwrap().clear();
+    let mut inb = HostBuffers::new(2, 64, 0.0);
+    let mut outb = HostBuffers::new(1, 64, 1.0);
+    let mut inputs = [inb.bus];
+    let mut outputs = [outb.bus];
+    assert_eq!(run_once(&w, &mut inputs, &mut outputs, 64), kResultOk);
+    assert!(outb.channels[0].iter().all(|&x| x == 0.5));
+    assert_eq!(calls_of(&w).lock().unwrap().len(), 1);
+    let _ = (&mut inb, &mut outb);
+}
+
+#[test]
+fn stereo_input_into_mono_output_does_not_read_past_the_host_array() {
+    let w = new_wrapper();
+    unsafe { setup_and_activate(&w, 256) };
+    let mut inb = HostBuffers::new(2, 64, 0.3);
+    let mut outb = HostBuffers::new(1, 64, 0.0);
+    let mut inputs = [inb.bus];
+    let mut outputs = [outb.bus];
+    assert_eq!(run_once(&w, &mut inputs, &mut outputs, 64), kResultOk);
+    assert!(outb.channels[0].iter().all(|&x| x == 0.5));
+    let _ = (&mut inb, &mut outb);
+}
+
+#[test]
+fn a_null_aux_channel_pointer_reads_as_silence() {
+    let w = new_wrapper();
+    unsafe { setup_and_activate(&w, 256) };
+    calls_of(&w).lock().unwrap().clear();
+    let mut inb = HostBuffers::new(2, 64, 0.0);
+    let mut auxb = HostBuffers::new(2, 64, 0.125);
+    auxb.null_channel(1);
+    let mut outb = HostBuffers::new(2, 64, 0.0);
+    let mut inputs = [inb.bus, auxb.bus];
+    let mut outputs = [outb.bus];
+    assert_eq!(run_once(&w, &mut inputs, &mut outputs, 64), kResultOk);
+    // Aux channel 0 (0.125) lands on the left; the plug-in ran.
+    assert!(outb.channels[0].iter().all(|&x| (x - 0.625).abs() < 1e-6));
+    assert_eq!(calls_of(&w).lock().unwrap().len(), 1);
+    let _ = (&mut inb, &mut auxb, &mut outb);
+}
+
+#[test]
+fn a_null_main_output_channel_pointer_is_backed_by_scratch() {
+    let w = new_wrapper();
+    unsafe { setup_and_activate(&w, 256) };
+    calls_of(&w).lock().unwrap().clear();
+    let mut inb = HostBuffers::new(2, 64, 0.0);
+    let mut outb = HostBuffers::new(2, 64, 1.0);
+    outb.null_channel(1);
+    let mut inputs = [inb.bus];
+    let mut outputs = [outb.bus];
+    assert_eq!(run_once(&w, &mut inputs, &mut outputs, 64), kResultOk);
+    assert!(outb.channels[0].iter().all(|&x| x == 0.5));
+    assert!(outb.channels[1].iter().all(|&x| x == 1.0));
+    assert_eq!(calls_of(&w).lock().unwrap().len(), 1);
+    let _ = (&mut inb, &mut outb);
+}
+
+#[test]
+fn an_aux_bus_that_vanishes_before_a_longer_block_is_zero_for_the_whole_block() {
+    let w = new_wrapper();
+    unsafe { setup_and_activate(&w, 512) };
+    let mut inb = HostBuffers::new(2, 512, 0.0);
+    let mut auxb = HostBuffers::new(2, 256, 0.125);
+    let mut outb = HostBuffers::new(2, 512, 0.0);
+    {
+        let mut inputs = [inb.bus, auxb.bus];
+        let mut outputs = [outb.bus];
+        assert_eq!(run_once(&w, &mut inputs, &mut outputs, 256), kResultOk);
+    }
+    calls_of(&w).lock().unwrap().clear();
+    let mut inputs = [inb.bus];
+    let mut outputs = [outb.bus];
+    assert_eq!(run_once(&w, &mut inputs, &mut outputs, 512), kResultOk);
+    assert!(outb.channels[0].iter().all(|&x| x == 0.5));
+    // H6: the aux slice is as long as the block (the old code left it at 256).
+    assert_eq!(calls_of(&w).lock().unwrap().last().unwrap().aux_len, 512);
+    let _ = (&mut inb, &mut auxb, &mut outb);
+}
+
+#[test]
+fn a_zero_channel_main_output_is_a_flush() {
+    // Ableton Live's flush: samples, but zero channels on the output bus.
+    let w = new_wrapper();
+    unsafe { setup_and_activate(&w, 256) };
+    calls_of(&w).lock().unwrap().clear();
+    let mut inb = HostBuffers::new(2, 64, 0.0);
+    let mut outb = HostBuffers::new(0, 64, 0.0);
+    let mut inputs = [inb.bus];
+    let mut outputs = [outb.bus];
+    assert_eq!(run_once(&w, &mut inputs, &mut outputs, 64), kResultOk);
+    assert!(calls_of(&w).lock().unwrap().is_empty());
+    let _ = (&mut inb, &mut outb);
+}
