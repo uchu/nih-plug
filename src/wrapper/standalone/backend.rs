@@ -84,4 +84,11 @@ pub trait Backend<P: Plugin>: 'static + Send + Sync {
     fn quarantine_requested(&mut self) -> bool {
         false
     }
+
+    /// The process callback runs on a thread the audio driver owns and schedules itself (ASIO),
+    /// so the wrapper must not register it with MMCSS or raise its priority: the driver manages
+    /// that thread, and a registration would outlive the stream since it is never reverted.
+    fn callback_thread_is_driver_owned(&self) -> bool {
+        false
+    }
 }

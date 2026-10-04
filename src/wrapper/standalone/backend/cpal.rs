@@ -727,6 +727,10 @@ impl<P: Plugin> Backend<P> for CpalMidir {
         }
     }
 
+    fn callback_thread_is_driver_owned(&self) -> bool {
+        self.duplex
+    }
+
     fn quarantine_requested(&mut self) -> bool {
         if self.duplex {
             // A restart can only land on the driver that is loaded, so there is nothing to stand
@@ -1664,9 +1668,10 @@ impl CpalMidir {
     {
         // This callback needs to copy input samples to a ring buffer that can be read from in the
         // output data callback
-        #[cfg(target_os = "windows")]
-        let mut input_thread_promoted = false;
         let duplex = self.duplex;
+        #[cfg(target_os = "windows")]
+        let mut input_promotion_pending =
+            super::super::wrapper::callback_thread_needs_promotion(duplex);
         let overflows = self.overflows.clone();
         let device_channels = self
             .input
@@ -1685,8 +1690,8 @@ impl CpalMidir {
             // samples it waits for.
             // A duplex capture runs on the driver's own thread, which nothing spins on.
             #[cfg(target_os = "windows")]
-            if !duplex && !input_thread_promoted {
-                input_thread_promoted = true;
+            if input_promotion_pending {
+                input_promotion_pending = false;
                 super::super::wrapper::promote_audio_thread();
             }
 
@@ -2151,6 +2156,11 @@ mod tests {
     fn listed(names: &[&str]) -> (Vec<String>, Vec<String>) {
         let names: Vec<String> = names.iter().map(|name| name.to_string()).collect();
         (names.clone(), names)
+    }
+
+    #[test]
+    fn the_default_host_leaves_its_callback_thread_to_us() {
+        assert!(!single_device_duplex(cpal::default_host().id()));
     }
 
     #[test]

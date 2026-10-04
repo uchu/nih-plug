@@ -140,6 +140,16 @@ pub(super) fn promote_audio_thread() {
     }
 }
 
+/// CoreAudio and JACK already run their callbacks on real-time threads.
+#[cfg(not(target_os = "windows"))]
+pub(super) fn promote_audio_thread() {}
+
+/// Whether the wrapper promotes the process callback's thread: only a thread the host API hands
+/// to us, never one the driver owns (see [`Backend::callback_thread_is_driver_owned()`]).
+pub(super) fn callback_thread_needs_promotion(driver_owned: bool) -> bool {
+    !driver_owned
+}
+
 /// Errors that may arise while initializing the wrapped plugins.
 #[derive(Debug, Clone, Copy)]
 pub enum WrapperError {
@@ -647,15 +657,15 @@ impl<P: Plugin, B: Backend<P>> Wrapper<P, B> {
                 let should_terminate = should_terminate.clone();
                 // Every stream (re)start gets a fresh cpal audio thread, so the
                 // promotion flag lives with the per-attempt callback.
-                #[cfg(target_os = "windows")]
-                let mut audio_thread_promoted = false;
+                let mut promotion_pending = callback_thread_needs_promotion(
+                    self.backend.borrow().callback_thread_is_driver_owned(),
+                );
                 // The process callback is consumed by `run()`, so it's rebuilt for every attempt.
                 self.backend.borrow_mut().run(
                     should_stop,
                     move |buffer, aux, transport, input_events, output_events| {
-                        #[cfg(target_os = "windows")]
-                        if !audio_thread_promoted {
-                            audio_thread_promoted = true;
+                        if promotion_pending {
+                            promotion_pending = false;
                             promote_audio_thread();
                         }
 
@@ -904,5 +914,20 @@ impl<P: Plugin, B: Backend<P>> Wrapper<P, B> {
         self.request_resize();
 
         success
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::callback_thread_needs_promotion;
+
+    #[test]
+    fn a_driver_owned_callback_thread_is_left_alone() {
+        assert!(!callback_thread_needs_promotion(true));
+    }
+
+    #[test]
+    fn a_callback_thread_the_host_api_hands_us_is_promoted() {
+        assert!(callback_thread_needs_promotion(false));
     }
 }
