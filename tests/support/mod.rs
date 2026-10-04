@@ -21,6 +21,7 @@ pub struct Call {
     pub notes: Vec<(u8, u32)>,
     pub pos_samples: Option<i64>,
     pub pos_beats: Option<f64>,
+    pub bar_start_pos_beats: Option<f64>,
     /// Length of aux input 0, channel 0, as handed to the plug-in (H6 pins it to `samples`).
     pub aux_len: usize,
 }
@@ -107,6 +108,7 @@ impl Plugin for TestPlugin {
             notes,
             pos_samples: context.transport().pos_samples,
             pos_beats: context.transport().pos_beats,
+            bar_start_pos_beats: context.transport().bar_start_pos_beats,
             aux_len: aux0.len(),
         });
         ProcessStatus::Normal

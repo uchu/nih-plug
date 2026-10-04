@@ -1065,7 +1065,7 @@ impl<P: Vst3Plugin> IAudioProcessorTrait for Wrapper<P> {
                                 // `event.subtract_timing(block_start)` before it is passed to the
                                 // plugin. Out of bounds events are clamped to the buffer>
                                 let timing = clamp_input_event_timing(
-                                    sample_offset as u32,
+                                    sample_offset.max(0) as u32,
                                     total_buffer_len as u32,
                                 );
                                 let value = value as f32;
@@ -1139,7 +1139,7 @@ impl<P: Vst3Plugin> IAudioProcessorTrait for Wrapper<P> {
 
                         let event = event.assume_init();
                         let timing = clamp_input_event_timing(
-                            event.sampleOffset as u32,
+                            event.sampleOffset.max(0) as u32,
                             total_buffer_len as u32,
                         );
 

@@ -364,13 +364,16 @@ fn a_4096_block_against_max_512_is_eight_blocks_with_the_note_in_the_right_one()
     let mut outputs = [outb.bus];
     let mut data = process_data(4096, &mut inputs, &mut outputs);
     data.inputEvents = event_list_ptr(&events);
-    // 120 bpm from bar 0: every size split must advance `pos_beats`, not only sample-accurate
-    // ones (H5).
+    // 120 bpm in 4/4 from beat 3.9: every size split must advance `pos_beats` and recompute the
+    // bar start, not only sample-accurate ones (H5). Block 5 crosses into the bar at beat 4.
     let mut ctx: ProcessContext = unsafe { std::mem::zeroed() };
-    ctx.state = kTempoValid | kProjectTimeMusicValid;
+    ctx.state = kTempoValid | kProjectTimeMusicValid | kBarPositionValid | kTimeSigValid;
     ctx.sampleRate = 48000.0;
     ctx.tempo = 120.0;
-    ctx.projectTimeMusic = 0.0;
+    ctx.timeSigNumerator = 4;
+    ctx.timeSigDenominator = 4;
+    ctx.projectTimeMusic = 3.9;
+    ctx.barPositionMusic = 0.0;
     ctx.projectTimeSamples = 0;
     data.processContext = &mut ctx;
     unsafe { assert_eq!(w.process(&mut data), kResultOk) };
@@ -384,8 +387,10 @@ fn a_4096_block_against_max_512_is_eight_blocks_with_the_note_in_the_right_one()
         .all(|(i, c)| c.notes.is_empty() || i == 2));
     assert_eq!(calls[1].pos_samples, Some(512));
     let beats_per_block = 512.0 / 48000.0 / 60.0 * 120.0;
-    assert!((calls[1].pos_beats.unwrap() - beats_per_block).abs() < 1e-9);
-    assert!((calls[7].pos_beats.unwrap() - 7.0 * beats_per_block).abs() < 1e-9);
+    assert!((calls[1].pos_beats.unwrap() - (3.9 + beats_per_block)).abs() < 1e-9);
+    assert!((calls[7].pos_beats.unwrap() - (3.9 + 7.0 * beats_per_block)).abs() < 1e-9);
+    assert_eq!(calls[0].bar_start_pos_beats, Some(0.0));
+    assert_eq!(calls[7].bar_start_pos_beats, Some(4.0));
     assert!(outb.channels[0].iter().all(|&s| s == 0.5));
     let _ = &mut inb;
 }
@@ -464,6 +469,25 @@ fn a_negative_max_block_size_still_activates_and_processes() {
     assert!(outb.channels[0].iter().all(|&x| x == 0.5));
     assert!(calls_of(&w).lock().unwrap().iter().all(|c| c.samples == 1));
     let _ = &mut inb;
+}
+
+#[test]
+fn a_negative_event_offset_lands_on_the_first_sample() {
+    let w = new_wrapper();
+    unsafe { setup_and_activate(&w, 256) };
+    calls_of(&w).lock().unwrap().clear();
+    let events = TestEventList::new(vec![note_on(60, -1)]).into_com();
+    let mut inb = HostBuffers::new(2, 64, 0.0);
+    let mut outb = HostBuffers::new(2, 64, 0.0);
+    let mut inputs = [inb.bus];
+    let mut outputs = [outb.bus];
+    let mut data = process_data(64, &mut inputs, &mut outputs);
+    data.inputEvents = event_list_ptr(&events);
+    unsafe { assert_eq!(w.process(&mut data), kResultOk) };
+    let calls = calls_of(&w).lock().unwrap().clone();
+    assert_eq!(calls.len(), 1);
+    assert_eq!(calls[0].notes, vec![(60, 0)]);
+    let _ = (&mut inb, &mut outb);
 }
 
 fn sysex_event(size: u32, bytes: *const u8) -> Event {
