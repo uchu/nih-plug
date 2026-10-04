@@ -41,7 +41,10 @@ use crate::prelude::{
 use crate::util::permit_alloc;
 use crate::wrapper::state;
 use crate::wrapper::util::buffer_management::{BufferManager, ChannelPointers};
-use crate::wrapper::util::{clamp_input_event_timing, clamp_output_event_timing, process_wrapper};
+use crate::wrapper::util::{
+    clamp_input_event_timing, clamp_output_event_timing, host_count, process_wrapper,
+    state_length_is_sane,
+};
 
 pub struct Wrapper<P: Vst3Plugin> {
     inner: Arc<WrapperInner<P>>,
@@ -420,40 +423,36 @@ impl<P: Vst3Plugin> IComponentTrait for Wrapper<P> {
     }
 
     unsafe fn setState(&self, state: *mut IBStream) -> tresult {
-        use vst3::Steinberg::IBStream_::IStreamSeekMode_::*;
-
         check_null_ptr!(state);
 
         let state = ComRef::from_raw(state).unwrap();
 
-        // We need to know how large the state is before we can read it. The current position can be
-        // zero, but it can also be something else. Bitwig prepends the preset header in the stream,
-        // while some other hosts don't expose that to the plugin.
-        let mut current_pos = 0;
-        let mut eof_pos = 0;
-        if state.tell(&mut current_pos) != kResultOk
-            || state.seek(0, kIBSeekEnd as int32, &mut eof_pos) != kResultOk
-            || state.seek(current_pos, kIBSeekSet as int32, std::ptr::null_mut()) != kResultOk
-        {
-            nih_debug_assert_failure!("Could not get the stream length");
-            return kResultFalse;
+        // H2: the stream is read until it says it is done, never measured. Hosts disagree on
+        // `tell`/`seek` (some window a project file, some refuse `kIBSeekEnd`, Bitwig prepends
+        // its preset header), and a short read is not the end of the stream.
+        const CHUNK: usize = 16 * 1024;
+        let mut read_buffer: Vec<u8> = Vec::new();
+        loop {
+            read_buffer.reserve(CHUNK);
+            let mut num_bytes_read: int32 = 0;
+            let result = state.read(
+                read_buffer.as_mut_ptr().add(read_buffer.len()) as *mut c_void,
+                CHUNK as int32,
+                &mut num_bytes_read,
+            );
+            // SAFETY: the host wrote at most `got` bytes into the reserved tail, and `got` is
+            // clamped to what was offered
+            let got = host_count(num_bytes_read).min(CHUNK);
+            read_buffer.set_len(read_buffer.len() + got);
+            if !state_length_is_sane(read_buffer.len() as u64) {
+                nih_debug_assert_failure!("State stream exceeds the size ceiling, refusing it");
+                return kResultFalse;
+            }
+            if result != kResultOk || got == 0 {
+                break;
+            }
         }
-
-        let stream_byte_size = (eof_pos - current_pos) as i32;
-        let mut num_bytes_read = 0;
-        let mut read_buffer: Vec<u8> = Vec::with_capacity(stream_byte_size as usize);
-        state.read(
-            read_buffer.as_mut_ptr() as *mut c_void,
-            read_buffer.capacity() as i32,
-            &mut num_bytes_read,
-        );
-        read_buffer.set_len(num_bytes_read as usize);
-
-        // If the size is zero, some hosts will always return `kResultFalse` even if the read was
-        // 'successful', so we can't check the return value but we can check the number of bytes
-        // read.
-        if read_buffer.len() != stream_byte_size as usize {
-            nih_debug_assert_failure!("Unexpected stream length");
+        if read_buffer.is_empty() {
             return kResultFalse;
         }
 
@@ -481,15 +480,24 @@ impl<P: Vst3Plugin> IComponentTrait for Wrapper<P> {
         );
         match serialized {
             Ok(serialized) => {
-                let mut num_bytes_written = 0;
-                let result = state.write(
-                    serialized.as_ptr() as *mut c_void,
-                    serialized.len() as i32,
-                    &mut num_bytes_written,
-                );
-
-                nih_debug_assert_eq!(result, kResultOk);
-                nih_debug_assert_eq!(num_bytes_written as usize, serialized.len());
+                // A host stream may accept fewer bytes than offered; keep writing until it has
+                // all of them or refuses, and never report a truncated state as saved
+                let mut written = 0usize;
+                while written < serialized.len() {
+                    let remaining = (serialized.len() - written).min(int32::MAX as usize);
+                    let mut num_bytes_written: int32 = 0;
+                    let result = state.write(
+                        serialized.as_ptr().add(written) as *mut c_void,
+                        remaining as int32,
+                        &mut num_bytes_written,
+                    );
+                    let n = host_count(num_bytes_written).min(remaining);
+                    if result != kResultOk || n == 0 {
+                        nih_debug_assert_failure!("Host stream refused the state write");
+                        return kResultFalse;
+                    }
+                    written += n;
+                }
 
                 nih_trace!("Saved state ({} bytes)", serialized.len());
 
