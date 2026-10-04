@@ -833,6 +833,11 @@ impl CpalMidir {
         self.config.sample_rate
     }
 
+    /// The period the stream was opened with; a duplex driver may have clamped it.
+    pub fn actual_period_size(&self) -> u32 {
+        self.config.period_size
+    }
+
     /// Whether a wanted device could run the session's stream right now: the restart's own
     /// resolution, then a silent stream built and started on that device and dropped as soon as
     /// it delivers a callback. A device can match every configuration and still refuse a stream

@@ -113,6 +113,9 @@ pub enum BackendType {
     /// Use WASAPI for audio and MIDI.
     #[cfg(target_os = "windows")]
     Wasapi,
+    /// Use an ASIO driver for audio, both output and input on the one driver.
+    #[cfg(all(target_os = "windows", feature = "asio"))]
+    Asio,
     /// Does not playback or receive any audio or MIDI.
     Dummy,
 }

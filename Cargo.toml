@@ -58,6 +58,10 @@ assert_process_allocs = ["dep:assert_no_alloc"]
 # `nih_export_standalone()` function. Disabled by default as this requires
 # building additional dependencies for audio and MIDI handling.
 standalone = ["dep:baseview", "dep:clap", "dep:cpal", "dep:jack", "dep:midir", "dep:rtrb"]
+# ASIO host for the Windows standalone. Implies `standalone`; cpal gates the
+# host to Windows, so the feature is a no-op elsewhere. Needs the Steinberg
+# ASIO SDK (`CPAL_ASIO_DIR`) and libclang at build time.
+asio = ["standalone", "cpal/asio"]
 # The standalone window enforces the editor's minimum size on interactive
 # (drag) resizing via `baseview::Window::set_min_client_size`. That method
 # exists only in Phaseburn's patched baseview (vendored in the consuming

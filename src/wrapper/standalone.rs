@@ -213,6 +213,19 @@ pub fn nih_export_standalone_with_args<P: Plugin, Args: IntoIterator<Item = Stri
                 }
             }
         }
+        #[cfg(all(target_os = "windows", feature = "asio"))]
+        config::BackendType::Asio => {
+            match backend::CpalMidir::new::<P>(config.clone(), cpal::HostId::Asio) {
+                Ok(backend) => {
+                    let actual_config = config_with_actual_rate(&config, &backend);
+                    run_wrapper::<P, _>(backend, actual_config)
+                }
+                Err(err) => {
+                    nih_error!("Could not initialize the ASIO backend: {:#}", err);
+                    false
+                }
+            }
+        }
         config::BackendType::Dummy => {
             run_wrapper::<P, _>(backend::Dummy::new::<P>(config.clone()), config)
         }
@@ -224,6 +237,7 @@ pub fn nih_export_standalone_with_args<P: Plugin, Args: IntoIterator<Item = Stri
 fn config_with_actual_rate(config: &WrapperConfig, backend: &backend::CpalMidir) -> WrapperConfig {
     let mut actual_config = config.clone();
     actual_config.sample_rate = backend.actual_sample_rate();
+    actual_config.period_size = backend.actual_period_size();
     actual_config
 }
 
