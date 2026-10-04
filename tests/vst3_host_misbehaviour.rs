@@ -1,13 +1,22 @@
 mod support;
 
+use nih_plug::prelude::Vst3Plugin;
+use nih_plug::wrapper::vst3::vst3::ComWrapper;
 use nih_plug::wrapper::vst3::vst3::Steinberg::Vst::*;
 use nih_plug::wrapper::vst3::vst3::Steinberg::*;
 use nih_plug::wrapper::vst3::Wrapper;
 use support::*;
 
-fn gain_id(w: &Wrapper<TestPlugin>) -> u32 {
+fn gain_id<P: Vst3Plugin>(w: &Wrapper<P>) -> u32 {
     let mut info: ParameterInfo = unsafe { std::mem::zeroed() };
     unsafe { assert_eq!(w.getParameterInfo(0, &mut info), kResultOk) };
+    info.id
+}
+
+/// The first generated MIDI parameter: channel 1, CC 0. It follows the one real parameter.
+fn midi_cc_0_id<P: Vst3Plugin>(w: &Wrapper<P>) -> u32 {
+    let mut info: ParameterInfo = unsafe { std::mem::zeroed() };
+    unsafe { assert_eq!(w.getParameterInfo(1, &mut info), kResultOk) };
     info.id
 }
 
@@ -90,6 +99,24 @@ fn get_state_writes_to_completion_through_a_short_writing_stream() {
 }
 
 #[test]
+fn get_state_succeeds_through_a_stream_that_never_reports_a_count() {
+    let w = new_wrapper();
+    let id = gain_id(&w);
+    unsafe {
+        assert_eq!(w.setParamNormalized(id, 0.875), kResultOk);
+        let mut s = TestStream::new(Vec::new());
+        s.silent_count = true;
+        let s = s.into_com();
+        assert_eq!(IComponentTrait::getState(&w, stream_ptr(&s)), kResultOk);
+        let blob = s.data.borrow().clone();
+        let w2 = new_wrapper();
+        let s2 = TestStream::new(blob).into_com();
+        assert_eq!(IComponentTrait::setState(&w2, stream_ptr(&s2)), kResultOk);
+        assert!((w2.getParamNormalized(gain_id(&w2)) - 0.875).abs() < 1e-9);
+    }
+}
+
+#[test]
 fn get_state_reports_a_refusing_stream() {
     let w = new_wrapper();
     let mut s = TestStream::new(Vec::new());
@@ -152,11 +179,12 @@ fn setup_only(w: &Wrapper<TestPlugin>) {
 #[test]
 fn process_before_setup_processing_is_not_initialized() {
     let w = new_wrapper();
-    let mut outb = HostBuffers::new(2, 64, 1.0);
+    let outb = HostBuffers::new(2, 64, 1.0);
     let mut outputs = [outb.bus];
     let mut data = process_data(64, &mut [], &mut outputs);
     unsafe { assert_eq!(w.process(&mut data), kNotInitialized) };
-    let _ = &mut outb;
+    assert!(outb.channels[0].iter().all(|&x| x == 0.0));
+    assert!(outb.channels[1].iter().all(|&x| x == 0.0));
 }
 
 #[test]
@@ -609,5 +637,200 @@ fn an_event_the_host_fails_to_hand_over_is_skipped() {
     let calls = calls_of(&w).lock().unwrap().clone();
     assert_eq!(calls.len(), 1);
     assert_eq!(calls[0].notes, vec![(60, 10)]);
+    let _ = (&mut inb, &mut outb);
+}
+
+#[test]
+fn set_active_toggled_while_another_thread_processes_does_not_panic() {
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+    use std::sync::Arc;
+    let w = Arc::new(new_wrapper());
+    unsafe { setup_and_activate(&w, 256) };
+    let stop = Arc::new(AtomicBool::new(false));
+    let blocks = Arc::new(AtomicUsize::new(0));
+    let worker = {
+        let w = w.clone();
+        let stop = stop.clone();
+        let blocks = blocks.clone();
+        std::thread::spawn(move || {
+            let mut main_in = HostBuffers::new(2, 256, 0.0);
+            let mut aux_in = HostBuffers::new(2, 256, 0.0);
+            let mut main_out = HostBuffers::new(2, 256, 0.0);
+            while !stop.load(Ordering::Relaxed) {
+                let mut inputs = [main_in.bus, aux_in.bus];
+                let mut outputs = [main_out.bus];
+                let mut data = process_data(256, &mut inputs, &mut outputs);
+                unsafe { assert_eq!(w.process(&mut data), kResultOk) };
+                blocks.fetch_add(1, Ordering::Relaxed);
+            }
+            let _ = (&mut main_in, &mut aux_in, &mut main_out);
+        })
+    };
+    while blocks.load(Ordering::Relaxed) == 0 {
+        std::thread::yield_now();
+    }
+    let toggles = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        for _ in 0..5000 {
+            unsafe {
+                assert_eq!(w.setActive(0), kResultOk);
+                assert_eq!(w.setActive(1), kResultOk);
+            }
+        }
+    }));
+    stop.store(true, Ordering::Relaxed);
+    let worker = worker.join();
+    assert!(
+        toggles.is_ok(),
+        "setActive panicked while the audio thread processed"
+    );
+    assert!(
+        worker.is_ok(),
+        "process panicked while the host toggled setActive"
+    );
+}
+
+#[test]
+fn get_parameter_info_one_past_the_end_is_refused() {
+    let w = new_wrapper();
+    unsafe {
+        let count = w.getParameterCount();
+        let mut info: ParameterInfo = std::mem::zeroed();
+        assert_eq!(w.getParameterInfo(count - 1, &mut info), kResultOk);
+        assert_eq!(w.getParameterInfo(count, &mut info), kInvalidArgument);
+    }
+}
+
+#[test]
+fn a_state_restore_never_initializes_below_the_block_size_process_hands_out() {
+    let blob = state_with_gain(0.3);
+    let w = new_wrapper();
+    unsafe { setup_and_activate(&w, 512) };
+    let mut setup = ProcessSetup {
+        processMode: ProcessModes_::kRealtime as i32,
+        symbolicSampleSize: SymbolicSampleSizes_::kSample32 as i32,
+        maxSamplesPerBlock: 64,
+        sampleRate: 48000.0,
+    };
+    unsafe { assert_eq!(w.setupProcessing(&mut setup), kResultOk) };
+    let s = TestStream::new(blob).into_com();
+    unsafe { assert_eq!(IComponentTrait::setState(&w, stream_ptr(&s)), kResultOk) };
+    let init_max = INIT_MAX_BUFFER.with(|m| m.get()).unwrap() as usize;
+    calls_of(&w).lock().unwrap().clear();
+    let mut main_in = HostBuffers::new(2, 512, 0.0);
+    let mut aux_in = HostBuffers::new(2, 512, 0.0);
+    let mut main_out = HostBuffers::new(2, 512, 0.0);
+    let mut inputs = [main_in.bus, aux_in.bus];
+    let mut outputs = [main_out.bus];
+    assert_eq!(run_once(&w, &mut inputs, &mut outputs, 512), kResultOk);
+    let lens: Vec<usize> = calls_of(&w)
+        .lock()
+        .unwrap()
+        .iter()
+        .map(|c| c.samples)
+        .collect();
+    assert!(
+        lens.iter().all(|&n| n <= init_max),
+        "plug-in initialized for {init_max} samples was handed blocks of {lens:?}"
+    );
+    let _ = (&mut main_in, &mut aux_in, &mut main_out);
+}
+
+#[test]
+fn size_splits_keep_the_hosts_bar_lines() {
+    use ProcessContext_::StatesAndFlags_::*;
+    let w = new_wrapper();
+    unsafe { setup_and_activate(&w, 512) };
+    calls_of(&w).lock().unwrap().clear();
+    let mut inb = HostBuffers::new(2, 1024, 0.0);
+    let mut outb = HostBuffers::new(2, 1024, 0.0);
+    let mut inputs = [inb.bus];
+    let mut outputs = [outb.bus];
+    let mut data = process_data(1024, &mut inputs, &mut outputs);
+    // A 3/4 pickup bar, then 4/4: the bar the block sits in runs from beat 3 to beat 7.
+    let mut ctx: ProcessContext = unsafe { std::mem::zeroed() };
+    ctx.state = kTempoValid | kProjectTimeMusicValid | kBarPositionValid | kTimeSigValid;
+    ctx.sampleRate = 48000.0;
+    ctx.tempo = 120.0;
+    ctx.timeSigNumerator = 4;
+    ctx.timeSigDenominator = 4;
+    ctx.projectTimeMusic = 4.0;
+    ctx.barPositionMusic = 3.0;
+    data.processContext = &mut ctx;
+    unsafe { assert_eq!(w.process(&mut data), kResultOk) };
+    let bars: Vec<Option<f64>> = calls_of(&w)
+        .lock()
+        .unwrap()
+        .iter()
+        .map(|c| c.bar_start_pos_beats)
+        .collect();
+    assert_eq!(bars, vec![Some(3.0), Some(3.0)]);
+    let _ = (&mut inb, &mut outb);
+}
+
+#[test]
+fn a_negative_bus_index_is_refused() {
+    let w = new_wrapper();
+    unsafe {
+        let mut info: BusInfo = std::mem::zeroed();
+        assert_eq!(
+            w.getBusInfo(
+                MediaTypes_::kAudio as i32,
+                BusDirections_::kInput as i32,
+                -1,
+                &mut info
+            ),
+            kInvalidArgument
+        );
+        let mut arr: SpeakerArrangement = 0;
+        assert_eq!(
+            w.getBusArrangement(BusDirections_::kInput as i32, -1, &mut arr),
+            kInvalidArgument
+        );
+    }
+}
+
+#[test]
+fn a_flush_applies_a_parameter_queued_after_a_midi_cc_with_sample_accurate_automation() {
+    let w = new_saa_wrapper();
+    unsafe { setup_and_activate(&w, 256) };
+    let gain = gain_id(&w);
+    let changes = ComWrapper::new(TestParamChanges {
+        queues: vec![
+            ComWrapper::new(TestParamQueue {
+                id: midi_cc_0_id(&w),
+                points: vec![(0, 0.5)],
+            }),
+            ComWrapper::new(TestParamQueue {
+                id: gain,
+                points: vec![(0, 0.75)],
+            }),
+        ],
+    });
+    let mut data = process_data(0, &mut [], &mut []);
+    data.inputParameterChanges = param_changes_ptr(&changes);
+    unsafe {
+        assert_eq!(w.process(&mut data), kResultOk);
+        assert!((w.getParamNormalized(gain) - 0.75).abs() < 1e-6);
+    }
+}
+
+#[test]
+fn an_absurd_maximum_block_size_is_capped_and_longer_blocks_are_split() {
+    let w = new_wrapper();
+    unsafe { setup_and_activate(&w, i32::MAX) };
+    assert_eq!(INIT_MAX_BUFFER.with(|m| m.get()), Some(1 << 16));
+    calls_of(&w).lock().unwrap().clear();
+    let mut inb = HostBuffers::new(2, 70_000, 0.0);
+    let mut outb = HostBuffers::new(2, 70_000, 0.0);
+    let mut inputs = [inb.bus];
+    let mut outputs = [outb.bus];
+    assert_eq!(run_once(&w, &mut inputs, &mut outputs, 70_000), kResultOk);
+    let lens: Vec<usize> = calls_of(&w)
+        .lock()
+        .unwrap()
+        .iter()
+        .map(|c| c.samples)
+        .collect();
+    assert_eq!(lens, vec![1 << 16, 70_000 - (1 << 16)]);
     let _ = (&mut inb, &mut outb);
 }

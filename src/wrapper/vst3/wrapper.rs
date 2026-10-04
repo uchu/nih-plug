@@ -43,8 +43,8 @@ use crate::util::permit_alloc;
 use crate::wrapper::state;
 use crate::wrapper::util::buffer_management::{BufferManager, ChannelPointers};
 use crate::wrapper::util::{
-    clamp_input_event_timing, clamp_output_event_timing, host_count, process_wrapper,
-    split_block_end, state_length_is_sane, MAX_STATE_BYTES,
+    bar_after_split, clamp_input_event_timing, clamp_output_event_timing, host_count,
+    host_max_block_size, process_wrapper, split_block_end, state_length_is_sane, MAX_STATE_BYTES,
 };
 
 pub struct Wrapper<P: Vst3Plugin> {
@@ -158,6 +158,9 @@ impl<P: Vst3Plugin> IComponentTrait for Wrapper<P> {
         info: *mut vst3::Steinberg::Vst::BusInfo,
     ) -> tresult {
         check_null_ptr!(info);
+        if index < 0 {
+            return kInvalidArgument;
+        }
 
         let current_audio_io_layout = self.inner.current_audio_io_layout.load();
 
@@ -408,6 +411,7 @@ impl<P: Vst3Plugin> IComponentTrait for Wrapper<P> {
                         buffer_config.max_buffer_size as usize,
                         audio_io_layout,
                     );
+                    self.inner.active_buffer_config.store(Some(buffer_config));
                     self.inner.is_active.store(true, Ordering::SeqCst);
 
                     kResultOk
@@ -419,7 +423,9 @@ impl<P: Vst3Plugin> IComponentTrait for Wrapper<P> {
             (true, None) => kResultFalse,
             (false, _) => {
                 self.inner.is_active.store(false, Ordering::SeqCst);
-                self.inner.plugin.lock().deactivate();
+                let mut plugin = self.inner.plugin.lock();
+                self.inner.active_buffer_config.store(None);
+                plugin.deactivate();
 
                 kResultOk
             }
@@ -497,13 +503,18 @@ impl<P: Vst3Plugin> IComponentTrait for Wrapper<P> {
                 let mut written = 0usize;
                 while written < serialized.len() {
                     let remaining = (serialized.len() - written).min(int32::MAX as usize);
-                    let mut num_bytes_written: int32 = 0;
+                    // Some hosts accept the write without filling in the optional count
+                    let mut num_bytes_written: int32 = -1;
                     let result = state.write(
                         serialized.as_ptr().add(written) as *mut c_void,
                         remaining as int32,
                         &mut num_bytes_written,
                     );
-                    let n = host_count(num_bytes_written).min(remaining);
+                    let n = if result == kResultOk && num_bytes_written == -1 {
+                        remaining
+                    } else {
+                        host_count(num_bytes_written).min(remaining)
+                    };
                     if result != kResultOk || n == 0 {
                         nih_debug_assert_failure!("Host stream refused the state write");
                         return kResultFalse;
@@ -553,7 +564,7 @@ impl<P: Vst3Plugin> IEditControllerTrait for Wrapper<P> {
     unsafe fn getParameterInfo(&self, param_index: int32, info: *mut ParameterInfo) -> tresult {
         check_null_ptr!(info);
 
-        if param_index < 0 || param_index > self.getParameterCount() {
+        if param_index < 0 || param_index >= self.getParameterCount() {
             return kInvalidArgument;
         }
 
@@ -836,6 +847,9 @@ impl<P: Vst3Plugin> IAudioProcessorTrait for Wrapper<P> {
         arr: *mut SpeakerArrangement,
     ) -> tresult {
         check_null_ptr!(arr);
+        if index < 0 {
+            return kInvalidArgument;
+        }
 
         let channel_count_to_map = |count| match count {
             0 => vst3::Steinberg::Vst::SpeakerArr::kEmpty,
@@ -914,7 +928,7 @@ impl<P: Vst3Plugin> IAudioProcessorTrait for Wrapper<P> {
         self.inner.current_buffer_config.store(Some(BufferConfig {
             sample_rate: setup.sampleRate as f32,
             min_buffer_size: None,
-            max_buffer_size: host_count(setup.maxSamplesPerBlock).max(1) as u32,
+            max_buffer_size: host_max_block_size(host_count(setup.maxSamplesPerBlock) as u32),
             process_mode: self.inner.current_process_mode.load(),
         }));
 
@@ -978,9 +992,14 @@ impl<P: Vst3Plugin> IAudioProcessorTrait for Wrapper<P> {
         process_wrapper(|| {
             // We need to handle incoming automation first
             let data = &*data;
+            let total_buffer_len = host_count(data.numSamples);
+            let num_inputs = host_count(data.numInputs);
+            let num_outputs = host_count(data.numOutputs);
+
             // H3: a host that processes before `setupProcessing` is told so instead of
-            // taking the process down with it.
+            // taking the process down with it, and gets silence in case it ignores that.
             let Some(buffer_config) = self.inner.current_buffer_config.load() else {
+                zero_host_outputs(data, num_outputs, total_buffer_len);
                 return kNotInitialized;
             };
             let sample_rate = buffer_config.sample_rate;
@@ -991,10 +1010,6 @@ impl<P: Vst3Plugin> IAudioProcessorTrait for Wrapper<P> {
                 vst3::Steinberg::Vst::SymbolicSampleSizes_::kSample32 as i32
             );
             nih_debug_assert!(data.numSamples >= 0);
-
-            let total_buffer_len = host_count(data.numSamples);
-            let num_inputs = host_count(data.numInputs);
-            let num_outputs = host_count(data.numOutputs);
 
             let current_audio_io_layout = self.inner.current_audio_io_layout.load();
             let has_main_input = current_audio_io_layout.main_input_channels.is_some();
@@ -1234,6 +1249,22 @@ impl<P: Vst3Plugin> IAudioProcessorTrait for Wrapper<P> {
                 })
             });
 
+            // The plug-in lock is taken before the buffer manager is touched and held across every
+            // block: `setActive` replaces the buffer manager under the same lock, so a host that
+            // toggles activation while a process call is in flight waits instead of colliding.
+            let mut plugin_guard = if is_param_flush {
+                None
+            } else {
+                // NOTE: `parking_lot`'s mutexes sometimes allocate because of their use of
+                //       thread locals
+                Some(permit_alloc(|| self.inner.plugin.lock()))
+            };
+            if plugin_guard.is_some() && !self.inner.is_active.load(Ordering::SeqCst) {
+                plugin_guard = None;
+                zero_host_outputs(data, num_outputs, total_buffer_len);
+                is_param_flush = true;
+            }
+
             // The capacity the buffer manager was allocated with, not the current buffer config:
             // a host may call `setupProcessing` with a larger maximum while the plug-in is active.
             // A flush hands no audio to the plug-in, so it is not split by size.
@@ -1287,7 +1318,11 @@ impl<P: Vst3Plugin> IAudioProcessorTrait for Wrapper<P> {
                                 );
                             }
                             ProcessEvent::NoteEvent(event) => {
-                                if event.timing() as usize >= block_end {
+                                // Only a block cut short leaves notes for a later one; in the
+                                // last block (a flush included) every timing is in range
+                                if block_end < total_buffer_len
+                                    && event.timing() as usize >= block_end
+                                {
                                     next_event_idx = event_idx;
                                     break;
                                 }
@@ -1472,12 +1507,13 @@ impl<P: Vst3Plugin> IAudioProcessorTrait for Wrapper<P> {
 
                         if context.state & kBarPositionValid as u32 != 0 {
                             if block_start > 0 {
-                                // The transport object knows how to recompute this from the other information
-                                transport.bar_start_pos_beats =
-                                    match transport.bar_start_pos_beats() {
-                                        Some(updated) => Some(updated),
-                                        None => Some(context.barPositionMusic),
-                                    };
+                                let (bar_start, _) = bar_after_split(
+                                    context.barPositionMusic,
+                                    transport.pos_beats(),
+                                    transport.time_sig_numerator,
+                                    transport.time_sig_denominator,
+                                );
+                                transport.bar_start_pos_beats = Some(bar_start);
                             } else {
                                 transport.bar_start_pos_beats = Some(context.barPositionMusic);
                             }
@@ -1490,10 +1526,9 @@ impl<P: Vst3Plugin> IAudioProcessorTrait for Wrapper<P> {
                         }
                     }
 
-                    let result = if buffer_is_valid {
-                        // NOTE: `parking_lot`'s mutexes sometimes allocate because of their use of
-                        //       thread locals
-                        let mut plugin = permit_alloc(|| self.inner.plugin.lock());
+                    let result = if let (true, Some(plugin)) =
+                        (buffer_is_valid, plugin_guard.as_mut())
+                    {
                         let mut aux = AuxiliaryBuffers {
                             inputs: buffers.aux_inputs,
                             outputs: buffers.aux_outputs,
@@ -1746,6 +1781,8 @@ impl<P: Vst3Plugin> IAudioProcessorTrait for Wrapper<P> {
                     block_start = block_end;
                 }
             };
+            // `set_state_inner()` below takes the plug-in lock itself
+            drop(plugin_guard);
 
             // After processing audio, we'll check if the editor has sent us updated plugin state.
             // We'll restore that here on the audio thread to prevent changing the values during the

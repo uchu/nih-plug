@@ -95,8 +95,8 @@ use crate::wrapper::clap::util::{read_stream, write_stream};
 use crate::wrapper::state::{self, PluginState};
 use crate::wrapper::util::buffer_management::{BufferManager, ChannelPointers};
 use crate::wrapper::util::{
-    clamp_input_event_timing, clamp_output_event_timing, hash_param_id, process_wrapper,
-    split_block_end, state_length_is_sane, strlcpy,
+    bar_after_split, clamp_input_event_timing, clamp_output_event_timing, hash_param_id,
+    host_max_block_size, process_wrapper, split_block_end, state_length_is_sane, strlcpy,
 };
 
 /// How many output parameter changes we can store in our output parameter change queue. Storing
@@ -141,6 +141,9 @@ pub struct Wrapper<P: ClapPlugin> {
     editor_scaling_factor: AtomicF32,
 
     is_processing: AtomicBool,
+    /// Set by a successful `activate()` and cleared by `deactivate()`, both under `plugin`'s lock.
+    /// Processing while inactive is refused (H8).
+    is_active: AtomicBool,
     /// The current IO configuration, modified through the `clap_plugin_audio_ports_config`
     /// extension. Initialized to the plugin's first audio IO configuration.
     current_audio_io_layout: AtomicCell<AudioIOLayout>,
@@ -598,6 +601,7 @@ impl<P: ClapPlugin> Wrapper<P> {
             editor_scaling_factor: AtomicF32::new(1.0),
 
             is_processing: AtomicBool::new(false),
+            is_active: AtomicBool::new(false),
             current_audio_io_layout: AtomicCell::new(
                 P::AUDIO_IO_LAYOUTS.first().copied().unwrap_or_default(),
             ),
@@ -1729,9 +1733,12 @@ impl<P: ClapPlugin> Wrapper<P> {
             {
                 let event = &*(event as *const clap_event_midi_sysex);
 
+                // H7: a sysex event without data is a host bug; skip it
+                if event.buffer.is_null() || event.size == 0 {
+                    return;
+                }
                 // `NoteEvent::from_midi` prints some tracing if parsing fails, which is not
                 // necessarily an error
-                assert!(!event.buffer.is_null());
                 let sysex_buffer = std::slice::from_raw_parts(event.buffer, event.size as usize);
                 if let Ok(note_event) = NoteEvent::from_midi(timing, sysex_buffer) {
                     input_events.push_back(note_event);
@@ -1946,8 +1953,9 @@ impl<P: ClapPlugin> Wrapper<P> {
     ) -> bool {
         check_null_ptr!(false, plugin, (*plugin).plugin_data);
         let wrapper = &*((*plugin).plugin_data as *const Self);
-        // H7: a zero capacity would make the first block grow buffers on the audio thread
-        let max_frames_count = max_frames_count.max(1);
+        // H7: a zero capacity would make the first block grow buffers on the audio thread, and
+        // an absurd one would abort on allocation; H5 splits whatever exceeds it
+        let max_frames_count = host_max_block_size(max_frames_count);
 
         let audio_io_layout = wrapper.current_audio_io_layout.load();
         let buffer_config = BufferConfig {
@@ -1976,9 +1984,11 @@ impl<P: ClapPlugin> Wrapper<P> {
 
             // Also store this for later, so we can reinitialize the plugin after restoring state
             wrapper.current_buffer_config.store(Some(buffer_config));
+            wrapper.is_active.store(true, Ordering::SeqCst);
 
             true
         } else {
+            wrapper.is_active.store(false, Ordering::SeqCst);
             false
         }
     }
@@ -1987,7 +1997,9 @@ impl<P: ClapPlugin> Wrapper<P> {
         check_null_ptr!((), plugin, (*plugin).plugin_data);
         let wrapper = &*((*plugin).plugin_data as *const Self);
 
-        wrapper.plugin.lock().deactivate();
+        let mut plugin = wrapper.plugin.lock();
+        wrapper.is_active.store(false, Ordering::SeqCst);
+        plugin.deactivate();
     }
 
     unsafe extern "C" fn start_processing(plugin: *const clap_plugin) -> bool {
@@ -2035,11 +2047,14 @@ impl<P: ClapPlugin> Wrapper<P> {
             // accuration automation yet and there's no way to get the last event for a parameter,
             // we'll process every incoming event.
             let process = &*process;
-            // H8: processing before `activate` has no buffer manager to run on. The CLAP spec
+            // H8: processing while not activated has no buffer manager to run on. The CLAP spec
             // forbids it; a host that does it anyway gets an error, not a crash.
             let Some(buffer_config) = wrapper.current_buffer_config.load() else {
                 return CLAP_PROCESS_ERROR;
             };
+            if !wrapper.is_active.load(Ordering::SeqCst) {
+                return CLAP_PROCESS_ERROR;
+            }
             let sample_rate = buffer_config.sample_rate;
             let total_buffer_len = process.frames_count as usize;
 
@@ -2062,6 +2077,18 @@ impl<P: ClapPlugin> Wrapper<P> {
                 || main_output_has_no_channels
                 || (output_buffers_missing
                     && (has_main_output || !current_audio_io_layout.aux_output_ports.is_empty()));
+
+            // The plug-in lock is taken before the buffer manager is touched and held across every
+            // block: `activate` replaces the buffer manager under the same lock, so a host that
+            // reactivates while a process call is in flight waits instead of colliding.
+            let mut plugin_guard = if is_flush {
+                None
+            } else {
+                Some(permit_alloc(|| wrapper.plugin.lock()))
+            };
+            if plugin_guard.is_some() && !wrapper.is_active.load(Ordering::SeqCst) {
+                return CLAP_PROCESS_ERROR;
+            }
 
             // H5: never more samples per block than the buffers were allocated for, whatever the
             // host sends. A flush hands no audio to the plug-in, so it is not split by size.
@@ -2336,16 +2363,15 @@ impl<P: ClapPlugin> Wrapper<P> {
                         }
                         // TODO: CLAP does not mention whether this is behind a flag or not
                         if block_start > transport_origin {
-                            transport.bar_start_pos_beats = match transport.bar_start_pos_beats() {
-                                Some(updated) => Some(updated),
-                                None => {
-                                    Some(context.bar_start as f64 / CLAP_BEATTIME_FACTOR as f64)
-                                }
-                            };
-                            transport.bar_number = match transport.bar_number() {
-                                Some(updated) => Some(updated),
-                                None => Some(context.bar_number),
-                            };
+                            let (bar_start, bars_skipped) = bar_after_split(
+                                context.bar_start as f64 / CLAP_BEATTIME_FACTOR as f64,
+                                transport.pos_beats(),
+                                transport.time_sig_numerator,
+                                transport.time_sig_denominator,
+                            );
+                            transport.bar_start_pos_beats = Some(bar_start);
+                            transport.bar_number =
+                                Some(context.bar_number.saturating_add(bars_skipped));
                         } else {
                             transport.bar_start_pos_beats =
                                 Some(context.bar_start as f64 / CLAP_BEATTIME_FACTOR as f64);
@@ -2372,8 +2398,9 @@ impl<P: ClapPlugin> Wrapper<P> {
                         }
                     }
 
-                    let result = if buffer_is_valid {
-                        let mut plugin = wrapper.plugin.lock();
+                    let result = if let (true, Some(plugin)) =
+                        (buffer_is_valid, plugin_guard.as_mut())
+                    {
                         // SAFETY: Shortening these borrows is safe as even if the plugin overwrites the
                         //         slices (which it cannot do without using unsafe code), then they
                         //         would still be reset on the next iteration
@@ -2417,6 +2444,8 @@ impl<P: ClapPlugin> Wrapper<P> {
                     block_start = block_end;
                 }
             };
+            // `set_state_inner()` below takes the plug-in lock itself
+            drop(plugin_guard);
 
             // After processing audio, we'll check if the editor has sent us updated plugin state.
             // We'll restore that here on the audio thread to prevent changing the values during the
@@ -3156,7 +3185,7 @@ impl<P: ClapPlugin> Wrapper<P> {
         check_null_ptr!(false, plugin, (*plugin).plugin_data, param_info);
         let wrapper = &*((*plugin).plugin_data as *const Self);
 
-        if param_index > Self::ext_params_count(plugin) {
+        if param_index >= Self::ext_params_count(plugin) {
             return false;
         }
 

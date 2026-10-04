@@ -22,8 +22,11 @@ pub struct Call {
     pub pos_samples: Option<i64>,
     pub pos_beats: Option<f64>,
     pub bar_start_pos_beats: Option<f64>,
+    pub bar_number: Option<i32>,
     /// Length of aux input 0, channel 0, as handed to the plug-in (H6 pins it to `samples`).
     pub aux_len: usize,
+    /// The gain parameter's value when the block started.
+    pub gain: f32,
 }
 
 thread_local! {
@@ -40,110 +43,145 @@ pub struct TestParams {
     pub gain: FloatParam,
 }
 
-pub struct TestPlugin {
-    pub params: Arc<TestParams>,
-    pub calls: Arc<Mutex<Vec<Call>>>,
-}
-
-impl Default for TestPlugin {
-    fn default() -> Self {
-        Self {
-            params: Arc::new(TestParams {
-                gain: FloatParam::new("Gain", 1.0, FloatRange::Linear { min: 0.0, max: 2.0 }),
-            }),
-            calls: CALLS.with(|c| c.clone()),
+/// Every process call's record, shared by the plug-in variants below.
+fn record<P: Plugin>(
+    params: &TestParams,
+    calls: &Mutex<Vec<Call>>,
+    buffer: &mut Buffer,
+    aux: &mut AuxiliaryBuffers,
+    context: &mut impl ProcessContext<P>,
+) -> ProcessStatus {
+    let mut notes = Vec::new();
+    while let Some(event) = context.next_event() {
+        if let NoteEvent::NoteOn { note, timing, .. } = event {
+            notes.push((note, timing));
         }
     }
+    // A recognisable signal: left = 0.5 plus aux channel 0, right = 0.25.
+    let aux0: Vec<f32> = aux
+        .inputs
+        .first()
+        .and_then(|b| b.as_slice_immutable().first().map(|c| c.to_vec()))
+        .unwrap_or_default();
+    for (i, mut frame) in buffer.iter_samples().enumerate() {
+        if let Some(l) = frame.get_mut(0) {
+            *l = 0.5 + aux0.get(i).copied().unwrap_or(0.0);
+        }
+        if let Some(r) = frame.get_mut(1) {
+            *r = 0.25;
+        }
+    }
+    calls.lock().unwrap().push(Call {
+        samples: buffer.samples(),
+        notes,
+        pos_samples: context.transport().pos_samples,
+        pos_beats: context.transport().pos_beats,
+        bar_start_pos_beats: context.transport().bar_start_pos_beats,
+        bar_number: context.transport().bar_number,
+        aux_len: aux0.len(),
+        gain: params.gain.value(),
+    });
+    ProcessStatus::Normal
 }
 
-impl Plugin for TestPlugin {
-    const NAME: &'static str = "Host Misbehaviour Test";
-    const VENDOR: &'static str = "nih-plug fork tests";
-    const URL: &'static str = "";
-    const EMAIL: &'static str = "";
-    const VERSION: &'static str = "0.0.0";
-    const AUDIO_IO_LAYOUTS: &'static [AudioIOLayout] = &[AudioIOLayout {
-        main_input_channels: NonZeroU32::new(2),
-        main_output_channels: NonZeroU32::new(2),
-        aux_input_ports: &[new_nonzero_u32(2)],
-        aux_output_ports: &[],
-        names: PortNames::const_default(),
-    }];
-    const MIDI_INPUT: MidiConfig = MidiConfig::MidiCCs;
-    const MIDI_OUTPUT: MidiConfig = MidiConfig::MidiCCs;
-    const SAMPLE_ACCURATE_AUTOMATION: bool = false;
-    type SysExMessage = ();
-    type BackgroundTask = ();
+/// `TestPlugin` without and `SaaTestPlugin` with sample-accurate automation.
+macro_rules! test_plugin {
+    ($name:ident, $saa:expr, $vst3_id:expr, $clap_id:expr) => {
+        pub struct $name {
+            pub params: Arc<TestParams>,
+            pub calls: Arc<Mutex<Vec<Call>>>,
+        }
 
-    fn params(&self) -> Arc<dyn Params> {
-        self.params.clone()
-    }
-
-    fn initialize(
-        &mut self,
-        _audio_io_layout: &AudioIOLayout,
-        buffer_config: &BufferConfig,
-        _context: &mut impl InitContext<Self>,
-    ) -> bool {
-        INIT_MAX_BUFFER.with(|m| m.set(Some(buffer_config.max_buffer_size)));
-        true
-    }
-
-    fn process(
-        &mut self,
-        buffer: &mut Buffer,
-        aux: &mut AuxiliaryBuffers,
-        context: &mut impl ProcessContext<Self>,
-    ) -> ProcessStatus {
-        let mut notes = Vec::new();
-        while let Some(event) = context.next_event() {
-            if let NoteEvent::NoteOn { note, timing, .. } = event {
-                notes.push((note, timing));
+        impl Default for $name {
+            fn default() -> Self {
+                Self {
+                    params: Arc::new(TestParams {
+                        gain: FloatParam::new(
+                            "Gain",
+                            1.0,
+                            FloatRange::Linear { min: 0.0, max: 2.0 },
+                        ),
+                    }),
+                    calls: CALLS.with(|c| c.clone()),
+                }
             }
         }
-        // A recognisable signal: left = 0.5 plus aux channel 0, right = 0.25.
-        let aux0: Vec<f32> = aux
-            .inputs
-            .first()
-            .and_then(|b| b.as_slice_immutable().first().map(|c| c.to_vec()))
-            .unwrap_or_default();
-        for (i, mut frame) in buffer.iter_samples().enumerate() {
-            if let Some(l) = frame.get_mut(0) {
-                *l = 0.5 + aux0.get(i).copied().unwrap_or(0.0);
+
+        impl Plugin for $name {
+            const NAME: &'static str = "Host Misbehaviour Test";
+            const VENDOR: &'static str = "nih-plug fork tests";
+            const URL: &'static str = "";
+            const EMAIL: &'static str = "";
+            const VERSION: &'static str = "0.0.0";
+            const AUDIO_IO_LAYOUTS: &'static [AudioIOLayout] = &[AudioIOLayout {
+                main_input_channels: NonZeroU32::new(2),
+                main_output_channels: NonZeroU32::new(2),
+                aux_input_ports: &[new_nonzero_u32(2)],
+                aux_output_ports: &[],
+                names: PortNames::const_default(),
+            }];
+            const MIDI_INPUT: MidiConfig = MidiConfig::MidiCCs;
+            const MIDI_OUTPUT: MidiConfig = MidiConfig::MidiCCs;
+            const SAMPLE_ACCURATE_AUTOMATION: bool = $saa;
+            type SysExMessage = ();
+            type BackgroundTask = ();
+
+            fn params(&self) -> Arc<dyn Params> {
+                self.params.clone()
             }
-            if let Some(r) = frame.get_mut(1) {
-                *r = 0.25;
+
+            fn initialize(
+                &mut self,
+                _audio_io_layout: &AudioIOLayout,
+                buffer_config: &BufferConfig,
+                _context: &mut impl InitContext<Self>,
+            ) -> bool {
+                INIT_MAX_BUFFER.with(|m| m.set(Some(buffer_config.max_buffer_size)));
+                true
+            }
+
+            fn process(
+                &mut self,
+                buffer: &mut Buffer,
+                aux: &mut AuxiliaryBuffers,
+                context: &mut impl ProcessContext<Self>,
+            ) -> ProcessStatus {
+                record(&self.params, &self.calls, buffer, aux, context)
             }
         }
-        self.calls.lock().unwrap().push(Call {
-            samples: buffer.samples(),
-            notes,
-            pos_samples: context.transport().pos_samples,
-            pos_beats: context.transport().pos_beats,
-            bar_start_pos_beats: context.transport().bar_start_pos_beats,
-            aux_len: aux0.len(),
-        });
-        ProcessStatus::Normal
-    }
+
+        impl Vst3Plugin for $name {
+            const VST3_CLASS_ID: [u8; 16] = *$vst3_id;
+            const VST3_SUBCATEGORIES: &'static [Vst3SubCategory] = &[Vst3SubCategory::Fx];
+        }
+
+        impl ClapPlugin for $name {
+            const CLAP_ID: &'static str = $clap_id;
+            const CLAP_DESCRIPTION: Option<&'static str> = None;
+            const CLAP_MANUAL_URL: Option<&'static str> = None;
+            const CLAP_SUPPORT_URL: Option<&'static str> = None;
+            const CLAP_FEATURES: &'static [ClapFeature] = &[ClapFeature::AudioEffect];
+        }
+    };
 }
 
-impl Vst3Plugin for TestPlugin {
-    const VST3_CLASS_ID: [u8; 16] = *b"HostMisbehaveTst";
-    const VST3_SUBCATEGORIES: &'static [Vst3SubCategory] = &[Vst3SubCategory::Fx];
-}
-
-impl ClapPlugin for TestPlugin {
-    const CLAP_ID: &'static str = "test.host-misbehaviour";
-    const CLAP_DESCRIPTION: Option<&'static str> = None;
-    const CLAP_MANUAL_URL: Option<&'static str> = None;
-    const CLAP_SUPPORT_URL: Option<&'static str> = None;
-    const CLAP_FEATURES: &'static [ClapFeature] = &[ClapFeature::AudioEffect];
-}
+test_plugin!(
+    TestPlugin,
+    false,
+    b"HostMisbehaveTst",
+    "test.host-misbehaviour"
+);
+test_plugin!(
+    SaaTestPlugin,
+    true,
+    b"HostMisbehaveSAA",
+    "test.host-misbehaviour-saa"
+);
 
 /// A host-side `IBStream`. `seekable = false` answers `kNotImplemented` to `seek`/`tell`,
 /// `chunk` caps every `read`/`write` (short transfers), `eof_is_error` makes the read after
 /// the last byte return `kResultFalse` instead of zero bytes, `endless` never runs out,
-/// `write_fails` refuses every write.
+/// `write_fails` refuses every write, `silent_count` accepts writes without reporting a count.
 pub struct TestStream {
     pub data: RefCell<Vec<u8>>,
     pub pos: Cell<usize>,
@@ -152,6 +190,7 @@ pub struct TestStream {
     pub eof_is_error: bool,
     pub endless: bool,
     pub write_fails: bool,
+    pub silent_count: bool,
     /// Bytes handed out by `read` so far.
     pub delivered: Cell<usize>,
 }
@@ -166,6 +205,7 @@ impl TestStream {
             eof_is_error: false,
             endless: false,
             write_fails: false,
+            silent_count: false,
             delivered: Cell::new(0),
         }
     }
@@ -215,7 +255,9 @@ impl IBStreamTrait for TestStream {
         let src = std::slice::from_raw_parts(buffer as *const u8, n);
         self.data.borrow_mut().extend_from_slice(src);
         self.pos.set(self.pos.get() + n);
-        *num_written = n as i32;
+        if !self.silent_count {
+            *num_written = n as i32;
+        }
         kResultOk
     }
 
@@ -330,7 +372,7 @@ pub fn stream_ptr(stream: &ComWrapper<TestStream>) -> *mut IBStream {
 }
 
 /// `setupProcessing` + `setActive(true)` + `setProcessing(true)` at 48 kHz.
-pub unsafe fn setup_and_activate(wrapper: &Wrapper<TestPlugin>, max_block: i32) {
+pub unsafe fn setup_and_activate<P: Vst3Plugin>(wrapper: &Wrapper<P>, max_block: i32) {
     let mut setup = ProcessSetup {
         processMode: ProcessModes_::kRealtime as i32,
         symbolicSampleSize: SymbolicSampleSizes_::kSample32 as i32,
@@ -401,6 +443,10 @@ pub fn process_data(
 
 pub fn new_wrapper() -> Wrapper<TestPlugin> {
     Wrapper::<TestPlugin>::new()
+}
+
+pub fn new_saa_wrapper() -> Wrapper<SaaTestPlugin> {
+    Wrapper::<SaaTestPlugin>::new()
 }
 
 /// The plug-in instance's call log (see [`CALLS`]).

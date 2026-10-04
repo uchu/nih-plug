@@ -9,6 +9,7 @@ use clap_sys::plugin::clap_plugin;
 use clap_sys::process::*;
 use clap_sys::stream::clap_istream;
 use clap_sys::version::CLAP_VERSION;
+use nih_plug::prelude::ClapPlugin;
 use nih_plug::wrapper::clap::Wrapper;
 use std::cell::Cell;
 use std::ffi::{c_char, c_void};
@@ -25,6 +26,8 @@ unsafe extern "C" fn host_noop(_h: *const clap_host) {}
 enum Ev {
     Note(clap_event_note),
     Transport(clap_event_transport),
+    SysEx(clap_event_midi_sysex),
+    Param(clap_event_param_value),
 }
 
 impl Ev {
@@ -32,6 +35,8 @@ impl Ev {
         match self {
             Ev::Note(e) => &e.header,
             Ev::Transport(e) => &e.header,
+            Ev::SysEx(e) => &e.header,
+            Ev::Param(e) => &e.header,
         }
     }
 }
@@ -79,6 +84,19 @@ fn note_on(key: i16, time: u32) -> Ev {
     })
 }
 
+fn param_value(param_id: u32, time: u32, value: f64) -> Ev {
+    Ev::Param(clap_event_param_value {
+        header: header::<clap_event_param_value>(time, CLAP_EVENT_PARAM_VALUE),
+        param_id,
+        cookie: std::ptr::null_mut(),
+        note_id: -1,
+        port_index: -1,
+        channel: -1,
+        key: -1,
+        value,
+    })
+}
+
 /// 120 BPM in 4/4, playing, at `beats` on the timeline.
 fn transport_at(time: u32, beats: f64) -> clap_event_transport {
     clap_event_transport {
@@ -107,14 +125,20 @@ fn beats_in(samples: usize) -> f64 {
     samples as f64 / 48000.0 / 60.0 * 120.0
 }
 
-struct Rig {
+struct Rig<P: ClapPlugin = TestPlugin> {
     // Declared first so it drops before the host it was handed.
-    wrapper: Arc<Wrapper<TestPlugin>>,
+    wrapper: Arc<Wrapper<P>>,
     _host: Box<clap_host>,
 }
 
 impl Rig {
     fn new() -> Self {
+        Self::build()
+    }
+}
+
+impl<P: ClapPlugin> Rig<P> {
+    fn build() -> Self {
         let host = Box::new(clap_host {
             clap_version: CLAP_VERSION,
             host_data: std::ptr::null_mut(),
@@ -127,7 +151,7 @@ impl Rig {
             request_process: Some(host_noop),
             request_callback: Some(host_noop),
         });
-        let wrapper = unsafe { Wrapper::<TestPlugin>::new(&*host) };
+        let wrapper = unsafe { Wrapper::<P>::new(&*host) };
         Self {
             wrapper,
             _host: host,
@@ -136,6 +160,19 @@ impl Rig {
 
     fn plugin(&self) -> *const clap_plugin {
         self.wrapper.clap_plugin.as_ptr()
+    }
+
+    /// The CLAP id of the plug-in's one real parameter, the gain.
+    fn gain_param_id(&self) -> u32 {
+        use clap_sys::ext::params::{clap_param_info, clap_plugin_params, CLAP_EXT_PARAMS};
+        let p = self.plugin();
+        unsafe {
+            let ext = ((*p).get_extension.unwrap())(p, CLAP_EXT_PARAMS.as_ptr())
+                as *const clap_plugin_params;
+            let mut info: clap_param_info = std::mem::zeroed();
+            assert!(((*ext).get_info.unwrap())(p, 0, &mut info));
+            info.id
+        }
     }
 
     fn activate(&self, max_frames: u32) {
@@ -366,4 +403,120 @@ fn a_transport_event_past_the_buffer_never_stretches_a_block() {
     rig.process(1024, &[late], Some(&start), 2);
     let lens: Vec<usize> = calls().iter().map(|c| c.samples).collect();
     assert_eq!(lens, vec![512, 512]);
+}
+
+#[test]
+fn a_sysex_event_with_a_null_buffer_is_ignored() {
+    let rig = Rig::new();
+    rig.activate(512);
+    let sysex = Ev::SysEx(clap_event_midi_sysex {
+        header: header::<clap_event_midi_sysex>(0, CLAP_EVENT_MIDI_SYSEX),
+        port_index: 0,
+        buffer: std::ptr::null(),
+        size: 4,
+    });
+    let status = rig.process(256, &[sysex, note_on(60, 10)], None, 2);
+    assert_ne!(status, CLAP_PROCESS_ERROR);
+    assert_eq!(calls().len(), 1);
+    assert_eq!(calls()[0].notes, vec![(60, 10)]);
+}
+
+#[test]
+fn params_get_info_one_past_the_end_is_refused() {
+    use clap_sys::ext::params::{clap_param_info, clap_plugin_params, CLAP_EXT_PARAMS};
+    let rig = Rig::new();
+    let p = rig.plugin();
+    unsafe {
+        assert!(((*p).init.unwrap())(p));
+        let ext =
+            ((*p).get_extension.unwrap())(p, CLAP_EXT_PARAMS.as_ptr()) as *const clap_plugin_params;
+        assert!(!ext.is_null());
+        let count = ((*ext).count.unwrap())(p);
+        let mut info: clap_param_info = std::mem::zeroed();
+        assert!(((*ext).get_info.unwrap())(p, count - 1, &mut info));
+        assert!(!((*ext).get_info.unwrap())(p, count, &mut info));
+    }
+}
+
+#[test]
+fn size_splits_keep_the_hosts_bar_lines() {
+    let rig = Rig::new();
+    rig.activate(512);
+    let mut t = transport_at(0, 4.0);
+    t.bar_start = 3 * CLAP_BEATTIME_FACTOR;
+    t.bar_number = 1;
+    rig.process(1024, &[], Some(&t), 2);
+    let bars: Vec<Option<f64>> = calls().iter().map(|c| c.bar_start_pos_beats).collect();
+    assert_eq!(bars, vec![Some(3.0), Some(3.0)]);
+    let numbers: Vec<Option<i32>> = calls().iter().map(|c| c.bar_number).collect();
+    assert_eq!(numbers, vec![Some(1), Some(1)]);
+}
+
+#[test]
+fn a_size_split_past_the_hosts_bar_line_counts_the_bars_it_crossed() {
+    let rig = Rig::new();
+    rig.activate(512);
+    // Bar 1 runs from beat 3 to 7; the second block starts 512 samples past beat 6.99.
+    let mut t = transport_at(0, 6.99);
+    t.bar_start = 3 * CLAP_BEATTIME_FACTOR;
+    t.bar_number = 1;
+    rig.process(1024, &[], Some(&t), 2);
+    let bars: Vec<Option<f64>> = calls().iter().map(|c| c.bar_start_pos_beats).collect();
+    assert_eq!(bars, vec![Some(3.0), Some(7.0)]);
+    let numbers: Vec<Option<i32>> = calls().iter().map(|c| c.bar_number).collect();
+    assert_eq!(numbers, vec![Some(1), Some(2)]);
+}
+
+#[test]
+fn process_after_deactivate_is_refused_like_before_activate() {
+    let rig = Rig::new();
+    rig.activate(512);
+    let p = rig.plugin();
+    unsafe {
+        ((*p).stop_processing.unwrap())(p);
+        ((*p).deactivate.unwrap())(p);
+    }
+    calls_of_any().lock().unwrap().clear();
+    assert_eq!(rig.process(64, &[], None, 2), CLAP_PROCESS_ERROR);
+    assert!(calls().is_empty());
+}
+
+#[test]
+fn an_absurd_maximum_block_size_is_capped() {
+    let rig = Rig::new();
+    rig.activate(u32::MAX);
+    assert_eq!(INIT_MAX_BUFFER.with(|m| m.get()), Some(1 << 16));
+}
+
+// Deliberate change from upstream: the first event in the queue is held to the same rule as
+// every other one. Upstream delivered it at sample 0 whatever its time.
+#[test]
+fn a_first_queued_parameter_change_after_sample_0_takes_effect_at_its_own_sample() {
+    let rig = Rig::<SaaTestPlugin>::build();
+    rig.activate(512);
+    let gain = rig.gain_param_id();
+    // nih-plug hands CLAP the normalized range: 0.75 is a gain of 1.5
+    rig.process(100, &[param_value(gain, 50, 0.75)], None, 2);
+    let calls = calls();
+    let lens: Vec<usize> = calls.iter().map(|c| c.samples).collect();
+    assert_eq!(lens, vec![50, 50]);
+    let gains: Vec<f32> = calls.iter().map(|c| c.gain).collect();
+    assert_eq!(gains, vec![1.0, 1.5]);
+}
+
+#[test]
+fn a_first_queued_transport_event_after_sample_0_splits_there_and_is_the_origin() {
+    let rig = Rig::new();
+    rig.activate(512);
+    let start = transport_at(0, 4.0);
+    let jump = Ev::Transport(transport_at(50, 16.0));
+    rig.process(1024, &[jump], Some(&start), 2);
+    let calls = calls();
+    let lens: Vec<usize> = calls.iter().map(|c| c.samples).collect();
+    assert_eq!(lens, vec![50, 512, 462]);
+    let beats: Vec<f64> = calls.iter().map(|c| c.pos_beats.unwrap()).collect();
+    let expected = [4.0, 16.0, 16.0 + beats_in(512)];
+    for (got, want) in beats.iter().zip(expected) {
+        assert!((got - want).abs() < 1e-9, "{beats:?} vs {expected:?}");
+    }
 }

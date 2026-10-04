@@ -78,6 +78,11 @@ pub(crate) struct WrapperInner<P: Vst3Plugin> {
     /// The current buffer configuration, containing the sample rate and the maximum block size.
     /// Will be set in `IAudioProcessor::setupProcessing()`.
     pub current_buffer_config: AtomicCell<Option<BufferConfig>>,
+    /// The configuration the plug-in was activated with and the buffer manager was allocated
+    /// for. A host may call `setupProcessing()` again while active; until it reactivates, a state
+    /// restore must not initialize the plug-in for anything else. Only changed under `plugin`'s
+    /// lock, `None` while inactive.
+    pub active_buffer_config: AtomicCell<Option<BufferConfig>>,
     /// The current audio processing mode. Set in `IAudioProcessor::setup_processing()`.
     pub current_process_mode: AtomicCell<ProcessMode>,
     /// The last process status returned by the plugin. This is used for tail handling.
@@ -339,6 +344,7 @@ impl<P: Vst3Plugin> WrapperInner<P> {
                 P::AUDIO_IO_LAYOUTS.first().copied().unwrap_or_default(),
             ),
             current_buffer_config: AtomicCell::new(None),
+            active_buffer_config: AtomicCell::new(None),
             current_process_mode: AtomicCell::new(ProcessMode::Realtime),
             last_process_status: AtomicCell::new(ProcessStatus::Normal),
             current_latency: AtomicU32::new(0),
@@ -595,6 +601,14 @@ impl<P: Vst3Plugin> WrapperInner<P> {
         }
     }
 
+    /// The configuration a (re)initialization must use: the active one while the plug-in is
+    /// active, otherwise the host's latest `setupProcessing()`.
+    fn initialized_buffer_config(&self) -> Option<BufferConfig> {
+        self.active_buffer_config
+            .load()
+            .or_else(|| self.current_buffer_config.load())
+    }
+
     /// Immediately set the plugin state. Returns `false` if the deserialization failed. The plugin
     /// state is set from a couple places, so this function aims to deduplicate that. Includes
     /// `permit_alloc()`s around the deserialization and initialization for the use case where
@@ -607,7 +621,7 @@ impl<P: Vst3Plugin> WrapperInner<P> {
     /// `self.plugin` must _not_ be locked while calling this function or it will deadlock.
     pub fn set_state_inner(&self, state: &mut PluginState) -> bool {
         let audio_io_layout = self.current_audio_io_layout.load();
-        let buffer_config = self.current_buffer_config.load();
+        let buffer_config = self.initialized_buffer_config();
 
         // FIXME: This is obviously not realtime-safe, but loading presets without doing this could
         //        lead to inconsistencies. It's the plugin's responsibility to not perform any
@@ -629,17 +643,19 @@ impl<P: Vst3Plugin> WrapperInner<P> {
         }
 
         // If the plugin was already initialized then it needs to be reinitialized
-        if let Some(buffer_config) = buffer_config {
+        if buffer_config.is_some() {
             // NOTE: This needs to be dropped after the `plugin` lock to avoid deadlocks
             let mut init_context = self.make_init_context();
             let mut plugin = self.plugin.lock();
-
-            // See above
-            success = permit_alloc(|| {
-                plugin.initialize(&audio_io_layout, &buffer_config, &mut init_context)
-            });
-            if success {
-                process_wrapper(|| plugin.reset());
+            // Read again under the lock `setActive()` changes it under
+            if let Some(buffer_config) = self.initialized_buffer_config() {
+                // See above
+                success = permit_alloc(|| {
+                    plugin.initialize(&audio_io_layout, &buffer_config, &mut init_context)
+                });
+                if success {
+                    process_wrapper(|| plugin.reset());
+                }
             }
         }
 

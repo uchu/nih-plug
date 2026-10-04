@@ -289,6 +289,14 @@ pub fn host_count(n: i32) -> usize {
     n.max(0) as usize
 }
 
+/// The largest block the plug-in and the buffer manager are ever sized for (H5, H7). Blocks past
+/// it are split, so an absurd host maximum cannot turn into an allocation that aborts.
+pub const MAX_BLOCK_SIZE: u32 = 1 << 16;
+
+pub fn host_max_block_size(n: u32) -> u32 {
+    n.clamp(1, MAX_BLOCK_SIZE)
+}
+
 /// Hard ceiling on a state blob read from a host stream (H2). Plug-in state is JSON in the
 /// tens of kilobytes; anything past this is a corrupt or hostile stream, not a preset.
 pub const MAX_STATE_BYTES: usize = 64 * 1024 * 1024;
@@ -312,6 +320,27 @@ pub fn split_block_end(
     match event_split {
         Some(at) if at > block_start && at < by_size => at,
         _ => by_size,
+    }
+}
+
+/// The bar a split block starts in and how many whole bars it lies past the host's bar line.
+/// Counted from the host's own bar start so pickup bars and earlier meter changes stay where the
+/// host put them; without a usable meter or position the host's bar line stands.
+pub fn bar_after_split(
+    host_bar_start: f64,
+    pos_beats: Option<f64>,
+    time_sig_numerator: Option<i32>,
+    time_sig_denominator: Option<i32>,
+) -> (f64, i32) {
+    match (pos_beats, time_sig_numerator, time_sig_denominator) {
+        (Some(pos), Some(num), Some(den))
+            if num > 0 && den > 0 && pos.is_finite() && pos >= host_bar_start =>
+        {
+            let bar_len = num as f64 / den as f64 * 4.0;
+            let bars = ((pos - host_bar_start) / bar_len).floor();
+            (host_bar_start + bars * bar_len, bars as i32)
+        }
+        _ => (host_bar_start, 0),
     }
 }
 
@@ -381,5 +410,30 @@ mod host_bounds {
     #[test]
     fn a_zero_max_never_yields_an_empty_block() {
         assert_eq!(split_block_end(0, 64, 0, None), 1);
+    }
+
+    #[test]
+    fn the_block_maximum_is_clamped_to_a_sane_range() {
+        assert_eq!(host_max_block_size(0), 1);
+        assert_eq!(host_max_block_size(512), 512);
+        assert_eq!(host_max_block_size(u32::MAX), MAX_BLOCK_SIZE);
+    }
+
+    #[test]
+    fn a_split_counts_bars_from_the_hosts_bar_line() {
+        assert_eq!(bar_after_split(3.0, Some(6.5), Some(4), Some(4)), (3.0, 0));
+        assert_eq!(bar_after_split(3.0, Some(7.0), Some(4), Some(4)), (7.0, 1));
+        assert_eq!(
+            bar_after_split(0.0, Some(13.0), Some(6), Some(8)),
+            (12.0, 4)
+        );
+    }
+
+    #[test]
+    fn without_a_usable_meter_the_hosts_bar_line_stands() {
+        assert_eq!(bar_after_split(3.0, Some(9.0), None, None), (3.0, 0));
+        assert_eq!(bar_after_split(3.0, Some(9.0), Some(0), Some(4)), (3.0, 0));
+        assert_eq!(bar_after_split(3.0, Some(2.0), Some(4), Some(4)), (3.0, 0));
+        assert_eq!(bar_after_split(3.0, None, Some(4), Some(4)), (3.0, 0));
     }
 }
