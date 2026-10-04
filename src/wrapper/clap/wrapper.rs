@@ -22,10 +22,6 @@ use clap_sys::ext::audio_ports::{
 use clap_sys::ext::audio_ports_config::{
     clap_audio_ports_config, clap_plugin_audio_ports_config, CLAP_EXT_AUDIO_PORTS_CONFIG,
 };
-use clap_sys::ext::preset_load::{clap_plugin_preset_load, CLAP_EXT_PRESET_LOAD};
-use clap_sys::ext::remote_controls::{
-    clap_plugin_remote_controls, clap_remote_controls_page, CLAP_EXT_REMOTE_CONTROLS,
-};
 use clap_sys::ext::gui::{
     clap_gui_resize_hints, clap_host_gui, clap_plugin_gui, clap_window, CLAP_EXT_GUI,
     CLAP_WINDOW_API_COCOA, CLAP_WINDOW_API_WIN32, CLAP_WINDOW_API_X11,
@@ -40,6 +36,10 @@ use clap_sys::ext::params::{
     CLAP_PARAM_IS_AUTOMATABLE, CLAP_PARAM_IS_BYPASS, CLAP_PARAM_IS_HIDDEN,
     CLAP_PARAM_IS_MODULATABLE, CLAP_PARAM_IS_MODULATABLE_PER_NOTE_ID, CLAP_PARAM_IS_READONLY,
     CLAP_PARAM_IS_STEPPED, CLAP_PARAM_RESCAN_VALUES,
+};
+use clap_sys::ext::preset_load::{clap_plugin_preset_load, CLAP_EXT_PRESET_LOAD};
+use clap_sys::ext::remote_controls::{
+    clap_plugin_remote_controls, clap_remote_controls_page, CLAP_EXT_REMOTE_CONTROLS,
 };
 use clap_sys::ext::render::{
     clap_plugin_render, clap_plugin_render_mode, CLAP_EXT_RENDER, CLAP_RENDER_OFFLINE,
@@ -95,7 +95,8 @@ use crate::wrapper::clap::util::{read_stream, write_stream};
 use crate::wrapper::state::{self, PluginState};
 use crate::wrapper::util::buffer_management::{BufferManager, ChannelPointers};
 use crate::wrapper::util::{
-    clamp_input_event_timing, clamp_output_event_timing, hash_param_id, process_wrapper, strlcpy,
+    clamp_input_event_timing, clamp_output_event_timing, hash_param_id, process_wrapper,
+    split_block_end, state_length_is_sane, strlcpy,
 };
 
 /// How many output parameter changes we can store in our output parameter change queue. Storing
@@ -457,7 +458,11 @@ struct clap_plugin_auv2_param_ordering {
     /// header comment in clapwrapper/auv2.h describes the inverse and is wrong). Return false to
     /// fall back to the default id-sorted ordering.
     get_param_order: Option<
-        unsafe extern "C" fn(plugin: *const clap_plugin, order: *mut usize, param_count: usize) -> bool,
+        unsafe extern "C" fn(
+            plugin: *const clap_plugin,
+            order: *mut usize,
+            param_count: usize,
+        ) -> bool,
     >,
 }
 
@@ -485,8 +490,11 @@ impl<P: ClapPlugin> Wrapper<P> {
         // `clap_host.name` is a plain struct field, readable before init() unlike extensions.
         let host_name = {
             let name = host_callback.name;
-            (!name.is_null())
-                .then(|| unsafe { CStr::from_ptr(name) }.to_string_lossy().into_owned())
+            (!name.is_null()).then(|| {
+                unsafe { CStr::from_ptr(name) }
+                    .to_string_lossy()
+                    .into_owned()
+            })
         };
 
         // This is a mapping from the parameter IDs specified by the plugin to pointers to those
@@ -971,24 +979,26 @@ impl<P: ClapPlugin> Wrapper<P> {
     }
 
     /// Similar to [`handle_in_events()`][Self::handle_in_events()], but will stop just before an
-    /// event if the predicate returns true for that events. This predicate is only called for
-    /// events that occur after `current_sample_idx`. This is used to stop before a tempo or time
-    /// signature change, or before next parameter change event with `raw_event.time >
-    /// current_sample_idx` and return the **absolute** (relative to the entire buffer that's being
-    /// split) sample index of that event along with the its index in the event queue as a
-    /// `(sample_idx, event_idx)` tuple. This allows for splitting the audio buffer into segments
-    /// with distinct sample values to enable sample accurate automation without modifications to the
-    /// wrapped plugin.
+    /// event that lies after `current_sample_idx` and either at or past `block_end_cap` or for
+    /// which the predicate returns true. This is used to stop before a tempo or time signature
+    /// change, before the next parameter change event, or at the most samples one block may
+    /// hold, and return the **absolute** (relative to the entire buffer that's being split)
+    /// sample index the block should end at along with the index of the first undelivered event
+    /// in the queue as a `(sample_idx, event_idx)` tuple. This allows for splitting the audio
+    /// buffer into segments with distinct sample values to enable sample accurate automation
+    /// without modifications to the wrapped plugin. `None` means every event was delivered.
     ///
     /// # Safety
     ///
     /// `in_` must contain only pointers to valid data (Clippy insists on there being a safety
     /// section here).
+    #[allow(clippy::too_many_arguments)]
     pub unsafe fn handle_in_events_until(
         &self,
         in_: &clap_input_events,
         transport_info: &mut *const clap_event_transport,
         current_sample_idx: usize,
+        block_end_cap: usize,
         total_buffer_len: usize,
         resume_from_event_idx: usize,
         stop_predicate: impl Fn(*const clap_event_header) -> bool,
@@ -996,41 +1006,38 @@ impl<P: ClapPlugin> Wrapper<P> {
         let mut input_events = self.input_events.borrow_mut();
         input_events.clear();
 
-        // To achieve this, we'll always read one event ahead
+        // Events past the end of the buffer are a host bug. They are delivered in the last
+        // block, clamped to its last sample, and never split it.
+        let is_last_block = block_end_cap >= total_buffer_len;
+        let block_len = block_end_cap.saturating_sub(current_sample_idx);
         let num_events = clap_call! { in_=>size(in_) };
-        if num_events == 0 {
-            return None;
-        }
+        for event_idx in (resume_from_event_idx as u32)..num_events {
+            let event: *const clap_event_header = clap_call! { in_=>get(in_, event_idx) };
+            if event.is_null() {
+                continue;
+            }
 
-        let start_idx = resume_from_event_idx as u32;
-        let mut event: *const clap_event_header = clap_call! { in_=>get(in_, start_idx) };
-        for next_event_idx in (start_idx + 1)..num_events {
+            // The event a previous split stopped at sits at `current_sample_idx` and is
+            // delivered; any later one may end this block, the first one included
+            let time = (*event).time as usize;
+            if time > current_sample_idx {
+                if time >= block_end_cap {
+                    if !is_last_block {
+                        return Some((block_end_cap, event_idx as usize));
+                    }
+                } else if stop_predicate(event) {
+                    return Some((time, event_idx as usize));
+                }
+            }
+
             self.handle_in_event(
                 event,
                 &mut input_events,
                 Some(transport_info),
                 current_sample_idx,
-                total_buffer_len,
+                block_len,
             );
-
-            // Stop just before the next parameter change or transport information event at a sample
-            // after the current sample
-            let next_event: *const clap_event_header = clap_call! { in_=>get(in_, next_event_idx) };
-            if (*next_event).time > current_sample_idx as u32 && stop_predicate(next_event) {
-                return Some(((*next_event).time as usize, next_event_idx as usize));
-            }
-
-            event = next_event;
         }
-
-        // Don't forget about the last event
-        self.handle_in_event(
-            event,
-            &mut input_events,
-            Some(transport_info),
-            current_sample_idx,
-            total_buffer_len,
-        );
 
         None
     }
@@ -1468,9 +1475,10 @@ impl<P: ClapPlugin> Wrapper<P> {
     ) {
         let raw_event = &*event;
 
-        // Out of bounds events are clamped to the buffer's size
+        // Out of bounds events are clamped to the buffer's size. A host that sends events out
+        // of order can hand one from before this block; it lands on the block's first sample.
         let timing = clamp_input_event_timing(
-            raw_event.time - current_sample_idx as u32,
+            raw_event.time.saturating_sub(current_sample_idx as u32),
             total_buffer_len as u32,
         );
 
@@ -2025,6 +2033,12 @@ impl<P: ClapPlugin> Wrapper<P> {
             // accuration automation yet and there's no way to get the last event for a parameter,
             // we'll process every incoming event.
             let process = &*process;
+            // H8: processing before `activate` has no buffer manager to run on. The CLAP spec
+            // forbids it; a host that does it anyway gets an error, not a crash.
+            let Some(buffer_config) = wrapper.current_buffer_config.load() else {
+                return CLAP_PROCESS_ERROR;
+            };
+            let sample_rate = buffer_config.sample_rate;
             let total_buffer_len = process.frames_count as usize;
 
             let current_audio_io_layout = wrapper.current_audio_io_layout.load();
@@ -2033,22 +2047,50 @@ impl<P: ClapPlugin> Wrapper<P> {
             let aux_input_start_idx = if has_main_input { 1 } else { 0 };
             let aux_output_start_idx = if has_main_output { 1 } else { 0 };
 
+            // Like the VST3 wrapper: no samples, no output bus where the layout has outputs, or a
+            // main output with zero channels is a flush. Events are handled, the plug-in is not
+            // run, since the buffer manager would otherwise back the missing outputs with scratch.
+            let output_buffers_missing = process.audio_outputs_count == 0
+                || process.audio_outputs.is_null()
+                || (*process.audio_outputs).data32.is_null();
+            let main_output_has_no_channels = has_main_output
+                && !output_buffers_missing
+                && (*process.audio_outputs).channel_count == 0;
+            let is_flush = total_buffer_len == 0
+                || main_output_has_no_channels
+                || (output_buffers_missing
+                    && (has_main_output || !current_audio_io_layout.aux_output_ports.is_empty()));
+
+            // H5: never more samples per block than the buffers were allocated for, whatever the
+            // host sends. A flush hands no audio to the plug-in, so it is not split by size.
+            let max_block_len = if is_flush {
+                total_buffer_len
+            } else {
+                wrapper.buffer_manager.borrow().max_buffer_size()
+            };
+
             // If `P::SAMPLE_ACCURATE_AUTOMATION` is set, then we'll split up the audio buffer into
             // chunks whenever a parameter change occurs
             let mut block_start = 0;
-            let mut block_end = total_buffer_len;
+            let mut block_end;
             let mut event_start_idx = 0;
+            let mut events_exhausted = false;
 
             // The host may send new transport information as an event. In that case we'll also
-            // split the buffer.
+            // split the buffer. The sample that transport is valid at is where later blocks
+            // measure their position from.
             let mut transport_info = process.transport;
+            let mut last_transport_info = transport_info;
+            let mut transport_origin = 0usize;
 
             let result = loop {
-                if !process.in_events.is_null() {
+                let size_end = split_block_end(block_start, total_buffer_len, max_block_len, None);
+                if !process.in_events.is_null() && !events_exhausted {
                     let split_result = wrapper.handle_in_events_until(
                         &*process.in_events,
                         &mut transport_info,
                         block_start,
+                        size_end,
                         total_buffer_len,
                         event_start_idx,
                         |next_event| {
@@ -2091,237 +2133,260 @@ impl<P: ClapPlugin> Wrapper<P> {
                             block_end = next_param_change_sample_idx;
                             event_start_idx = next_param_change_event_idx;
                         }
-                        None => block_end = total_buffer_len,
+                        None => {
+                            // Later size splits must not deliver these events again
+                            events_exhausted = true;
+                            block_end = size_end;
+                        }
                     }
+                } else {
+                    wrapper.input_events.borrow_mut().clear();
+                    block_end = size_end;
+                }
+
+                if transport_info != last_transport_info {
+                    // A transport event always ends the block before it, so it sits right here
+                    last_transport_info = transport_info;
+                    transport_origin = block_start;
                 }
 
                 // After processing the events we now know where/if the block should be split, and
                 // we can start preparing audio processing
                 let block_len = block_end - block_start;
 
-                // The buffer manager preallocated buffer slices for all the IO and storage for any
-                // axuiliary inputs.
-                // TODO: The audio buffers have a latency field, should we use those?
-                // TODO: Like with VST3, should we expose some way to access or set the silence/constant
-                //       flags?
-                let mut buffer_manager = wrapper.buffer_manager.borrow_mut();
-                let buffers =
-                    buffer_manager.create_buffers(block_start, block_len, |buffer_source| {
-                        // Explicitly take plugins with no main output that does have auxiliary
-                        // outputs into account. Shouldn't happen, but if we just start copying
-                        // audio here then that would result in unsoundness.
-                        if process.audio_outputs_count > 0
-                            && !process.audio_outputs.is_null()
-                            && !(*process.audio_outputs).data32.is_null()
-                            && has_main_output
-                        {
-                            let audio_output = &*process.audio_outputs;
-                            let ptrs = NonNull::new(audio_output.data32 as *mut *mut f32).unwrap();
-                            let num_channels = audio_output.channel_count as usize;
-
-                            *buffer_source.main_output_channel_pointers =
-                                Some(ChannelPointers { ptrs, num_channels });
-                        }
-
-                        if process.audio_inputs_count > 0
-                            && !process.audio_inputs.is_null()
-                            && !(*process.audio_inputs).data32.is_null()
-                            && has_main_input
-                        {
-                            let audio_input = &*process.audio_inputs;
-                            let ptrs = NonNull::new(audio_input.data32 as *mut *mut f32).unwrap();
-                            let num_channels = audio_input.channel_count as usize;
-
-                            *buffer_source.main_input_channel_pointers =
-                                Some(ChannelPointers { ptrs, num_channels });
-                        }
-
-                        if !process.audio_inputs.is_null() {
-                            for (aux_input_no, aux_input_channel_pointers) in buffer_source
-                                .aux_input_channel_pointers
-                                .iter_mut()
-                                .enumerate()
-                            {
-                                let aux_input_idx = aux_input_no + aux_input_start_idx;
-                                // `>=`: the last valid index into an array of
-                                // `audio_inputs_count` entries is one less than
-                                // the count. With a sidechain left unconnected
-                                // the count is 0 and `0 > 0` let the loop
-                                // dereference an empty array — the
-                                // `!audio_inputs.is_null()` guard above does not
-                                // catch a non-null empty array, and the `data32`
-                                // NonNull check below happens after the read.
-                                if aux_input_idx >= process.audio_inputs_count as usize {
-                                    break;
-                                }
-
-                                let audio_input = &*process.audio_inputs.add(aux_input_idx);
-                                match NonNull::new(audio_input.data32 as *mut *mut f32) {
-                                    Some(ptrs) => {
-                                        let num_channels = audio_input.channel_count as usize;
-
-                                        *aux_input_channel_pointers =
-                                            Some(ChannelPointers { ptrs, num_channels });
-                                    }
-                                    None => continue,
-                                }
-                            }
-                        }
-
-                        if !process.audio_outputs.is_null() {
-                            for (aux_output_no, aux_output_channel_pointers) in buffer_source
-                                .aux_output_channel_pointers
-                                .iter_mut()
-                                .enumerate()
-                            {
-                                let aux_output_idx = aux_output_no + aux_output_start_idx;
-                                // Same off-by-one, mirrored (see above).
-                                if aux_output_idx >= process.audio_outputs_count as usize {
-                                    break;
-                                }
-
-                                let audio_output = &*process.audio_outputs.add(aux_output_idx);
-                                match NonNull::new(audio_output.data32 as *mut *mut f32) {
-                                    Some(ptrs) => {
-                                        let num_channels = audio_output.channel_count as usize;
-
-                                        *aux_output_channel_pointers =
-                                            Some(ChannelPointers { ptrs, num_channels });
-                                    }
-                                    None => continue,
-                                }
-                            }
-                        }
-                    });
-
-                // If the host does not provide outputs or if it does not provide the required
-                // number of channels (should not happen, but Ableton Live does this for bypassed
-                // VST3 plugins) then we'll skip audio processing. In that case
-                // `buffer_manager.create_buffers` will have set one or more of the output buffers
-                // to empty slices since there is no storage to point them to. The auxiliary input
-                // buffers always point to valid storage.
-                let mut buffer_is_valid = true;
-                for output_buffer_slice in buffers.main_buffer.as_slice_immutable().iter().chain(
-                    buffers
-                        .aux_outputs
-                        .iter()
-                        .flat_map(|buffer| buffer.as_slice_immutable().iter()),
-                ) {
-                    if output_buffer_slice.is_empty() {
-                        buffer_is_valid = false;
-                        break;
-                    }
-                }
-
-                nih_debug_assert!(buffer_is_valid);
-
-                // Some of the fields are left empty because CLAP does not provide this information,
-                // but the methods on [`Transport`] can reconstruct these values from the other
-                // fields
-                let sample_rate = wrapper
-                    .current_buffer_config
-                    .load()
-                    .expect("Process call without prior initialization call")
-                    .sample_rate;
-                let mut transport = Transport::new(sample_rate);
-                if !transport_info.is_null() {
-                    let context = &*transport_info;
-
-                    transport.playing = context.flags & CLAP_TRANSPORT_IS_PLAYING != 0;
-                    transport.recording = context.flags & CLAP_TRANSPORT_IS_RECORDING != 0;
-                    transport.preroll_active =
-                        Some(context.flags & CLAP_TRANSPORT_IS_WITHIN_PRE_ROLL != 0);
-                    if context.flags & CLAP_TRANSPORT_HAS_TEMPO != 0 {
-                        transport.tempo = Some(context.tempo);
-                    }
-                    if context.flags & CLAP_TRANSPORT_HAS_TIME_SIGNATURE != 0 {
-                        transport.time_sig_numerator = Some(context.tsig_num as i32);
-                        transport.time_sig_denominator = Some(context.tsig_denom as i32);
-                    }
-                    if context.flags & CLAP_TRANSPORT_HAS_BEATS_TIMELINE != 0 {
-                        let beats = context.song_pos_beats as f64 / CLAP_BEATTIME_FACTOR as f64;
-
-                        // This is a bit messy, but we'll try to compensate for the block splitting.
-                        // We can't use the functions on the transport information object for this
-                        // because we don't have any sample information.
-                        if P::SAMPLE_ACCURATE_AUTOMATION
-                            && block_start > 0
-                            && (context.flags & CLAP_TRANSPORT_HAS_TEMPO != 0)
-                        {
-                            transport.pos_beats = Some(
-                                beats
-                                    + (block_start as f64 / sample_rate as f64 / 60.0
-                                        * context.tempo),
-                            );
-                        } else {
-                            transport.pos_beats = Some(beats);
-                        }
-                    }
-                    if context.flags & CLAP_TRANSPORT_HAS_SECONDS_TIMELINE != 0 {
-                        let seconds = context.song_pos_seconds as f64 / CLAP_SECTIME_FACTOR as f64;
-
-                        // Same here
-                        if P::SAMPLE_ACCURATE_AUTOMATION
-                            && block_start > 0
-                            && (context.flags & CLAP_TRANSPORT_HAS_TEMPO != 0)
-                        {
-                            transport.pos_seconds =
-                                Some(seconds + (block_start as f64 / sample_rate as f64));
-                        } else {
-                            transport.pos_seconds = Some(seconds);
-                        }
-                    }
-                    // TODO: CLAP does not mention whether this is behind a flag or not
-                    if P::SAMPLE_ACCURATE_AUTOMATION && block_start > 0 {
-                        transport.bar_start_pos_beats = match transport.bar_start_pos_beats() {
-                            Some(updated) => Some(updated),
-                            None => Some(context.bar_start as f64 / CLAP_BEATTIME_FACTOR as f64),
-                        };
-                        transport.bar_number = match transport.bar_number() {
-                            Some(updated) => Some(updated),
-                            None => Some(context.bar_number),
-                        };
-                    } else {
-                        transport.bar_start_pos_beats =
-                            Some(context.bar_start as f64 / CLAP_BEATTIME_FACTOR as f64);
-                        transport.bar_number = Some(context.bar_number);
-                    }
-                    // TODO: They also aren't very clear about this, but presumably if the loop is
-                    //       active and the corresponding song transport information is available then
-                    //       this is also available
-                    if context.flags & CLAP_TRANSPORT_IS_LOOP_ACTIVE != 0
-                        && context.flags & CLAP_TRANSPORT_HAS_BEATS_TIMELINE != 0
-                    {
-                        transport.loop_range_beats = Some((
-                            context.loop_start_beats as f64 / CLAP_BEATTIME_FACTOR as f64,
-                            context.loop_end_beats as f64 / CLAP_BEATTIME_FACTOR as f64,
-                        ));
-                    }
-                    if context.flags & CLAP_TRANSPORT_IS_LOOP_ACTIVE != 0
-                        && context.flags & CLAP_TRANSPORT_HAS_SECONDS_TIMELINE != 0
-                    {
-                        transport.loop_range_seconds = Some((
-                            context.loop_start_seconds as f64 / CLAP_SECTIME_FACTOR as f64,
-                            context.loop_end_seconds as f64 / CLAP_SECTIME_FACTOR as f64,
-                        ));
-                    }
-                }
-
-                let result = if buffer_is_valid {
-                    let mut plugin = wrapper.plugin.lock();
-                    // SAFETY: Shortening these borrows is safe as even if the plugin overwrites the
-                    //         slices (which it cannot do without using unsafe code), then they
-                    //         would still be reset on the next iteration
-                    let mut aux = AuxiliaryBuffers {
-                        inputs: buffers.aux_inputs,
-                        outputs: buffers.aux_outputs,
-                    };
-                    let mut context = wrapper.make_process_context(transport);
-                    let result = plugin.process(buffers.main_buffer, &mut aux, &mut context);
-                    wrapper.last_process_status.store(result);
-                    result
-                } else {
+                let result = if is_flush {
                     ProcessStatus::Normal
+                } else {
+                    // The buffer manager preallocated buffer slices for all the IO and storage for any
+                    // axuiliary inputs.
+                    // TODO: The audio buffers have a latency field, should we use those?
+                    // TODO: Like with VST3, should we expose some way to access or set the silence/constant
+                    //       flags?
+                    let mut buffer_manager = wrapper.buffer_manager.borrow_mut();
+                    let buffers =
+                        buffer_manager.create_buffers(block_start, block_len, |buffer_source| {
+                            // Explicitly take plugins with no main output that does have auxiliary
+                            // outputs into account. Shouldn't happen, but if we just start copying
+                            // audio here then that would result in unsoundness.
+                            if process.audio_outputs_count > 0
+                                && !process.audio_outputs.is_null()
+                                && !(*process.audio_outputs).data32.is_null()
+                                && has_main_output
+                            {
+                                let audio_output = &*process.audio_outputs;
+                                let ptrs =
+                                    NonNull::new(audio_output.data32 as *mut *mut f32).unwrap();
+                                let num_channels = audio_output.channel_count as usize;
+
+                                *buffer_source.main_output_channel_pointers =
+                                    Some(ChannelPointers { ptrs, num_channels });
+                            }
+
+                            if process.audio_inputs_count > 0
+                                && !process.audio_inputs.is_null()
+                                && !(*process.audio_inputs).data32.is_null()
+                                && has_main_input
+                            {
+                                let audio_input = &*process.audio_inputs;
+                                let ptrs =
+                                    NonNull::new(audio_input.data32 as *mut *mut f32).unwrap();
+                                let num_channels = audio_input.channel_count as usize;
+
+                                *buffer_source.main_input_channel_pointers =
+                                    Some(ChannelPointers { ptrs, num_channels });
+                            }
+
+                            if !process.audio_inputs.is_null() {
+                                for (aux_input_no, aux_input_channel_pointers) in buffer_source
+                                    .aux_input_channel_pointers
+                                    .iter_mut()
+                                    .enumerate()
+                                {
+                                    let aux_input_idx = aux_input_no + aux_input_start_idx;
+                                    // `>=`: the last valid index into an array of
+                                    // `audio_inputs_count` entries is one less than
+                                    // the count. With a sidechain left unconnected
+                                    // the count is 0 and `0 > 0` let the loop
+                                    // dereference an empty array — the
+                                    // `!audio_inputs.is_null()` guard above does not
+                                    // catch a non-null empty array, and the `data32`
+                                    // NonNull check below happens after the read.
+                                    if aux_input_idx >= process.audio_inputs_count as usize {
+                                        break;
+                                    }
+
+                                    let audio_input = &*process.audio_inputs.add(aux_input_idx);
+                                    match NonNull::new(audio_input.data32 as *mut *mut f32) {
+                                        Some(ptrs) => {
+                                            let num_channels = audio_input.channel_count as usize;
+
+                                            *aux_input_channel_pointers =
+                                                Some(ChannelPointers { ptrs, num_channels });
+                                        }
+                                        None => continue,
+                                    }
+                                }
+                            }
+
+                            if !process.audio_outputs.is_null() {
+                                for (aux_output_no, aux_output_channel_pointers) in buffer_source
+                                    .aux_output_channel_pointers
+                                    .iter_mut()
+                                    .enumerate()
+                                {
+                                    let aux_output_idx = aux_output_no + aux_output_start_idx;
+                                    // Same off-by-one, mirrored (see above).
+                                    if aux_output_idx >= process.audio_outputs_count as usize {
+                                        break;
+                                    }
+
+                                    let audio_output = &*process.audio_outputs.add(aux_output_idx);
+                                    match NonNull::new(audio_output.data32 as *mut *mut f32) {
+                                        Some(ptrs) => {
+                                            let num_channels = audio_output.channel_count as usize;
+
+                                            *aux_output_channel_pointers =
+                                                Some(ChannelPointers { ptrs, num_channels });
+                                        }
+                                        None => continue,
+                                    }
+                                }
+                            }
+                        });
+
+                    // If the host does not provide outputs or if it does not provide the required
+                    // number of channels (should not happen, but Ableton Live does this for bypassed
+                    // VST3 plugins) then we'll skip audio processing. In that case
+                    // `buffer_manager.create_buffers` will have set one or more of the output buffers
+                    // to empty slices since there is no storage to point them to. The auxiliary input
+                    // buffers always point to valid storage.
+                    let mut buffer_is_valid = true;
+                    for output_buffer_slice in
+                        buffers.main_buffer.as_slice_immutable().iter().chain(
+                            buffers
+                                .aux_outputs
+                                .iter()
+                                .flat_map(|buffer| buffer.as_slice_immutable().iter()),
+                        )
+                    {
+                        if output_buffer_slice.is_empty() {
+                            buffer_is_valid = false;
+                            break;
+                        }
+                    }
+
+                    nih_debug_assert!(buffer_is_valid);
+
+                    // Some of the fields are left empty because CLAP does not provide this information,
+                    // but the methods on [`Transport`] can reconstruct these values from the other
+                    // fields
+                    let mut transport = Transport::new(sample_rate);
+                    if !transport_info.is_null() {
+                        let context = &*transport_info;
+
+                        transport.playing = context.flags & CLAP_TRANSPORT_IS_PLAYING != 0;
+                        transport.recording = context.flags & CLAP_TRANSPORT_IS_RECORDING != 0;
+                        transport.preroll_active =
+                            Some(context.flags & CLAP_TRANSPORT_IS_WITHIN_PRE_ROLL != 0);
+                        if context.flags & CLAP_TRANSPORT_HAS_TEMPO != 0 {
+                            transport.tempo = Some(context.tempo);
+                        }
+                        if context.flags & CLAP_TRANSPORT_HAS_TIME_SIGNATURE != 0 {
+                            transport.time_sig_numerator = Some(context.tsig_num as i32);
+                            transport.time_sig_denominator = Some(context.tsig_denom as i32);
+                        }
+                        if context.flags & CLAP_TRANSPORT_HAS_BEATS_TIMELINE != 0 {
+                            let beats = context.song_pos_beats as f64 / CLAP_BEATTIME_FACTOR as f64;
+
+                            // This is a bit messy, but we'll try to compensate for the block splitting.
+                            // We can't use the functions on the transport information object for this
+                            // because we don't have any sample information.
+                            if block_start > transport_origin
+                                && (context.flags & CLAP_TRANSPORT_HAS_TEMPO != 0)
+                            {
+                                transport.pos_beats = Some(
+                                    beats
+                                        + ((block_start - transport_origin) as f64
+                                            / sample_rate as f64
+                                            / 60.0
+                                            * context.tempo),
+                                );
+                            } else {
+                                transport.pos_beats = Some(beats);
+                            }
+                        }
+                        if context.flags & CLAP_TRANSPORT_HAS_SECONDS_TIMELINE != 0 {
+                            let seconds =
+                                context.song_pos_seconds as f64 / CLAP_SECTIME_FACTOR as f64;
+
+                            // Same here
+                            if block_start > transport_origin
+                                && (context.flags & CLAP_TRANSPORT_HAS_TEMPO != 0)
+                            {
+                                transport.pos_seconds = Some(
+                                    seconds
+                                        + ((block_start - transport_origin) as f64
+                                            / sample_rate as f64),
+                                );
+                            } else {
+                                transport.pos_seconds = Some(seconds);
+                            }
+                        }
+                        // TODO: CLAP does not mention whether this is behind a flag or not
+                        if block_start > transport_origin {
+                            transport.bar_start_pos_beats = match transport.bar_start_pos_beats() {
+                                Some(updated) => Some(updated),
+                                None => {
+                                    Some(context.bar_start as f64 / CLAP_BEATTIME_FACTOR as f64)
+                                }
+                            };
+                            transport.bar_number = match transport.bar_number() {
+                                Some(updated) => Some(updated),
+                                None => Some(context.bar_number),
+                            };
+                        } else {
+                            transport.bar_start_pos_beats =
+                                Some(context.bar_start as f64 / CLAP_BEATTIME_FACTOR as f64);
+                            transport.bar_number = Some(context.bar_number);
+                        }
+                        // TODO: They also aren't very clear about this, but presumably if the loop is
+                        //       active and the corresponding song transport information is available then
+                        //       this is also available
+                        if context.flags & CLAP_TRANSPORT_IS_LOOP_ACTIVE != 0
+                            && context.flags & CLAP_TRANSPORT_HAS_BEATS_TIMELINE != 0
+                        {
+                            transport.loop_range_beats = Some((
+                                context.loop_start_beats as f64 / CLAP_BEATTIME_FACTOR as f64,
+                                context.loop_end_beats as f64 / CLAP_BEATTIME_FACTOR as f64,
+                            ));
+                        }
+                        if context.flags & CLAP_TRANSPORT_IS_LOOP_ACTIVE != 0
+                            && context.flags & CLAP_TRANSPORT_HAS_SECONDS_TIMELINE != 0
+                        {
+                            transport.loop_range_seconds = Some((
+                                context.loop_start_seconds as f64 / CLAP_SECTIME_FACTOR as f64,
+                                context.loop_end_seconds as f64 / CLAP_SECTIME_FACTOR as f64,
+                            ));
+                        }
+                    }
+
+                    let result = if buffer_is_valid {
+                        let mut plugin = wrapper.plugin.lock();
+                        // SAFETY: Shortening these borrows is safe as even if the plugin overwrites the
+                        //         slices (which it cannot do without using unsafe code), then they
+                        //         would still be reset on the next iteration
+                        let mut aux = AuxiliaryBuffers {
+                            inputs: buffers.aux_inputs,
+                            outputs: buffers.aux_outputs,
+                        };
+                        let mut context = wrapper.make_process_context(transport);
+                        let result = plugin.process(buffers.main_buffer, &mut aux, &mut context);
+                        wrapper.last_process_status.store(result);
+                        result
+                    } else {
+                        ProcessStatus::Normal
+                    };
+                    result
                 };
 
                 let clap_result = match result {
@@ -3390,15 +3455,21 @@ impl<P: ClapPlugin> Wrapper<P> {
             return false;
         }
         let length = u64::from_le_bytes(length_bytes);
+        // H2: the prefix is host data; a corrupt or hostile one must not size an allocation
+        if !state_length_is_sane(length) {
+            nih_debug_assert_failure!("State length prefix is not plausible, refusing the state");
+            return false;
+        }
+        let length = length as usize;
 
-        let mut read_buffer: Vec<u8> = Vec::with_capacity(length as usize);
-        if !read_stream(&*stream, read_buffer.spare_capacity_mut()) {
+        let mut read_buffer: Vec<u8> = Vec::with_capacity(length);
+        if !read_stream(&*stream, &mut read_buffer.spare_capacity_mut()[..length]) {
             nih_debug_assert_failure!(
                 "Error or end of stream while reading the state buffer from the stream."
             );
             return false;
         }
-        read_buffer.set_len(length as usize);
+        read_buffer.set_len(length);
 
         match state::deserialize_json(&read_buffer) {
             Some(mut state) => {

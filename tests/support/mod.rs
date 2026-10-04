@@ -120,6 +120,14 @@ impl Vst3Plugin for TestPlugin {
     const VST3_SUBCATEGORIES: &'static [Vst3SubCategory] = &[Vst3SubCategory::Fx];
 }
 
+impl ClapPlugin for TestPlugin {
+    const CLAP_ID: &'static str = "test.host-misbehaviour";
+    const CLAP_DESCRIPTION: Option<&'static str> = None;
+    const CLAP_MANUAL_URL: Option<&'static str> = None;
+    const CLAP_SUPPORT_URL: Option<&'static str> = None;
+    const CLAP_FEATURES: &'static [ClapFeature] = &[ClapFeature::AudioEffect];
+}
+
 /// A host-side `IBStream`. `seekable = false` answers `kNotImplemented` to `seek`/`tell`,
 /// `chunk` caps every `read`/`write` (short transfers), `eof_is_error` makes the read after
 /// the last byte return `kResultFalse` instead of zero bytes, `endless` never runs out,
@@ -385,6 +393,11 @@ pub fn new_wrapper() -> Wrapper<TestPlugin> {
 
 /// The plug-in instance's call log (see [`CALLS`]).
 pub fn calls_of(_wrapper: &Wrapper<TestPlugin>) -> Arc<Mutex<Vec<Call>>> {
+    calls_of_any()
+}
+
+/// The call log of the plug-in constructed on this thread, whichever wrapper made it.
+pub fn calls_of_any() -> Arc<Mutex<Vec<Call>>> {
     CALLS.with(|c| c.clone())
 }
 
