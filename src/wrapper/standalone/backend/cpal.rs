@@ -45,9 +45,9 @@ pub struct CpalMidir {
     audio_io_layout: AudioIOLayout,
     /// Needed to re-select devices in `reinit()` after the audio stream died.
     host_id: cpal::HostId,
-    /// The host the devices were opened through, kept for `reinit()`: on ASIO it is the one
-    /// instance that knows which driver is loaded, so no second instance loads (and so unloads)
-    /// drivers under it (A7).
+    /// The host the devices were opened through, kept for `reinit()`. An ASIO host enumerates only
+    /// at launch: its enumeration loads every driver in turn, so a duplex restart loads its one
+    /// driver by name instead (A7).
     host: cpal::Host,
     /// A single-device duplex host, see `single_device_duplex`.
     duplex: bool,
@@ -651,10 +651,12 @@ impl<P: Plugin> Backend<P> for CpalMidir {
                     }
                 }
             }
-            drop(output_stream);
+            // Stopped before the callback goes, so the last period the driver plays is one the
+            // callback rendered.
             if self.duplex {
                 asio_driver::stop(&output.device);
             }
+            drop(output_stream);
             watch_stop.store(true, Ordering::Release);
             if self.duplex {
                 let overflows = self.overflows.swap(0, Ordering::Relaxed);
@@ -713,9 +715,8 @@ impl<P: Plugin> Backend<P> for CpalMidir {
         if self.duplex {
             // A real driver reset (asio.h kAsioResetRequest): every handle to the driver is
             // released, so it runs ASIODisposeBuffers and ASIOExit, and the resolution below loads
-            // the same driver afresh with ASIOInit. A replugged interface or a new control-panel
-            // buffer size only takes effect that way. No stream is open, so loading drivers here
-            // cannot disturb one (A7).
+            // the same driver afresh, by name, with ASIOInit. A replugged interface or a new
+            // control-panel buffer size only takes effect that way (A7).
             self.input = None;
             self.output = None;
         }
@@ -1287,9 +1288,9 @@ impl CpalMidir {
     ///
     /// A duplex driver carries both directions: its period is adopted into `config` (A4) and the
     /// input, when the plugin has one and the driver offers input channels, is the output's own
-    /// device (A2); `--input-device` plays no part. A duplex restart reloads the driver `previous`
-    /// was open on and no other (A7): nothing stands in for it, so a driver that does not load is
-    /// an error and the caller retries it.
+    /// device (A2); `--input-device` plays no part. A duplex restart loads the driver `previous`
+    /// was open on by name, so no other driver is loaded (A7): nothing stands in for it, so a
+    /// driver that does not load is an error and the caller retries it.
     ///
     /// `previous` is what the stream was open on before a restart; a launch passes the default.
     fn open_devices(
@@ -1319,9 +1320,8 @@ impl CpalMidir {
         if duplex && start == Start::Restart {
             let reloaded = match previous.opened.clone() {
                 Some(name) => {
-                    match Self::resolve_output(
-                        host,
-                        &name,
+                    match Self::resolve_output_among(
+                        asio_driver::load(&name).into_iter().collect(),
                         config,
                         output_channels,
                         start,
@@ -1536,7 +1536,23 @@ impl CpalMidir {
         start: Start,
         device_use: DeviceUse,
     ) -> Resolved {
-        let candidates = Self::devices_named(host, name)
+        Self::resolve_output_among(
+            Self::devices_named(host, name),
+            config,
+            num_output_channels,
+            start,
+            device_use,
+        )
+    }
+
+    fn resolve_output_among(
+        devices: Vec<Device>,
+        config: &WrapperConfig,
+        num_output_channels: usize,
+        start: Start,
+        device_use: DeviceUse,
+    ) -> Resolved {
+        let candidates = devices
             .into_iter()
             .filter(|device| {
                 device

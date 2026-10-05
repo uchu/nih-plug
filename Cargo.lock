@@ -3600,6 +3600,7 @@ dependencies = [
  "anyhow",
  "anymap3",
  "approx 0.5.1",
+ "asio-sys",
  "assert_no_alloc",
  "atomic_float",
  "atomic_refcell",

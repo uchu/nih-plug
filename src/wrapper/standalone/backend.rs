@@ -96,6 +96,9 @@ pub trait Backend<P: Plugin>: 'static + Send + Sync {
     /// [`reinit()`][Self::reinit()] releases and reloads a driver that is a single-threaded COM
     /// object (ASIO), so it must run on the thread that loaded it at launch: the GUI thread, which
     /// pumps the messages such a driver relies on. The audio thread never pumps any.
+    ///
+    /// While such a stream is down, nothing on the GUI thread may block on the audio thread:
+    /// `GuiContext::set_state()` waits for an audio callback, which would then never come.
     fn reinit_on_gui_thread(&self) -> bool {
         false
     }

@@ -61,7 +61,7 @@ standalone = ["dep:baseview", "dep:clap", "dep:cpal", "dep:jack", "dep:midir", "
 # ASIO host for the Windows standalone. Implies `standalone`; cpal gates the
 # host to Windows, so the feature is a no-op elsewhere. Needs the Steinberg
 # ASIO SDK (`CPAL_ASIO_DIR`) and libclang at build time.
-asio = ["standalone", "cpal/asio"]
+asio = ["standalone", "cpal/asio", "dep:asio-sys"]
 # The standalone window enforces the editor's minimum size on interactive
 # (drag) resizing via `baseview::Window::set_min_client_size`. That method
 # exists only in Phaseburn's patched baseview (vendored in the consuming
@@ -136,6 +136,12 @@ libc = "0.2.124"
 [target.'cfg(target_os = "macos")'.dependencies]
 objc = "0.2.7"
 core-foundation = "0.9.3"
+
+# Used for the `asio` feature: a duplex restart loads its one driver by name. The same crate
+# cpal's `asio` host links, so both drive the SDK's single loaded driver.
+[target.'cfg(target_os = "windows")'.dependencies.asio-sys]
+version = "0.2.6"
+optional = true
 
 [target.'cfg(target_os = "windows")'.dependencies.windows]
 version = "0.44"

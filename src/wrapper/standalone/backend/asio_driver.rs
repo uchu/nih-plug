@@ -1,5 +1,5 @@
-//! What an open ASIO driver tells the host outside its buffer callbacks, and stopping it at the
-//! end of a run (spec A6). Off ASIO every function here is inert.
+//! What an open ASIO driver tells the host outside its buffer callbacks, stopping it at the end
+//! of a run (spec A6), and reloading it by name (A7). Off ASIO every function here is inert.
 
 use cpal::Device;
 use crossbeam::sync::Unparker;
@@ -82,6 +82,39 @@ pub(crate) fn stop(device: &Device) {
 
 #[cfg(not(all(target_os = "windows", feature = "asio")))]
 pub(crate) fn stop(_device: &Device) {}
+
+/// The driver `name`, loaded by name. Enumerating through the cpal host instead loads and
+/// releases every driver registered ahead of it, and all of them while it does not load. Called
+/// only with every handle to the previous driver released, so no driver is loaded.
+#[cfg(all(target_os = "windows", feature = "asio"))]
+pub(crate) fn load(name: &str) -> Option<Device> {
+    use std::sync::atomic::AtomicI32;
+    use std::sync::{Mutex, OnceLock};
+
+    // The SDK holds one driver per process; this instance tracks the one it loaded.
+    static ASIO: OnceLock<asio_sys::Asio> = OnceLock::new();
+    let driver = match ASIO.get_or_init(asio_sys::Asio::new).load_driver(name) {
+        Ok(driver) => driver,
+        Err(err) => {
+            nih_log!("The ASIO driver '{name}' does not load: {err}");
+            return None;
+        }
+    };
+    let device = cpal::platform::AsioDevice {
+        driver: Arc::new(driver),
+        asio_streams: Arc::new(Mutex::new(asio_sys::AsioStreams {
+            input: None,
+            output: None,
+        })),
+        current_buffer_index: Arc::new(AtomicI32::new(-1)),
+    };
+    Some(device.into())
+}
+
+#[cfg(not(all(target_os = "windows", feature = "asio")))]
+pub(crate) fn load(_name: &str) -> Option<Device> {
+    None
+}
 
 #[cfg(test)]
 mod tests {
