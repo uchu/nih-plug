@@ -18,7 +18,9 @@ mod context;
 mod recovery;
 mod wrapper;
 
-pub use change::{request_audio_change, AudioChange};
+pub use change::{
+    open_asio_control_panel, register_asio_control_panel, request_audio_change, AudioChange,
+};
 
 /// The audio devices the standalone's stream is open on right now.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]

@@ -5,7 +5,7 @@ use std::time::{Duration, Instant};
 use super::change::{audio_change_pending, AudioChange};
 use crate::prelude::{AuxiliaryBuffers, PluginNoteEvent, Transport};
 
-mod asio_driver;
+pub(super) mod asio_driver;
 mod buffer_sizes;
 mod cpal;
 pub mod device_watch;

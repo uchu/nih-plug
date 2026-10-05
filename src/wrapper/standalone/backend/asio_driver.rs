@@ -15,6 +15,10 @@ pub(crate) fn set_driver_open(open: bool) {
     DRIVER_OPEN.store(open, std::sync::atomic::Ordering::Release);
 }
 
+pub(crate) fn driver_open() -> bool {
+    DRIVER_OPEN.load(std::sync::atomic::Ordering::Acquire)
+}
+
 /// Stops listening for the driver's reset requests when dropped.
 pub(crate) struct ResetListener(Option<Box<dyn FnOnce() + Send>>);
 

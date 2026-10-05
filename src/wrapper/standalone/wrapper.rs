@@ -12,7 +12,7 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use super::backend::{wait_unless, Backend, RunOutcome, Wake};
-use super::change::{audio_change_pending, take_audio_change};
+use super::change::{audio_change_pending, register_gui_runner, take_audio_change, GuiRunner};
 use super::config::WrapperConfig;
 use super::context::{WrapperGuiContext, WrapperInitContext, WrapperProcessContext};
 use super::recovery::{next_step, Action, Recovery, Step};
@@ -387,6 +387,7 @@ impl<P: Plugin, B: Backend<P>> Wrapper<P, B> {
     pub fn run(self: Arc<Self>) -> Result<(), WrapperError> {
         let (gui_task_sender, gui_task_receiver) = channel::bounded(512);
         *self.gui_tasks_sender.borrow_mut() = Some(gui_task_sender.clone());
+        register_gui_runner(gui_runner(gui_task_sender.clone()));
 
         // We'll spawn a separate thread to handle IO and to process audio. This audio thread should
         // terminate together with this function.
@@ -1073,6 +1074,12 @@ pub(crate) fn needs_reinit(current: (f32, u32), stream: (f32, u32)) -> bool {
     (stream.0 - current.0).abs() > 0.1 || stream.1 > current.1
 }
 
+/// Posts a job to the GUI thread without ever waiting for it: the caller may be the GUI thread
+/// itself, so a full queue or a closed window refuses the job instead.
+fn gui_runner(sender: Sender<GuiTask>) -> GuiRunner {
+    Box::new(move |job| sender.try_send(GuiTask::Run(job)).is_ok())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1083,5 +1090,16 @@ mod tests {
         assert!(!needs_reinit((48_000.0, 8192), (48_000.05, 256)));
         assert!(needs_reinit((48_000.0, 8192), (44_100.0, 8192)));
         assert!(needs_reinit((48_000.0, 512), (48_000.0, 1024)));
+    }
+
+    #[test]
+    fn the_gui_runner_refuses_a_job_rather_than_wait_on_a_full_or_closed_queue() {
+        let (sender, tasks) = channel::bounded(1);
+        let run = gui_runner(sender);
+        assert!(run(Box::new(|| ())));
+        assert!(!run(Box::new(|| ())));
+        assert!(matches!(tasks.try_recv(), Ok(GuiTask::Run(_))));
+        drop(tasks);
+        assert!(!run(Box::new(|| ())));
     }
 }
