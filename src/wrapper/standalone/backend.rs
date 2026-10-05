@@ -7,6 +7,7 @@ use crate::prelude::{AuxiliaryBuffers, PluginNoteEvent, Transport};
 
 pub(super) mod asio_driver;
 mod buffer_sizes;
+mod coreaudio_rate;
 mod cpal;
 pub mod device_watch;
 mod dummy;

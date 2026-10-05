@@ -27,6 +27,7 @@ use super::super::config::{WrapperConfig, DEFAULT_PERIOD_SIZE};
 use super::super::{publish_audio_devices_in_use, AudioDevicesInUse};
 use super::asio_driver;
 use super::buffer_sizes::{legal_sizes, snap, BufferFacts, DUPLEX_BLOCK};
+use super::coreaudio_rate::DeviceRate;
 use super::device_watch::{DeviceWatch, Kind, Wanted};
 use super::{sleep_unless, wait_unless, Backend, RunOutcome, Wake};
 use crate::midi::MidiResult;
@@ -92,6 +93,9 @@ struct CpalDevice {
     pub device: Device,
     pub config: StreamConfig,
     pub sample_format: SampleFormat,
+    /// What the run loop reads a shared CoreAudio output's rate from (A17), resolved when it
+    /// opened; `None` on an input, on any other host, and when `watched_rate` declines it.
+    pub rate_source: Option<DeviceRate>,
 }
 
 /// Whether the devices are opened for a start, for a restart after a stream failure, or for a
@@ -659,7 +663,7 @@ impl<P: Plugin> Backend<P> for CpalMidir {
                     // Setup) may keep calling back; the restart adopts the new rate (A17).
                     if check_rate && rate_checked.elapsed() >= RATE_CHECK_INTERVAL {
                         rate_checked = Instant::now();
-                        if let Some(rate) = output_rate_now(self.duplex, &output.device)
+                        if let Some(rate) = output_rate_now(self.duplex, output)
                             .filter(|&rate| rate_moved(rate, self.config.sample_rate))
                         {
                             if self.duplex {
@@ -1029,17 +1033,37 @@ fn rate_check_applies(duplex: bool, host_id: cpal::HostId) -> bool {
     }
 }
 
-/// The output's rate right now. On a shared host this is the read `open_output` adopts, so a
-/// restart always settles on the rate that ended the run. `None` when the device does not answer.
-fn output_rate_now(duplex: bool, device: &Device) -> Option<f64> {
+/// The output's rate right now: the ASIO driver's, or the nominal rate of the device a shared
+/// output resolved to. `None` when there is nothing to read or the device does not answer.
+fn output_rate_now(duplex: bool, output: &CpalDevice) -> Option<f64> {
     if duplex {
-        asio_driver::driver_rate(device)
+        asio_driver::driver_rate(&output.device)
     } else {
-        device
-            .default_output_config()
-            .ok()
-            .map(|current| current.sample_rate().0 as f64)
+        output.rate_source.and_then(DeviceRate::read)
     }
+}
+
+/// The device a shared output named `name` opened on, watched only when its nominal rate is the
+/// rate the open adopted from cpal's read. Any other device, a wrong one of two alike or one whose
+/// rate cpal rounds, would restart the stream on every check; that run goes unwatched instead.
+fn watched_rate(name: Option<&str>, on_default: bool, session: f32) -> Option<DeviceRate> {
+    let device = DeviceRate::resolve(name?, on_default)?;
+    match device.read() {
+        rate if agrees(rate, session) => return Some(device),
+        Some(rate) => nih_log!(
+            "The output device reports {rate} Hz, not the {session} Hz it opened at; the session \
+             does not follow a rate change on it"
+        ),
+        None => nih_log!(
+            "The output device's rate cannot be read; the session does not follow a rate change \
+             on it"
+        ),
+    }
+    None
+}
+
+fn agrees(rate: Option<f64>, session: f32) -> bool {
+    rate.is_some_and(|rate| !rate_moved(rate, session))
 }
 
 /// The `-b` id of the host a stream runs on, as the app names drivers.
@@ -1067,8 +1091,7 @@ pub(crate) fn duplex_input_channels(wanted: u16, available: &[u16]) -> Option<u1
 /// No error callback ever fires on ASIO (cpal ignores it), so silence is the signal (A6).
 const DUPLEX_LIVENESS_TIMEOUT_MS: u64 = 2000;
 
-/// How often a running stream reads its output's rate, where `rate_check_applies`. cpal's
-/// CoreAudio read instantiates a HAL output unit: tens of milliseconds on this waiting thread.
+/// How often a running stream reads its output's rate, where `rate_check_applies`.
 const RATE_CHECK_INTERVAL: Duration = Duration::from_secs(1);
 
 pub(crate) fn liveness_expired(now_ms: u64, last_ms: u64) -> bool {
@@ -1710,7 +1733,8 @@ impl CpalMidir {
                 }
             }
         }
-        let output = match output {
+        let on_default = output.is_none();
+        let mut output = match output {
             Some(output) => output,
             None if stands_in_default(start, duplex) => {
                 let result = host
@@ -1757,6 +1781,9 @@ impl CpalMidir {
             nih_log!("The output runs at {rate} Hz; the session follows it");
         }
         config.sample_rate = rate;
+        if !duplex {
+            output.rate_source = watched_rate(in_use.opened.as_deref(), on_default, rate);
+        }
         if let (true, cpal::BufferSize::Fixed(period)) = (duplex, output.config.buffer_size) {
             nih_log!("The driver runs a period of {period} samples");
             config.period_size = DUPLEX_BLOCK;
@@ -1790,6 +1817,7 @@ impl CpalMidir {
                             buffer_size: output.config.buffer_size,
                         },
                         sample_format,
+                        rate_source: None,
                     });
                     in_use.input = in_use.output.clone().or_else(|| output.device.name().ok());
                 }
@@ -2037,6 +2065,7 @@ impl CpalMidir {
             device,
             config: input_config,
             sample_format: input_sample_format,
+            rate_source: None,
         })
     }
 
@@ -2098,6 +2127,7 @@ impl CpalMidir {
             device,
             config: output_config,
             sample_format: output_sample_format,
+            rate_source: None,
         })
     }
 
@@ -2872,5 +2902,29 @@ mod tests {
     #[test]
     fn a_shared_wasapi_stream_leaves_a_rate_change_to_its_error_callback() {
         assert!(!rate_check_applies(false, cpal::HostId::Wasapi));
+    }
+
+    #[test]
+    fn only_a_device_at_the_adopted_rate_is_watched() {
+        assert!(agrees(Some(48_000.0), 48_000.0));
+        assert!(!agrees(Some(44_100.0), 48_000.0));
+        assert!(!agrees(Some(47_999.7), 47_999.0));
+        assert!(!agrees(None, 48_000.0));
+    }
+
+    /// Needs an output device; a machine without one has nothing to check.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn the_default_output_resolves_to_a_device_at_the_rate_an_open_adopts() {
+        let Some(device) = cpal::default_host().default_output_device() else {
+            return;
+        };
+        let (Ok(name), Ok(current)) = (device.name(), device.default_output_config()) else {
+            return;
+        };
+        let adopted = adopted_rate(Some(current.sample_rate()), 0.0);
+        let watched =
+            watched_rate(Some(&name), true, adopted).expect("the default output resolves");
+        assert!(agrees(watched.read(), adopted));
     }
 }

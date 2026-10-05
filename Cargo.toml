@@ -57,7 +57,7 @@ assert_process_allocs = ["dep:assert_no_alloc"]
 # Enables an export target for standalone binaries through the
 # `nih_export_standalone()` function. Disabled by default as this requires
 # building additional dependencies for audio and MIDI handling.
-standalone = ["dep:baseview", "dep:clap", "dep:cpal", "dep:jack", "dep:midir", "dep:rtrb"]
+standalone = ["dep:baseview", "dep:clap", "dep:coreaudio-sys", "dep:cpal", "dep:jack", "dep:midir", "dep:rtrb"]
 # ASIO host for the Windows standalone. Implies `standalone`; cpal gates the
 # host to Windows, so the feature is a no-op elsewhere. Needs the Steinberg
 # ASIO SDK (`CPAL_ASIO_DIR`) and libclang at build time.
@@ -136,6 +136,9 @@ libc = "0.2.124"
 [target.'cfg(target_os = "macos")'.dependencies]
 objc = "0.2.7"
 core-foundation = "0.9.3"
+# Used for the `standalone` feature: a shared CoreAudio stream reads its device's nominal rate.
+# The copy cpal links through coreaudio-rs, asking for no binding it does not already build.
+coreaudio-sys = { version = "0.2.16", default-features = false, features = ["core_audio"], optional = true }
 
 # Used for the `asio` feature: a duplex restart loads its one driver by name. The same crate
 # cpal's `asio` host links, so both drive the SDK's single loaded driver.

@@ -3611,6 +3611,7 @@ dependencies = [
  "clap",
  "clap-sys",
  "core-foundation 0.9.4",
+ "coreaudio-sys",
  "cpal",
  "crossbeam",
  "jack",
