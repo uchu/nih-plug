@@ -12,10 +12,13 @@ use super::util::setup_logger;
 use crate::prelude::Plugin;
 
 mod backend;
+mod change;
 mod config;
 mod context;
 mod recovery;
 mod wrapper;
+
+pub use change::{request_audio_change, AudioChange};
 
 /// The audio devices the standalone's stream is open on right now.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]

@@ -4,6 +4,7 @@ use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use super::super::change::{audio_change_pending, AudioChange};
 use super::super::config::WrapperConfig;
 use super::{Backend, RunOutcome};
 use crate::prelude::{AudioIOLayout, AuxiliaryBuffers, Buffer, Plugin, PluginNoteEvent, Transport};
@@ -102,6 +103,9 @@ impl<P: Plugin> Backend<P> for Dummy {
         let mut midi_output_events = Vec::with_capacity(1024);
         let mut num_processed_samples = 0usize;
         loop {
+            if audio_change_pending() {
+                return RunOutcome::Reconfigure;
+            }
             let period_start = Instant::now();
 
             let mut transport = Transport::new(self.config.sample_rate);
@@ -182,6 +186,11 @@ impl<P: Plugin> Backend<P> for Dummy {
         }
 
         RunOutcome::Stopped
+    }
+
+    /// There is nothing to open, so every change applies.
+    fn reconfigure(&mut self, _change: AudioChange) -> anyhow::Result<()> {
+        Ok(())
     }
 }
 

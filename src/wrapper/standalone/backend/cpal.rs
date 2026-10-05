@@ -17,12 +17,13 @@ use std::sync::Arc;
 use std::thread::ScopedJoinHandle;
 use std::time::{Duration, Instant};
 
+use super::super::change::{self, audio_change_pending};
 use super::super::config::{WrapperConfig, DEFAULT_PERIOD_SIZE};
 use super::super::{publish_audio_devices_in_use, AudioDevicesInUse};
 use super::asio_driver;
 use super::buffer_sizes::{legal_sizes, snap, BufferFacts, DUPLEX_BLOCK};
 use super::device_watch::{DeviceWatch, Kind, Wanted};
-use super::{sleep_unless, Backend, RunOutcome};
+use super::{sleep_unless, wait_unless, Backend, RunOutcome, Wake};
 use crate::midi::MidiResult;
 use crate::prelude::{
     AudioIOLayout, AuxiliaryBuffers, Buffer, MidiConfig, NoteEvent, Plugin, PluginNoteEvent,
@@ -248,6 +249,7 @@ impl<P: Plugin> Backend<P> for CpalMidir {
             // output spinning on an input ring buffer that will never fill up again).
             let parker = Parker::new();
             let unparker = parker.unparker().clone();
+            change::register_wake(unparker.clone());
 
             let mut _input_stream: Option<Stream> = None;
             let mut input_rb_consumer: Option<rtrb::Consumer<f32>> = None;
@@ -622,6 +624,7 @@ impl<P: Plugin> Backend<P> for CpalMidir {
                         || callback_stopped.load(Ordering::Acquire)
                         || should_stop.load(Ordering::SeqCst)
                         || device_returned.load(Ordering::Acquire)
+                        || audio_change_pending()
                     {
                         break;
                     }
@@ -701,14 +704,16 @@ impl<P: Plugin> Backend<P> for CpalMidir {
 
             // A stop requested by the process callback wins over a simultaneous stream error: the
             // plugin already decided to shut down, so the caller must not try to recover. Either
-            // kind of stop also wins over a device that came back at the same moment.
+            // kind of stop also wins over a requested change and over a device that came back at
+            // the same moment. A requested change wins over a failure: the stream is left for the
+            // configuration the user picked, not restarted where it was.
             let callback_stopped = callback_stopped.load(Ordering::Acquire);
-            if setup_failed || (stream_error.load(Ordering::Acquire) && !callback_stopped) {
+            let stopping = callback_stopped || should_stop.load(Ordering::SeqCst);
+            if !stopping && audio_change_pending() {
+                RunOutcome::Reconfigure
+            } else if setup_failed || (stream_error.load(Ordering::Acquire) && !callback_stopped) {
                 RunOutcome::StreamFailed
-            } else if !callback_stopped
-                && !should_stop.load(Ordering::SeqCst)
-                && device_returned.load(Ordering::Acquire)
-            {
+            } else if !stopping && device_returned.load(Ordering::Acquire) {
                 RunOutcome::DeviceReturned
             } else {
                 RunOutcome::Stopped
@@ -758,17 +763,19 @@ impl<P: Plugin> Backend<P> for CpalMidir {
     fn wait_for_device_change(&self, should_stop: &AtomicBool, max: Duration) {
         if self.duplex {
             // A7: listing loads every ASIO driver; wait instead and let `reinit()` try again.
-            sleep_unless(should_stop, max);
+            wait_unless(should_stop, max);
             return;
         }
         let Ok(host) = cpal::host_from_id(self.host_id) else {
-            sleep_unless(should_stop, max);
+            wait_unless(should_stop, max);
             return;
         };
         let before = device_names(&host);
         let deadline = Instant::now() + max;
         while Instant::now() < deadline {
-            if sleep_unless(should_stop, DEVICE_POLL_INTERVAL) || device_names(&host) != before {
+            if wait_unless(should_stop, DEVICE_POLL_INTERVAL) != Wake::Elapsed
+                || device_names(&host) != before
+            {
                 return;
             }
         }

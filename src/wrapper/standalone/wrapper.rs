@@ -11,10 +11,11 @@ use std::sync::Arc;
 use std::thread;
 use std::time::{Duration, Instant};
 
-use super::backend::{sleep_unless, Backend, RunOutcome};
+use super::backend::{wait_unless, Backend, RunOutcome, Wake};
+use super::change::{audio_change_pending, take_audio_change};
 use super::config::WrapperConfig;
 use super::context::{WrapperGuiContext, WrapperInitContext, WrapperProcessContext};
-use super::recovery::{Action, Recovery};
+use super::recovery::{next_step, Action, Recovery, Step};
 use crate::event_loop::{EventLoop, MainThreadExecutor, OsEventLoop};
 use crate::prelude::{
     AsyncExecutor, AudioIOLayout, BufferConfig, Editor, ParamFlags, ParamPtr, Params,
@@ -179,7 +180,8 @@ pub enum GuiTask {
     Resize(u32, u32),
     /// The close window. This will cause the application to terminate.
     Close,
-    /// Work that must happen on the GUI thread, see [`Backend::reinit_on_gui_thread()`].
+    /// Work that must happen on the GUI thread, see [`Backend::reinit_on_gui_thread()`] and
+    /// [`Backend::reconfigure_on_gui_thread()`].
     Run(Box<dyn FnOnce() + Send>),
 }
 
@@ -643,7 +645,9 @@ impl<P: Plugin, B: Backend<P>> Wrapper<P, B> {
     /// this recovers by reinitializing the backend — which stands the system default in for a
     /// requested device that is gone and moves back onto it when it returns — with interruptible
     /// backoff (see [`Recovery`]). The application never ends up without audio for good: when
-    /// nothing can be opened it waits for the audio hardware to change and tries again.
+    /// nothing can be opened it waits for the audio hardware to change and tries again. A
+    /// requested audio change (A16) ends the run, or any wait of the recovery, and the backend
+    /// reopens on it.
     fn run_audio_thread(
         self: Arc<Self>,
         should_terminate: Arc<AtomicBool>,
@@ -762,79 +766,144 @@ impl<P: Plugin, B: Backend<P>> Wrapper<P, B> {
             let action = match outcome {
                 // The plugin or the user asked to stop; same behavior as before the restart loop
                 RunOutcome::Stopped => break,
-                RunOutcome::StreamFailed => recovery.stream_failed(run_started.elapsed()),
-                RunOutcome::DeviceReturned => recovery.device_returned(),
+                RunOutcome::StreamFailed => Some(recovery.stream_failed(run_started.elapsed())),
+                RunOutcome::DeviceReturned => Some(recovery.device_returned()),
+                RunOutcome::Reconfigure => None,
             };
-            match action {
-                Action::Reinit { backoff } => {
-                    nih_error!("The audio stream died, attempting to recover in {backoff:?}");
-                    if sleep_unless(&should_terminate, backoff) {
-                        return;
-                    }
-                }
-                Action::ReinitNow => {
-                    nih_log!("A requested audio device is available again, switching to it");
-                }
-                Action::WaitForHardware => {
-                    if self.backend.borrow_mut().quarantine_requested() {
-                        nih_error!(
-                            "The audio stream keeps dying on a requested device; standing the \
-                             system default in and trying the device again later"
-                        );
-                    } else {
-                        nih_error!(
-                            "The audio stream keeps dying; waiting for the audio hardware to \
-                             change before trying again"
-                        );
-                        self.backend
-                            .borrow()
-                            .wait_for_device_change(&should_terminate, Recovery::HARDWARE_WAIT);
-                    }
-                }
-            }
+            let mut step = match action {
+                Some(action) => match self.pause_before_reopen(action, &should_terminate) {
+                    Some(step) => step,
+                    None => return,
+                },
+                None => Step::Reconfigure,
+            };
 
-            // Never `run()` on a backend whose devices are stale: reinitialize until it succeeds.
-            // A failure here (no output device at all, the audio API gone) is not a stream death;
+            // Never `run()` on a backend whose devices are stale: reopen until it succeeds. A
+            // failed reinit (no output device at all, the audio API gone) is not a stream death;
             // it waits for the hardware to change — capped, so a transient refusal is retried
-            // regardless — and tries again.
+            // regardless — and tries again. A change that opens nothing recovers the same way.
             loop {
                 if should_terminate.load(Ordering::SeqCst) {
                     return;
                 }
-                let Some(reinit) = self.reinit_backend(&gui_task_sender, &should_terminate) else {
-                    return;
-                };
-                match reinit {
-                    Ok(()) => {
-                        // The stream died mid-note; clear held voices and effect tails that
-                        // accumulated across the audio gap before the new stream starts.
-                        process_wrapper(|| self.plugin.lock().reset());
-                        nih_log!("Audio device reinitialized, resuming playback");
-                        break;
+                match step {
+                    Step::Reconfigure => {
+                        let Some(change) = take_audio_change() else {
+                            step = Step::Recover;
+                            continue;
+                        };
+                        let on_gui = self.backend.borrow().reconfigure_on_gui_thread(&change);
+                        let Some(reconfigure) = self.on_backend_thread(
+                            on_gui,
+                            &gui_task_sender,
+                            &should_terminate,
+                            move |backend| backend.reconfigure(change),
+                        ) else {
+                            return;
+                        };
+                        match reconfigure {
+                            Ok(()) => {
+                                self.after_reopen();
+                                // A switch the user made is not a failure.
+                                recovery = Recovery::new();
+                                nih_log!("Audio configuration changed, resuming playback");
+                                break;
+                            }
+                            Err(err) => {
+                                nih_error!(
+                                    "The audio change could not open anything, recovering: {err:#}"
+                                );
+                                step = Step::Recover;
+                            }
+                        }
                     }
-                    Err(err) => {
-                        nih_error!(
-                            "Could not reinitialize the audio backend, waiting for an audio \
-                             device change: {err:#}"
-                        );
-                        self.backend
-                            .borrow()
-                            .wait_for_device_change(&should_terminate, Recovery::HARDWARE_WAIT);
+                    Step::Recover => {
+                        let on_gui = self.backend.borrow().reinit_on_gui_thread();
+                        let Some(reinit) = self.on_backend_thread(
+                            on_gui,
+                            &gui_task_sender,
+                            &should_terminate,
+                            |backend| backend.reinit(),
+                        ) else {
+                            return;
+                        };
+                        match reinit {
+                            Ok(()) => {
+                                self.after_reopen();
+                                nih_log!("Audio device reinitialized, resuming playback");
+                                break;
+                            }
+                            Err(err) => {
+                                nih_error!(
+                                    "Could not reinitialize the audio backend, waiting for an \
+                                     audio device change: {err:#}"
+                                );
+                                self.backend.borrow().wait_for_device_change(
+                                    &should_terminate,
+                                    Recovery::HARDWARE_WAIT,
+                                );
+                                step = next_step(audio_change_pending());
+                            }
+                        }
                     }
                 }
             }
         }
     }
 
-    /// [`Backend::reinit()`], on the GUI thread when the backend needs it there; this thread waits
-    /// for the result. `None` when the application quits meanwhile.
-    fn reinit_backend(
+    /// Wait out what `action` asks for before the backend reopens. `None` when the application
+    /// quits meanwhile.
+    fn pause_before_reopen(&self, action: Action, should_terminate: &AtomicBool) -> Option<Step> {
+        match action {
+            Action::Reinit { backoff } => {
+                nih_error!("The audio stream died, attempting to recover in {backoff:?}");
+                if wait_unless(should_terminate, backoff) == Wake::Stop {
+                    return None;
+                }
+            }
+            Action::ReinitNow => {
+                nih_log!("A requested audio device is available again, switching to it");
+            }
+            Action::WaitForHardware => {
+                if self.backend.borrow_mut().quarantine_requested() {
+                    nih_error!(
+                        "The audio stream keeps dying on a requested device; standing the system \
+                         default in and trying the device again later"
+                    );
+                } else {
+                    nih_error!(
+                        "The audio stream keeps dying; waiting for the audio hardware to change \
+                         before trying again"
+                    );
+                    self.backend
+                        .borrow()
+                        .wait_for_device_change(should_terminate, Recovery::HARDWARE_WAIT);
+                }
+            }
+        }
+        Some(next_step(audio_change_pending()))
+    }
+
+    /// Runs on the audio thread after every successful reopen, before the next `run()`: no
+    /// callback is running.
+    fn after_reopen(&self) {
+        // The stream stopped mid-note; clear held voices and effect tails that accumulated across
+        // the audio gap before the new stream starts.
+        process_wrapper(|| self.plugin.lock().reset());
+    }
+
+    /// Run `job` on the backend: on the GUI thread when `on_gui` (see
+    /// [`Backend::reinit_on_gui_thread()`]), with this thread waiting for the result, otherwise
+    /// right here. `None` when the application quits meanwhile.
+    fn on_backend_thread(
         self: &Arc<Self>,
+        on_gui: bool,
         gui_task_sender: &channel::Sender<GuiTask>,
         should_terminate: &AtomicBool,
+        job: impl FnOnce(&mut B) -> anyhow::Result<()> + Send + 'static,
     ) -> Option<anyhow::Result<()>> {
-        if !self.backend.borrow().reinit_on_gui_thread() {
-            return Some(self.backend.borrow_mut().reinit());
+        if !on_gui {
+            return Some(job(&mut self.backend.borrow_mut()));
         }
         let (reply_sender, reply) = channel::bounded(1);
         // Weak: a job still queued when the window closes must not keep the wrapper, and so the
@@ -842,7 +911,13 @@ impl<P: Plugin, B: Backend<P>> Wrapper<P, B> {
         let wrapper = Arc::downgrade(self);
         let job = Box::new(move || {
             if let Some(wrapper) = wrapper.upgrade() {
-                let _ = reply_sender.send(wrapper.backend.borrow_mut().reinit());
+                // The borrow ends before the reply: the audio thread borrows the backend as soon
+                // as it hears back.
+                let result = {
+                    let mut backend = wrapper.backend.borrow_mut();
+                    job(&mut backend)
+                };
+                let _ = reply_sender.send(result);
             }
         });
         gui_task_sender.send(GuiTask::Run(job)).ok()?;

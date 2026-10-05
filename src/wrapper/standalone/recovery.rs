@@ -3,9 +3,27 @@
 //! A stream that dies right after starting is a device that cannot hold a stream; one that dies after
 //! a long healthy run is an unplug. The first is retried a few times with growing pauses, then left
 //! alone until the hardware changes; the second always gets a fresh budget. A device that came back
-//! is not a failure at all.
+//! is not a failure at all. A change the app asks for (A16) comes before all of this: it cuts every
+//! wait short and is opened instead of the configuration that failed.
 
 use std::time::Duration;
+
+/// What the audio thread does next after a run ended or a reopen failed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Step {
+    /// Open the change the app asked for.
+    Reconfigure,
+    /// Reopen the configuration the stream was on.
+    Recover,
+}
+
+pub(crate) fn next_step(change_pending: bool) -> Step {
+    if change_pending {
+        Step::Reconfigure
+    } else {
+        Step::Recover
+    }
+}
 
 /// What the audio thread does before the next `reinit()`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -108,6 +126,12 @@ mod tests {
                 backoff: Recovery::BACKOFF[1]
             }
         );
+    }
+
+    #[test]
+    fn a_pending_change_comes_before_recovering_the_old_configuration() {
+        assert_eq!(next_step(true), Step::Reconfigure);
+        assert_eq!(next_step(false), Step::Recover);
     }
 
     #[test]
