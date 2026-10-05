@@ -767,7 +767,12 @@ impl<P: Plugin, B: Backend<P>> Wrapper<P, B> {
                 // The plugin or the user asked to stop; same behavior as before the restart loop
                 RunOutcome::Stopped => break,
                 RunOutcome::StreamFailed => Some(recovery.stream_failed(run_started.elapsed())),
-                RunOutcome::DeviceReturned => Some(recovery.device_returned()),
+                RunOutcome::DeviceReturned => {
+                    nih_log!("A requested audio device is available again, switching to it");
+                    Some(recovery.device_returned())
+                }
+                // The backend logged why.
+                RunOutcome::Restart => Some(recovery.restart()),
                 RunOutcome::Reconfigure => None,
             };
             let mut step = match action {
@@ -861,9 +866,7 @@ impl<P: Plugin, B: Backend<P>> Wrapper<P, B> {
                     return None;
                 }
             }
-            Action::ReinitNow => {
-                nih_log!("A requested audio device is available again, switching to it");
-            }
+            Action::ReinitNow => {}
             Action::WaitForHardware => {
                 if self.backend.borrow_mut().quarantine_requested() {
                     nih_error!(

@@ -31,6 +31,10 @@ pub enum RunOutcome {
     /// A requested device that another device was standing in for is available again. Not a
     /// failure: the caller should [`Backend::reinit()`] and [`Backend::run()`] again to move onto it.
     DeviceReturned,
+    /// The device asked for, or changed in a way that needs, a fresh stream: an ASIO driver's reset
+    /// request, an output whose rate moved (A17). Not a failure: the caller should
+    /// [`Backend::reinit()`] and [`Backend::run()`] again at once.
+    Restart,
     /// A change was requested (A16): the caller takes it and calls [`Backend::reconfigure()`].
     Reconfigure,
 }
@@ -94,8 +98,8 @@ pub trait Backend<P: Plugin>: 'static + Send + Sync {
     ) -> RunOutcome;
 
     /// Rebuild the backend's audio resources after [`run()`][Self::run()] returned
-    /// [`RunOutcome::StreamFailed`], so that `run()` can be called again. Backends that don't
-    /// support recovery return an error.
+    /// [`RunOutcome::StreamFailed`], [`RunOutcome::DeviceReturned`] or [`RunOutcome::Restart`], so
+    /// that `run()` can be called again. Backends that don't support recovery return an error.
     fn reinit(&mut self) -> anyhow::Result<()> {
         anyhow::bail!("Audio device recovery is not supported by this backend")
     }

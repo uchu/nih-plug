@@ -3,8 +3,9 @@
 //! A stream that dies right after starting is a device that cannot hold a stream; one that dies after
 //! a long healthy run is an unplug. The first is retried a few times with growing pauses, then left
 //! alone until the hardware changes; the second always gets a fresh budget. A device that came back
-//! is not a failure at all. A change the app asks for (A16) comes before all of this: it cuts every
-//! wait short and is opened instead of the configuration that failed.
+//! is not a failure at all, nor is a fresh stream the device needs (an ASIO reset request, a rate
+//! that moved): neither spends the budget. A change the app asks for (A16) comes before all of
+//! this: it cuts every wait short and is opened instead of the configuration that failed.
 
 use std::time::Duration;
 
@@ -30,7 +31,8 @@ pub(crate) fn next_step(change_pending: bool) -> Step {
 pub enum Action {
     /// Pause, then reinitialise: the stream died.
     Reinit { backoff: Duration },
-    /// Reinitialise at once: a requested device is available again.
+    /// Reinitialise at once, not after a failure: a requested device is available again, or the
+    /// device needs a fresh stream.
     ReinitNow,
     /// The stream keeps dying: wait for the audio hardware to change before starting over.
     WaitForHardware,
@@ -74,6 +76,12 @@ impl Recovery {
 
     /// The backend reported that a requested device is back.
     pub fn device_returned(&mut self) -> Action {
+        Action::ReinitNow
+    }
+
+    /// The device needs a fresh stream. Says nothing about whether it can hold one, so the budget
+    /// is left as it is.
+    pub fn restart(&mut self) -> Action {
         Action::ReinitNow
     }
 }
@@ -132,6 +140,34 @@ mod tests {
     fn a_pending_change_comes_before_recovering_the_old_configuration() {
         assert_eq!(next_step(true), Step::Reconfigure);
         assert_eq!(next_step(false), Step::Recover);
+    }
+
+    #[test]
+    fn a_restart_the_device_needs_never_touches_the_failure_budget() {
+        let mut recovery = Recovery::new();
+        recovery.stream_failed(quick());
+        recovery.stream_failed(quick());
+        assert_eq!(recovery.restart(), Action::ReinitNow);
+        assert_eq!(
+            recovery.stream_failed(quick()),
+            Action::Reinit {
+                backoff: Recovery::BACKOFF[2]
+            }
+        );
+    }
+
+    #[test]
+    fn restarts_in_a_row_never_wait_for_hardware() {
+        let mut recovery = Recovery::new();
+        for _ in 0..=Recovery::MAX_RETRIES {
+            assert_eq!(recovery.restart(), Action::ReinitNow);
+        }
+        assert_eq!(
+            recovery.stream_failed(quick()),
+            Action::Reinit {
+                backoff: Recovery::BACKOFF[0]
+            }
+        );
     }
 
     #[test]

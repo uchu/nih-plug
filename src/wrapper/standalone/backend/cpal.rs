@@ -628,6 +628,8 @@ impl<P: Plugin> Backend<P> for CpalMidir {
                 }
             };
 
+            // Why the device needs a fresh stream, when it does: not a failure.
+            let mut restart: Option<String> = None;
             // Wait for the audio thread to exit. The timeout also lets this thread notice a stop
             // request when the device is already dead and no further callbacks or stream errors
             // will arrive (previously that combination made the application hang on exit).
@@ -655,8 +657,7 @@ impl<P: Plugin> Backend<P> for CpalMidir {
                         break;
                     }
                     if self.duplex && reset_requested.load(Ordering::Acquire) {
-                        nih_log!("The ASIO driver asked for a reset, restarting the stream");
-                        stream_error.store(true, Ordering::Release);
+                        restart = Some("the ASIO driver asked for a reset".to_string());
                         break;
                     }
                     // An output whose rate moves (a control panel, an external clock, Audio MIDI
@@ -666,18 +667,12 @@ impl<P: Plugin> Backend<P> for CpalMidir {
                         if let Some(rate) = output_rate_now(self.duplex, output)
                             .filter(|&rate| rate_moved(rate, self.config.sample_rate))
                         {
-                            if self.duplex {
-                                nih_log!(
-                                    "The ASIO driver now runs at {rate} Hz, restarting the stream \
-                                     to follow it"
-                                );
+                            let device = if self.duplex {
+                                "the ASIO driver"
                             } else {
-                                nih_log!(
-                                    "The output device now runs at {rate} Hz, restarting the \
-                                     stream to follow it"
-                                );
-                            }
-                            stream_error.store(true, Ordering::Release);
+                                "the output device"
+                            };
+                            restart = Some(format!("{device} now runs at {rate} Hz"));
                             break;
                         }
                     }
@@ -726,22 +721,19 @@ impl<P: Plugin> Backend<P> for CpalMidir {
                     }
                 });
 
-            // A stop requested by the process callback wins over a simultaneous stream error: the
-            // plugin already decided to shut down, so the caller must not try to recover. Either
-            // kind of stop also wins over a requested change and over a device that came back at
-            // the same moment. A requested change wins over a failure: the stream is left for the
-            // configuration the user picked, not restarted where it was.
-            let callback_stopped = callback_stopped.load(Ordering::Acquire);
-            let stopping = callback_stopped || should_stop.load(Ordering::SeqCst);
-            if !stopping && audio_change_pending() {
-                RunOutcome::Reconfigure
-            } else if setup_failed || (stream_error.load(Ordering::Acquire) && !callback_stopped) {
-                RunOutcome::StreamFailed
-            } else if !stopping && device_returned.load(Ordering::Acquire) {
-                RunOutcome::DeviceReturned
-            } else {
-                RunOutcome::Stopped
+            let outcome = run_outcome(RunEnd {
+                callback_stopped: callback_stopped.load(Ordering::Acquire),
+                stop_requested: should_stop.load(Ordering::SeqCst),
+                change_pending: audio_change_pending(),
+                setup_failed,
+                stream_error: stream_error.load(Ordering::Acquire),
+                device_returned: device_returned.load(Ordering::Acquire),
+                restart: restart.is_some(),
+            });
+            if let (RunOutcome::Restart, Some(reason)) = (outcome, restart) {
+                nih_log!("Restarting the audio stream: {reason}");
             }
+            outcome
         })
     }
 
@@ -1030,6 +1022,42 @@ fn rate_check_applies(duplex: bool, host_id: cpal::HostId) -> bool {
     {
         let _ = host_id;
         duplex
+    }
+}
+
+/// What a run saw by the time its streams were down.
+#[derive(Clone, Copy, Debug, Default)]
+struct RunEnd {
+    callback_stopped: bool,
+    stop_requested: bool,
+    change_pending: bool,
+    /// The output stream was not built or did not start.
+    setup_failed: bool,
+    /// A stream's error callback fired, or the duplex driver fell silent.
+    stream_error: bool,
+    device_returned: bool,
+    /// The device needs a fresh stream: an ASIO reset request, a rate that moved.
+    restart: bool,
+}
+
+/// Why a run ended when several reasons met in one wake. A stop by the process callback wins over
+/// all of them: the plugin already decided to shut down, so the caller must not try to recover.
+/// Either kind of stop wins over a change, a returned device and a restart. A requested change wins
+/// over a failure: the stream is left for the configuration the user picked, not restarted where
+/// it was. A failure wins over a returned device and a restart, so the failure budget sees it, and
+/// a returned device over a restart, as the reopen that moves onto it is a fresh stream too.
+fn run_outcome(end: RunEnd) -> RunOutcome {
+    let stopping = end.callback_stopped || end.stop_requested;
+    if !stopping && end.change_pending {
+        RunOutcome::Reconfigure
+    } else if end.setup_failed || (end.stream_error && !end.callback_stopped) {
+        RunOutcome::StreamFailed
+    } else if !stopping && end.device_returned {
+        RunOutcome::DeviceReturned
+    } else if !stopping && end.restart {
+        RunOutcome::Restart
+    } else {
+        RunOutcome::Stopped
     }
 }
 
@@ -2902,6 +2930,67 @@ mod tests {
     #[test]
     fn a_shared_wasapi_stream_leaves_a_rate_change_to_its_error_callback() {
         assert!(!rate_check_applies(false, cpal::HostId::Wasapi));
+    }
+
+    #[test]
+    fn a_restart_the_device_needs_is_its_own_outcome() {
+        let end = RunEnd {
+            restart: true,
+            ..RunEnd::default()
+        };
+        assert_eq!(run_outcome(end), RunOutcome::Restart);
+    }
+
+    #[test]
+    fn a_stop_wins_over_every_other_reason() {
+        let everything = RunEnd {
+            callback_stopped: true,
+            stop_requested: true,
+            change_pending: true,
+            stream_error: true,
+            device_returned: true,
+            restart: true,
+            ..RunEnd::default()
+        };
+        assert_eq!(run_outcome(everything), RunOutcome::Stopped);
+        let requested_stop = RunEnd {
+            stop_requested: true,
+            device_returned: true,
+            restart: true,
+            ..RunEnd::default()
+        };
+        assert_eq!(run_outcome(requested_stop), RunOutcome::Stopped);
+    }
+
+    #[test]
+    fn a_change_then_a_failure_then_a_returned_device_win_over_a_restart() {
+        let restart = RunEnd {
+            restart: true,
+            device_returned: true,
+            ..RunEnd::default()
+        };
+        assert_eq!(run_outcome(restart), RunOutcome::DeviceReturned);
+        let failed = RunEnd {
+            stream_error: true,
+            ..restart
+        };
+        assert_eq!(run_outcome(failed), RunOutcome::StreamFailed);
+        let changed = RunEnd {
+            change_pending: true,
+            ..failed
+        };
+        assert_eq!(run_outcome(changed), RunOutcome::Reconfigure);
+    }
+
+    #[test]
+    fn a_stream_that_never_started_failed_whatever_else_happened() {
+        let end = RunEnd {
+            setup_failed: true,
+            callback_stopped: true,
+            restart: true,
+            ..RunEnd::default()
+        };
+        assert_eq!(run_outcome(end), RunOutcome::StreamFailed);
     }
 
     #[test]
