@@ -147,6 +147,13 @@ pub trait Backend<P: Plugin>: 'static + Send + Sync {
     fn reinit_on_gui_thread(&self) -> bool {
         false
     }
+
+    /// The (sample rate, plugin block) the stream that is open runs with, which the wrapper
+    /// follows after every reopen (A17). `None` when the backend cannot say, and the plugin keeps
+    /// the configuration it was initialized with.
+    fn stream_format(&self) -> Option<(f32, u32)> {
+        None
+    }
 }
 
 #[cfg(test)]

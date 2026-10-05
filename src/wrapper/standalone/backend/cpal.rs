@@ -642,16 +642,15 @@ impl<P: Plugin> Backend<P> for CpalMidir {
                         break;
                     }
                     // A driver whose rate moves (a control-panel or external clock change) may
-                    // keep calling back at the new rate; the restart sets it back (A6).
+                    // keep calling back at the new rate; the restart adopts it (A17).
                     if self.duplex && rate_checked.elapsed() >= DUPLEX_RATE_CHECK_INTERVAL {
                         rate_checked = Instant::now();
                         if let Some(rate) = asio_driver::driver_rate(&output.device)
                             .filter(|&rate| asio_driver::rate_moved(rate, self.config.sample_rate))
                         {
                             nih_log!(
-                                "The ASIO driver now runs at {rate} Hz, restarting the stream at \
-                                 the session's {} Hz",
-                                self.config.sample_rate
+                                "The ASIO driver now runs at {rate} Hz, restarting the stream to \
+                                 follow it"
                             );
                             stream_error.store(true, Ordering::Release);
                             break;
@@ -731,10 +730,8 @@ impl<P: Plugin> Backend<P> for CpalMidir {
             self.output = None;
         }
 
-        // Unlike `new()` there is deliberately no native-sample-rate override here:
-        // `self.config.sample_rate` is the rate the plugin and the wrapper were initialized with
-        // and cannot change mid-session. For a default-device selection this picks up whatever
-        // the *current* system default is.
+        // The session takes the reopened output's rate, which the wrapper follows (A17). For a
+        // default-device selection this picks up whatever the *current* system default is.
         let previous = self.in_use.lock().clone();
         let device_use = self.device_use();
         self.config.period_size = open_period(self.duplex, self.shared_period);
@@ -814,6 +811,10 @@ impl<P: Plugin> Backend<P> for CpalMidir {
         self.quarantined = quarantined;
         true
     }
+
+    fn stream_format(&self) -> Option<(f32, u32)> {
+        Some((self.config.sample_rate, self.config.period_size))
+    }
 }
 
 fn main_channels(channels: Option<NonZeroU32>) -> usize {
@@ -887,13 +888,12 @@ fn single_device_duplex(host_id: cpal::HostId) -> bool {
 /// How a start or restart treats the output device's own settings.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum DeviceUse {
-    /// WASAPI and CoreAudio: the period as requested, and a restart refuses a device that runs at
-    /// another rate rather than switch it under other applications.
+    /// WASAPI and CoreAudio: the period as requested.
     Shared,
     /// A single-device duplex driver (ASIO), which this application alone uses: the stream runs
-    /// the driver's preferred size, or `requested` snapped to a size the driver accepts, and a
-    /// restart sets the driver back to the session's rate (A6, A13). The plugin processes blocks
-    /// of up to `DUPLEX_BLOCK`, so no driver period up to it is split (A14).
+    /// the driver's preferred size, or `requested` snapped to a size the driver accepts (A13). The
+    /// plugin processes blocks of up to `DUPLEX_BLOCK`, so no driver period up to it is split
+    /// (A14).
     Duplex { requested: Option<u32> },
 }
 
@@ -929,6 +929,12 @@ pub(crate) fn open_period(duplex: bool, shared_period: u32) -> u32 {
     } else {
         shared_period
     }
+}
+
+/// The session's rate after an open: the output device's own rate when it reports one. A device
+/// is never asked for another rate (A17).
+pub(crate) fn adopted_rate(current: Option<cpal::SampleRate>, session: f32) -> f32 {
+    current.map_or(session, |rate| rate.0 as f32)
 }
 
 /// The `-b` id of the host a stream runs on, as the app names drivers.
@@ -1227,7 +1233,6 @@ impl CpalMidir {
                 &wanted.name,
                 &self.config,
                 main_channels(self.audio_io_layout.main_output_channels),
-                Start::Restart,
                 self.device_use(),
             ),
             Kind::Input => Self::resolve_input(
@@ -1235,7 +1240,6 @@ impl CpalMidir {
                 &wanted.name,
                 &self.config,
                 main_channels(self.audio_io_layout.main_input_channels),
-                Start::Restart,
             ),
         };
         match resolved {
@@ -1304,11 +1308,10 @@ impl CpalMidir {
     /// device in `quarantined` — its stream kept dying — is refused without an attempt. Only "no
     /// output device at all" is an error.
     ///
-    /// A start takes the opened output's native sample rate into `config`, so CoreAudio and WASAPI
-    /// do no internal conversion; a restart keeps the session's rate, which the plugin cannot
-    /// change, and never switches a requested device's own rate to reach it. What the stream is
-    /// open on is published either way, so the host application's status is true even while
-    /// nothing could be opened.
+    /// Every start and restart takes the opened output's own sample rate into `config`, so
+    /// CoreAudio and WASAPI do no internal conversion and no device is switched to another rate
+    /// (A17); an input must already run at it. What the stream is open on is published either
+    /// way, so the host application's status is true even while nothing could be opened.
     ///
     /// A duplex driver carries both directions: the stream runs the driver's period while the
     /// plugin's block in `config` becomes `DUPLEX_BLOCK` (A13, A14), the sizes the driver accepts
@@ -1350,7 +1353,6 @@ impl CpalMidir {
                         asio_driver::load(&name).into_iter().collect(),
                         config,
                         output_channels,
-                        start,
                         device_use,
                     ) {
                         Resolved::Open(device) => Ok((name, device)),
@@ -1386,7 +1388,7 @@ impl CpalMidir {
             let resolved = if quarantined.contains(&wanted) {
                 Resolved::Refused(anyhow::anyhow!("the stream on it keeps dying"))
             } else {
-                Self::resolve_output(host, &name, config, output_channels, start, device_use)
+                Self::resolve_output(host, &name, config, output_channels, device_use)
             };
             match resolved {
                 Resolved::Open(device) => {
@@ -1418,7 +1420,7 @@ impl CpalMidir {
                     .default_output_device()
                     .context("No default audio output device available")
                     .and_then(|device| {
-                        Self::open_output(device, config, output_channels, start, device_use)
+                        Self::open_output(device, config, output_channels, device_use)
                     });
                 match result {
                     Ok(output) => output,
@@ -1449,9 +1451,11 @@ impl CpalMidir {
         in_use.opened = output.device.name().ok();
         in_use.sample_rate = Some(output.config.sample_rate.0);
         in_use.buffer_size = stream_period(&output).map(|period| period as u32);
-        if start == Start::Launch {
-            config.sample_rate = output.config.sample_rate.0 as f32;
+        let rate = output.config.sample_rate.0 as f32;
+        if start == Start::Restart && (rate - config.sample_rate).abs() > 0.1 {
+            nih_log!("The output runs at {rate} Hz; the session follows it");
         }
+        config.sample_rate = rate;
         if let (true, cpal::BufferSize::Fixed(period)) = (duplex, output.config.buffer_size) {
             nih_log!("The driver runs a period of {period} samples");
             config.period_size = DUPLEX_BLOCK;
@@ -1502,7 +1506,7 @@ impl CpalMidir {
             let resolved = if quarantined.contains(&wanted) {
                 Resolved::Refused(anyhow::anyhow!("the stream on it keeps dying"))
             } else {
-                Self::resolve_input(host, &name, config, input_channels, start)
+                Self::resolve_input(host, &name, config, input_channels)
             };
             match resolved {
                 Resolved::Open(device) => {
@@ -1573,14 +1577,12 @@ impl CpalMidir {
         name: &str,
         config: &WrapperConfig,
         num_output_channels: usize,
-        start: Start,
         device_use: DeviceUse,
     ) -> Resolved {
         Self::resolve_output_among(
             Self::devices_named(host, name),
             config,
             num_output_channels,
-            start,
             device_use,
         )
     }
@@ -1589,7 +1591,6 @@ impl CpalMidir {
         devices: Vec<Device>,
         config: &WrapperConfig,
         num_output_channels: usize,
-        start: Start,
         device_use: DeviceUse,
     ) -> Resolved {
         let candidates = devices
@@ -1602,11 +1603,7 @@ impl CpalMidir {
             })
             .collect();
         Self::resolve(candidates, |device| {
-            if start == Start::Restart && device_use == DeviceUse::Shared {
-                let current = device.default_output_config().ok().map(|c| c.sample_rate());
-                Self::runs_at_session_rate(current, config)?;
-            }
-            Self::open_output(device, config, num_output_channels, start, device_use)
+            Self::open_output(device, config, num_output_channels, device_use)
         })
     }
 
@@ -1615,7 +1612,6 @@ impl CpalMidir {
         name: &str,
         config: &WrapperConfig,
         num_input_channels: usize,
-        start: Start,
     ) -> Resolved {
         let candidates = Self::devices_named(host, name)
             .into_iter()
@@ -1627,17 +1623,15 @@ impl CpalMidir {
             })
             .collect();
         Self::resolve(candidates, |device| {
-            if start == Start::Restart {
-                let current = device.default_input_config().ok().map(|c| c.sample_rate());
-                Self::runs_at_session_rate(current, config)?;
-            }
+            let current = device.default_input_config().ok().map(|c| c.sample_rate());
+            Self::runs_at_session_rate(current, config)?;
             Self::build_input_cpal_device(device, config, num_input_channels)
         })
     }
 
-    /// A requested device that comes back mid-session has to run at the session's rate already.
-    /// Opening it at another rate would switch the device — system-wide on CoreAudio — under any
-    /// other application using it, so it is refused instead, with the reason.
+    /// An input has to run at the session's rate, which the output sets (A17); there is no
+    /// resampler. Opening it at another rate would switch the device — system-wide on CoreAudio —
+    /// under any other application using it, so it is refused instead, with the reason.
     fn runs_at_session_rate(
         current: Option<cpal::SampleRate>,
         config: &WrapperConfig,
@@ -1657,33 +1651,22 @@ impl CpalMidir {
         Ok(())
     }
 
-    /// The output configuration `device` runs the stream with: at its own native rate on a start
-    /// (the rate the session then adopts), at the session's rate on a restart. A duplex driver's
-    /// period comes from its buffer facts (`duplex_period`); a driver whose facts cannot be read
-    /// or are unusable is refused before cpal is asked for a stream (A12).
+    /// The output configuration `device` runs the stream with, at its own current rate on every
+    /// start: the rate the session then adopts (A17). A duplex driver's period comes from its
+    /// buffer facts (`duplex_period`); a driver whose facts cannot be read or are unusable is
+    /// refused before cpal is asked for a stream (A12).
     fn open_output(
         device: Device,
         config: &WrapperConfig,
         num_output_channels: usize,
-        start: Start,
         device_use: DeviceUse,
     ) -> Result<CpalDevice> {
-        let current = match (start, device_use) {
-            (Start::Restart, DeviceUse::Shared) => None,
-            _ => device.default_output_config().ok(),
-        };
+        let current = device
+            .default_output_config()
+            .ok()
+            .map(|current| current.sample_rate());
         let mut config = config.clone();
-        if let Some(current) = &current {
-            let driver_rate = current.sample_rate().0 as f32;
-            match start {
-                Start::Launch => config.sample_rate = driver_rate,
-                Start::Restart if (driver_rate - config.sample_rate).abs() > 0.1 => nih_log!(
-                    "The ASIO driver runs at {driver_rate} Hz; asking it for the session's {} Hz",
-                    config.sample_rate
-                ),
-                Start::Restart => {}
-            }
-        }
+        config.sample_rate = adopted_rate(current, config.sample_rate);
         if let DeviceUse::Duplex { requested } = device_use {
             let facts = match asio_driver::buffer_facts(&device) {
                 Some(facts) => facts?,
@@ -2296,6 +2279,7 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+    use clap::Parser;
 
     fn through_the_backend(device: &[f32], device_channels: usize, frames: usize) -> Vec<Vec<f32>> {
         let mut ring = Vec::new();
@@ -2548,5 +2532,17 @@ mod tests {
             started_capture(Ok::<u8, &str>(7), queued, refused_on_the_stream_thread),
             None
         );
+    }
+
+    #[test]
+    fn an_output_at_another_rate_is_adopted_and_an_input_at_another_rate_refused() {
+        assert_eq!(
+            adopted_rate(Some(cpal::SampleRate(44_100)), 48_000.0),
+            44_100.0
+        );
+        assert_eq!(adopted_rate(None, 48_000.0), 48_000.0);
+        let mut config = WrapperConfig::parse_from(["standalone", "-b", "dummy"]);
+        config.sample_rate = 44_100.0;
+        assert!(CpalMidir::runs_at_session_rate(Some(cpal::SampleRate(48_000)), &config).is_err());
     }
 }

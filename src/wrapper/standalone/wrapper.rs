@@ -67,9 +67,12 @@ pub struct Wrapper<P: Plugin, B: Backend<P>> {
     /// deserialization.
     param_id_to_ptr: HashMap<String, ParamPtr>,
 
-    /// The bus and buffer configurations are static for the standalone target.
+    /// The bus configuration is static for the standalone target.
     audio_io_layout: AudioIOLayout,
-    buffer_config: BufferConfig,
+    /// The plugin's sample rate (`f32` bits) and largest block, see [`Self::buffer_config()`].
+    /// They follow the stream: [`Self::after_reopen()`] re-initializes the plugin when it moves.
+    sample_rate: AtomicU32,
+    max_buffer_size: AtomicU32,
 
     /// Parameter changes that have been output by the GUI that have not yet been set in the plugin.
     /// This queue will be flushed at the end of every processing cycle, just like in the plugin
@@ -316,13 +319,8 @@ impl<P: Plugin, B: Backend<P>> Wrapper<P, B> {
                 .collect(),
 
             audio_io_layout,
-            buffer_config: BufferConfig {
-                sample_rate: config.sample_rate,
-                min_buffer_size: None,
-                max_buffer_size: config.period_size,
-                // TODO: Detect JACK freewheeling and report it here
-                process_mode: ProcessMode::Realtime,
-            },
+            sample_rate: AtomicU32::new(config.sample_rate.to_bits()),
+            max_buffer_size: AtomicU32::new(config.period_size),
             config,
 
             unprocessed_param_changes: ArrayQueue::new(EVENT_QUEUE_CAPACITY),
@@ -361,15 +359,16 @@ impl<P: Plugin, B: Backend<P>> Wrapper<P, B> {
             .map(|editor| Arc::new(Mutex::new(editor)));
 
         // Before initializing the plugin, make sure all smoothers are set the the default values
+        let buffer_config = wrapper.buffer_config();
         for param in wrapper.param_id_to_ptr.values() {
-            unsafe { param.update_smoother(wrapper.buffer_config.sample_rate, true) };
+            unsafe { param.update_smoother(buffer_config.sample_rate, true) };
         }
 
         {
             let mut plugin = wrapper.plugin.lock();
             if !plugin.initialize(
                 &wrapper.audio_io_layout,
-                &wrapper.buffer_config,
+                &buffer_config,
                 &mut wrapper.make_init_context(),
             ) {
                 return Err(WrapperError::InitializationFailed);
@@ -550,7 +549,7 @@ impl<P: Plugin, B: Backend<P>> Wrapper<P, B> {
             return;
         }
 
-        let sample_rate = self.buffer_config.sample_rate;
+        let sample_rate = self.buffer_config().sample_rate;
         while let Some((param_ptr, normalized_value)) = self.unprocessed_param_changes.pop() {
             if unsafe { param_ptr.set_normalized_value(normalized_value) } {
                 unsafe { param_ptr.update_smoother(sample_rate, true) };
@@ -687,7 +686,7 @@ impl<P: Plugin, B: Backend<P>> Wrapper<P, B> {
                                 return false;
                             }
 
-                            let sample_rate = this.buffer_config.sample_rate;
+                            let sample_rate = this.buffer_config().sample_rate;
                             {
                                 let mut plugin = this.plugin.lock();
                                 if let ProcessStatus::Error(err) = plugin.process(
@@ -885,11 +884,57 @@ impl<P: Plugin, B: Backend<P>> Wrapper<P, B> {
     }
 
     /// Runs on the audio thread after every successful reopen, before the next `run()`: no
-    /// callback is running.
+    /// callback is running. A stream at another rate, or with a larger block than the plugin was
+    /// initialized for, re-initializes the plugin (A17); any other reopen only resets it.
     fn after_reopen(&self) {
+        let current = self.buffer_config();
+        // Not in the `if let`: the backend stays unborrowed while the plugin re-initializes.
+        let stream = self.backend.borrow().stream_format();
+        if let Some(stream) = stream {
+            if needs_reinit((current.sample_rate, current.max_buffer_size), stream) {
+                self.reinitialize_plugin(stream);
+                return;
+            }
+        }
         // The stream stopped mid-note; clear held voices and effect tails that accumulated across
         // the audio gap before the new stream starts.
         process_wrapper(|| self.plugin.lock().reset());
+    }
+
+    /// The path a host takes on a rate change, in [`Self::new()`]'s order: smoothers, then
+    /// `initialize()`, then `reset()`. The block only ever grows, so no buffer the plugin sized
+    /// for an earlier stream is ever too small.
+    fn reinitialize_plugin(&self, (sample_rate, block): (f32, u32)) {
+        nih_log!("The stream runs at {sample_rate} Hz now, re-initializing the plug-in");
+        self.sample_rate
+            .store(sample_rate.to_bits(), Ordering::Release);
+        self.max_buffer_size.store(
+            block.max(self.max_buffer_size.load(Ordering::Acquire)),
+            Ordering::Release,
+        );
+        for param in self.param_id_to_ptr.values() {
+            unsafe { param.update_smoother(sample_rate, true) };
+        }
+
+        let config = self.buffer_config();
+        // Dropped after the `plugin` lock, as in `set_state_inner()`
+        let mut init_context = self.make_init_context();
+        let mut plugin = self.plugin.lock();
+        if !plugin.initialize(&self.audio_io_layout, &config, &mut init_context) {
+            nih_error!("The plug-in failed to re-initialize at {sample_rate} Hz");
+        }
+        process_wrapper(|| plugin.reset());
+    }
+
+    /// The plugin's current buffer configuration.
+    fn buffer_config(&self) -> BufferConfig {
+        BufferConfig {
+            sample_rate: f32::from_bits(self.sample_rate.load(Ordering::Acquire)),
+            min_buffer_size: None,
+            max_buffer_size: self.max_buffer_size.load(Ordering::Acquire),
+            // TODO: Detect JACK freewheeling and report it here
+            process_mode: ProcessMode::Realtime,
+        }
     }
 
     /// Run `job` on the backend: on the GUI thread when `on_gui` (see
@@ -975,12 +1020,13 @@ impl<P: Plugin, B: Backend<P>> Wrapper<P, B> {
         //        supports runtime preset loading. `state::deserialize_object()` normally never
         //        allocates, but if the plugin has persistent non-parameter data then its
         //        `deserialize_fields()` implementation may still allocate.
+        let buffer_config = self.buffer_config();
         let mut success = permit_alloc(|| unsafe {
             state::deserialize_object::<P>(
                 state,
                 self.params.clone(),
                 |param_id| self.param_id_to_ptr.get(param_id).copied(),
-                Some(&self.buffer_config),
+                Some(&buffer_config),
             )
         });
         if !success {
@@ -996,11 +1042,7 @@ impl<P: Plugin, B: Backend<P>> Wrapper<P, B> {
 
             // See above
             success = permit_alloc(|| {
-                plugin.initialize(
-                    &self.audio_io_layout,
-                    &self.buffer_config,
-                    &mut init_context,
-                )
+                plugin.initialize(&self.audio_io_layout, &buffer_config, &mut init_context)
             });
             if success {
                 process_wrapper(|| plugin.reset());
@@ -1022,5 +1064,24 @@ impl<P: Plugin, B: Backend<P>> Wrapper<P, B> {
         self.request_resize();
 
         success
+    }
+}
+
+/// Whether a stream running `stream` (sample rate, plugin block) needs the plugin re-initialized
+/// from `current`: another rate, or a block larger than the plugin was initialized for.
+pub(crate) fn needs_reinit(current: (f32, u32), stream: (f32, u32)) -> bool {
+    (stream.0 - current.0).abs() > 0.1 || stream.1 > current.1
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_new_rate_or_a_larger_block_needs_a_reinit_and_nothing_else_does() {
+        assert!(!needs_reinit((48_000.0, 8192), (48_000.0, 8192)));
+        assert!(!needs_reinit((48_000.0, 8192), (48_000.05, 256)));
+        assert!(needs_reinit((48_000.0, 8192), (44_100.0, 8192)));
+        assert!(needs_reinit((48_000.0, 512), (48_000.0, 1024)));
     }
 }

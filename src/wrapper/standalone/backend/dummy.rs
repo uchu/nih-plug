@@ -192,6 +192,10 @@ impl<P: Plugin> Backend<P> for Dummy {
     fn reconfigure(&mut self, _change: AudioChange) -> anyhow::Result<()> {
         Ok(())
     }
+
+    fn stream_format(&self) -> Option<(f32, u32)> {
+        Some((self.config.sample_rate, self.config.period_size))
+    }
 }
 
 impl Dummy {
