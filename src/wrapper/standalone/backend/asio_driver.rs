@@ -114,12 +114,6 @@ pub(crate) fn buffer_facts(_device: &Device) -> Option<anyhow::Result<BufferFact
     None
 }
 
-/// A driver that keeps streaming at another rate leaves the plugin processing at the session's
-/// rate on hardware running at a different one.
-pub(crate) fn rate_moved(driver_rate: f64, session_rate: f32) -> bool {
-    (driver_rate - session_rate as f64).abs() > 0.1
-}
-
 /// Stop the driver. Dropping a cpal ASIO stream only removes its callback, and a running driver
 /// keeps replaying its last two periods with nothing writing them; ASIOStop returns after the
 /// last buffer switch, so the hardware is quiet until the driver is released or started again.
@@ -166,17 +160,4 @@ pub(crate) fn load(name: &str) -> Option<Device> {
 #[cfg(not(all(target_os = "windows", feature = "asio")))]
 pub(crate) fn load(_name: &str) -> Option<Device> {
     None
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn a_rate_change_is_anything_past_a_tenth_of_a_hertz() {
-        assert!(!rate_moved(48_000.0, 48_000.0));
-        assert!(!rate_moved(48_000.05, 48_000.0));
-        assert!(rate_moved(44_100.0, 48_000.0));
-        assert!(rate_moved(96_000.0, 48_000.0));
-    }
 }

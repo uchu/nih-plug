@@ -630,6 +630,7 @@ impl<P: Plugin> Backend<P> for CpalMidir {
             if !setup_failed {
                 // The first callback gets the whole timeout
                 liveness.stamp();
+                let check_rate = rate_check_applies(self.duplex, self.host_id);
                 let mut rate_checked = Instant::now();
                 loop {
                     parker.park_timeout(Duration::from_millis(100));
@@ -654,17 +655,24 @@ impl<P: Plugin> Backend<P> for CpalMidir {
                         stream_error.store(true, Ordering::Release);
                         break;
                     }
-                    // A driver whose rate moves (a control-panel or external clock change) may
-                    // keep calling back at the new rate; the restart adopts it (A17).
-                    if self.duplex && rate_checked.elapsed() >= DUPLEX_RATE_CHECK_INTERVAL {
+                    // An output whose rate moves (a control panel, an external clock, Audio MIDI
+                    // Setup) may keep calling back; the restart adopts the new rate (A17).
+                    if check_rate && rate_checked.elapsed() >= RATE_CHECK_INTERVAL {
                         rate_checked = Instant::now();
-                        if let Some(rate) = asio_driver::driver_rate(&output.device)
-                            .filter(|&rate| asio_driver::rate_moved(rate, self.config.sample_rate))
+                        if let Some(rate) = output_rate_now(self.duplex, &output.device)
+                            .filter(|&rate| rate_moved(rate, self.config.sample_rate))
                         {
-                            nih_log!(
-                                "The ASIO driver now runs at {rate} Hz, restarting the stream to \
-                                 follow it"
-                            );
+                            if self.duplex {
+                                nih_log!(
+                                    "The ASIO driver now runs at {rate} Hz, restarting the stream \
+                                     to follow it"
+                                );
+                            } else {
+                                nih_log!(
+                                    "The output device now runs at {rate} Hz, restarting the \
+                                     stream to follow it"
+                                );
+                            }
                             stream_error.store(true, Ordering::Release);
                             break;
                         }
@@ -1000,6 +1008,40 @@ pub(crate) fn adopted_rate(current: Option<cpal::SampleRate>, session: f32) -> f
     current.map_or(session, |rate| rate.0 as f32)
 }
 
+/// An output that keeps streaming at another rate leaves the plugin processing at the session's
+/// rate on hardware running at a different one.
+pub(crate) fn rate_moved(device_rate: f64, session_rate: f32) -> bool {
+    (device_rate - session_rate as f64).abs() > 0.1
+}
+
+/// Whether a running stream polls its output's rate. An ASIO driver keeps calling back at its new
+/// rate and the CoreAudio HAL converts a device's new rate silently, so neither ends the stream; a
+/// WASAPI mix-format change fails the stream through its error callback (A17).
+fn rate_check_applies(duplex: bool, host_id: cpal::HostId) -> bool {
+    #[cfg(target_os = "macos")]
+    {
+        duplex || host_id == cpal::HostId::CoreAudio
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = host_id;
+        duplex
+    }
+}
+
+/// The output's rate right now. On a shared host this is the read `open_output` adopts, so a
+/// restart always settles on the rate that ended the run. `None` when the device does not answer.
+fn output_rate_now(duplex: bool, device: &Device) -> Option<f64> {
+    if duplex {
+        asio_driver::driver_rate(device)
+    } else {
+        device
+            .default_output_config()
+            .ok()
+            .map(|current| current.sample_rate().0 as f64)
+    }
+}
+
 /// The `-b` id of the host a stream runs on, as the app names drivers.
 pub(crate) fn backend_id(host_id: cpal::HostId) -> String {
     match host_id.name() {
@@ -1025,8 +1067,9 @@ pub(crate) fn duplex_input_channels(wanted: u16, available: &[u16]) -> Option<u1
 /// No error callback ever fires on ASIO (cpal ignores it), so silence is the signal (A6).
 const DUPLEX_LIVENESS_TIMEOUT_MS: u64 = 2000;
 
-/// How often a running duplex stream reads the driver's rate.
-const DUPLEX_RATE_CHECK_INTERVAL: Duration = Duration::from_secs(1);
+/// How often a running stream reads its output's rate, where `rate_check_applies`. cpal's
+/// CoreAudio read instantiates a HAL output unit: tens of milliseconds on this waiting thread.
+const RATE_CHECK_INTERVAL: Duration = Duration::from_secs(1);
 
 pub(crate) fn liveness_expired(now_ms: u64, last_ms: u64) -> bool {
     now_ms.saturating_sub(last_ms) > DUPLEX_LIVENESS_TIMEOUT_MS
@@ -2804,5 +2847,30 @@ mod tests {
         let mut config = WrapperConfig::parse_from(["standalone", "-b", "dummy"]);
         config.sample_rate = 44_100.0;
         assert!(CpalMidir::runs_at_session_rate(Some(cpal::SampleRate(48_000)), &config).is_err());
+    }
+
+    #[test]
+    fn a_rate_change_is_anything_past_a_tenth_of_a_hertz() {
+        assert!(!rate_moved(48_000.0, 48_000.0));
+        assert!(!rate_moved(48_000.05, 48_000.0));
+        assert!(rate_moved(44_100.0, 48_000.0));
+        assert!(rate_moved(96_000.0, 48_000.0));
+    }
+
+    #[test]
+    fn a_duplex_stream_always_watches_its_rate() {
+        assert!(rate_check_applies(true, cpal::default_host().id()));
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn a_shared_coreaudio_stream_watches_its_output_rate() {
+        assert!(rate_check_applies(false, cpal::HostId::CoreAudio));
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn a_shared_wasapi_stream_leaves_a_rate_change_to_its_error_callback() {
+        assert!(!rate_check_applies(false, cpal::HostId::Wasapi));
     }
 }
