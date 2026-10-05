@@ -18,8 +18,8 @@ use std::thread::ScopedJoinHandle;
 use std::time::{Duration, Instant};
 
 use self::target::{
-    first_that_opens, reconfigure_start, refused_pick, stands_in_default, target_of, touches_asio,
-    Target,
+    first_that_opens, host_id_for, reconfigure_start, refused_pick, stands_in_default, switch_plan,
+    target_of, touches_asio, SwitchPlan, Target,
 };
 use super::super::change::{self, audio_change_pending, AudioChange};
 use super::super::config::{WrapperConfig, DEFAULT_PERIOD_SIZE};
@@ -51,11 +51,13 @@ const PROBE_FIRST_CALLBACK: Duration = Duration::from_secs(1);
 pub struct CpalMidir {
     config: WrapperConfig,
     audio_io_layout: AudioIOLayout,
-    /// Needed to re-select devices in `reinit()` after the audio stream died.
+    /// Needed to re-select devices in `reinit()` after the audio stream died. This, `host` and
+    /// `duplex` belong to the configuration that runs: a switch to another host replaces all three
+    /// (A18).
     host_id: cpal::HostId,
     /// The host the devices were opened through, kept for `reinit()`. An ASIO host enumerates only
-    /// at launch: its enumeration loads every driver in turn, so a duplex restart loads its one
-    /// driver by name instead (A7).
+    /// when it opens, at launch or on a switch to it: its enumeration loads every driver in turn,
+    /// so a duplex restart loads its one driver by name instead (A7).
     host: cpal::Host,
     /// A single-device duplex host, see `single_device_duplex`.
     duplex: bool,
@@ -755,19 +757,19 @@ impl<P: Plugin> Backend<P> for CpalMidir {
         Ok(())
     }
 
-    /// A change on the host that runs (a host change is not supported yet). A shared host opens
-    /// the picked devices as a launch does, the system default standing in for one that does not
-    /// open, and keeps the choice even when nothing opens. On ASIO a picked driver that does not
-    /// load or open brings the previous driver back, with the pick published as refused; the
-    /// error only when that one does not open either.
+    /// A change on the host that runs, or a switch to another host (`switch_host`). A shared host
+    /// opens the picked devices as a launch does, the system default standing in for one that
+    /// does not open, and keeps the choice even when nothing opens. On ASIO a picked driver that
+    /// does not load or open brings the previous driver back, with the pick published as refused;
+    /// the error only when that one does not open either.
     fn reconfigure(&mut self, change: AudioChange) -> Result<()> {
         let current = self.current_target();
         let next = target_of(&current, &change);
-        if next.driver != current.driver {
-            anyhow::bail!("switching the audio driver is not supported yet");
-        }
         // A pick is a fresh choice: the watch starts over and nothing is held against a device.
         self.quarantined.clear();
+        if next.driver != current.driver {
+            return self.switch_host(&current, &next);
+        }
         let previous = self.in_use.lock().clone();
         let previous_period = self.period_request;
         self.release_driver();
@@ -795,7 +797,7 @@ impl<P: Plugin> Backend<P> for CpalMidir {
             Err(err) if self.duplex => {
                 nih_error!("The ASIO change did not open, reopening the previous driver: {err:#}");
                 self.period_request = previous_period;
-                self.reopen_previous(previous, refused_pick(&change))
+                self.reopen_previous(previous, refused_pick(&change), None)
             }
             Err(err) => {
                 // Recovery keeps opening the choice, the default standing in once one exists.
@@ -899,11 +901,12 @@ pub(crate) fn dedupe_names(names: Vec<String>) -> Vec<String> {
     out
 }
 
-/// The output and input lists to publish (spec A3). A duplex (ASIO) host is listed once, at
-/// launch, before any driver is loaded; the input list IS the output list, since a driver is both
-/// and a second listing would load every driver again. A restart and a live change carry `listed`
-/// (the launch lists) over for the same reason. WASAPI and CoreAudio are never listed here: the
-/// default path never listed devices, and a full listing costs seconds on CoreAudio.
+/// The output and input lists to publish (spec A3). A duplex (ASIO) host is listed once, when it
+/// opens (at launch, or on a switch to it), before any driver is loaded; the input list IS the
+/// output list, since a driver is both and a second listing would load every driver again. A
+/// restart and a live change carry `listed` (those lists) over for the same reason. WASAPI and
+/// CoreAudio are never listed here: the default path never listed devices, and a full listing
+/// costs seconds on CoreAudio.
 fn device_lists(
     start: Start,
     duplex: bool,
@@ -1317,21 +1320,25 @@ impl CpalMidir {
         asio_driver::set_driver_open(self.duplex);
     }
 
-    /// After an ASIO change that opened nothing: the driver the stream ran on, reloaded by name as
-    /// a restart does (A7), with `refused` published. An error when that driver does not open
-    /// either; `reinit()` then keeps trying it, refusal included.
+    /// After a change that opened nothing: what the stream ran on, reopened as a restart does (on
+    /// ASIO the driver, reloaded by name, A7), with the refusals published. An error when that
+    /// does not open either; `reinit()` then keeps trying it, refusals included.
     fn reopen_previous(
         &mut self,
         mut previous: AudioDevicesInUse,
-        refused: Option<String>,
+        refused_output: Option<String>,
+        refused_driver: Option<String>,
     ) -> Result<()> {
-        if refused.is_some() {
-            previous.refused_output = refused;
+        if refused_output.is_some() {
+            previous.refused_output = refused_output.clone();
+        }
+        if refused_driver.is_some() {
+            previous.refused_driver = refused_driver;
         }
         *self.in_use.lock() = previous.clone();
         let device_use = self.device_use();
         self.config.period_size = open_period(self.duplex, self.shared_period);
-        let opened = Self::open_devices(
+        let mut opened = Self::open_devices(
             &self.host,
             &mut self.config,
             &self.audio_io_layout,
@@ -1340,6 +1347,89 @@ impl CpalMidir {
             device_use,
             &previous,
         )?;
+        // A shared host's restart publishes its own devices' refusals; the ASIO driver a failed
+        // switch picked goes over them.
+        if refused_output.is_some() && opened.in_use.refused_output != refused_output {
+            opened.in_use.refused_output = refused_output;
+            publish_audio_devices_in_use(opened.in_use.clone());
+        }
+        self.hold(opened);
+        Ok(())
+    }
+
+    /// A switch to another host (A18). Every handle on the host the stream leaves goes first, so
+    /// an ASIO driver is released before another host opens. The new host opens as a launch
+    /// would, its lists taken afresh, and a shared one stands the system default in. On ASIO the
+    /// picked driver, or for "First available" the first listed one that opens, loads by name;
+    /// nothing stands in for it. A switch that opens nothing reopens the host it left with the
+    /// switch published as refused, and errs only when that does not open either.
+    fn switch_host(&mut self, current: &Target, next: &Target) -> Result<()> {
+        let previous = self.in_use.lock().clone();
+        asio_driver::set_driver_open(false);
+        self.input = None;
+        self.output = None;
+
+        let Err(err) = self.open_host(next) else {
+            return Ok(());
+        };
+        let SwitchPlan::RevertTo(left) = switch_plan(&current.driver, &next.driver, false) else {
+            return Err(err);
+        };
+        nih_error!(
+            "The audio driver '{}' opened nothing, reopening '{left}': {err:#}",
+            next.driver
+        );
+        let picked = next
+            .output
+            .clone()
+            .filter(|_| host_id_for(&next.driver).is_some_and(single_device_duplex));
+        self.reopen_previous(previous, picked, Some(next.driver.clone()))
+    }
+
+    /// Open `next` on its own host and move the backend onto it. Nothing about the backend
+    /// changes unless it opens.
+    fn open_host(&mut self, next: &Target) -> Result<()> {
+        let id = host_id_for(&next.driver)
+            .with_context(|| format!("the audio driver '{}' is not available", next.driver))?;
+        let host = cpal::host_from_id(id)?;
+        let duplex = single_device_duplex(id);
+
+        let mut config = self.config.clone();
+        config.output_device = next.output.clone();
+        config.input_device = next.input.clone();
+        config.period_size = open_period(duplex, self.shared_period);
+        let device_use = if duplex {
+            DeviceUse::Duplex {
+                requested: next.period,
+            }
+        } else {
+            DeviceUse::Shared
+        };
+        // The one A3 listing of an ASIO host: every driver loads in turn, which is allowed here,
+        // on the GUI thread with no stream open.
+        let (outputs, inputs) = device_lists(Start::Launch, duplex, Default::default(), || {
+            names_of(host.output_devices().ok())
+        });
+        let listed = AudioDevicesInUse {
+            outputs,
+            inputs,
+            ..Default::default()
+        };
+        let opened = Self::open_devices(
+            &host,
+            &mut config,
+            &self.audio_io_layout,
+            Start::Reconfigure,
+            &[],
+            device_use,
+            &listed,
+        )?;
+
+        self.host_id = id;
+        self.host = host;
+        self.duplex = duplex;
+        self.config = config;
+        self.period_request = next.period;
         self.hold(opened);
         Ok(())
     }
@@ -1509,7 +1599,7 @@ impl CpalMidir {
     /// one.
     ///
     /// `previous` is what the stream was open on before a restart or a change; a launch passes the
-    /// default.
+    /// default, and a host switch only the new host's lists.
     fn open_devices(
         host: &cpal::Host,
         config: &mut WrapperConfig,
@@ -1529,6 +1619,12 @@ impl CpalMidir {
             inputs,
             duplex,
             driver: Some(backend_id(host.id())),
+            // A restart stays on the host a failed switch went back to.
+            refused_driver: if start == Start::Restart {
+                previous.refused_driver.clone()
+            } else {
+                None
+            },
             ..Default::default()
         };
         let mut opened = OpenedDevicesSoFar::default();

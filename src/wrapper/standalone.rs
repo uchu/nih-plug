@@ -31,7 +31,8 @@ pub struct AudioDevicesInUse {
     pub input: Option<String>,
     /// A requested output that is connected but could not open the session's stream. On ASIO, a
     /// driver the user picked that did not load or open while the previous one runs again, or
-    /// [`FIRST_AVAILABLE_REFUSED`].
+    /// [`FIRST_AVAILABLE_REFUSED`]. After a switch to ASIO that opened nothing (`refused_driver`),
+    /// the driver it picked by name, if it picked one.
     pub refused_output: Option<String>,
     /// A requested input that is connected but could not open the session's stream.
     pub refused_input: Option<String>,
@@ -50,6 +51,7 @@ pub struct AudioDevicesInUse {
     /// The host the stream runs on, by backend id: `"wasapi"`, `"asio"`, `"core-audio"`, `"alsa"`.
     pub driver: Option<String>,
     /// A driver, by backend id, that was asked for but opened nothing; the stream stayed on `driver`.
+    /// Kept through restarts; a device or driver change that opens clears it.
     pub refused_driver: Option<String>,
     /// The stream's sample rate in Hz, once an output is open.
     pub sample_rate: Option<u32>,

@@ -85,6 +85,25 @@ pub(super) fn refused_pick(change: &AudioChange) -> Option<String> {
     })
 }
 
+/// The host a switch leaves the stream on.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum SwitchPlan {
+    /// The host it switched to.
+    Keep,
+    /// The host it left, by backend id: a switch that opens nothing reopens it (A16, A18).
+    RevertTo(String),
+}
+
+/// What follows a switch from the host `from` to the host `to` that `opened` or not. A change
+/// that stays on one host is no switch and has nothing to go back to.
+pub(crate) fn switch_plan(from: &str, to: &str, opened: bool) -> SwitchPlan {
+    if opened || from == to {
+        SwitchPlan::Keep
+    } else {
+        SwitchPlan::RevertTo(from.to_string())
+    }
+}
+
 /// "First available": `names` in order, until `open` opens one. `open` lets go of a driver that
 /// does not open before the next one is tried, as the SDK holds one driver at a time.
 pub(super) fn first_that_opens<T>(
@@ -214,6 +233,18 @@ mod tests {
             Some(FIRST_AVAILABLE_REFUSED)
         );
         assert_eq!(refused_pick(&pick(None)), None);
+    }
+
+    #[test]
+    fn a_host_switch_that_opens_nothing_reopens_the_previous_host() {
+        let plan = switch_plan("wasapi", "asio", false);
+        assert_eq!(plan, SwitchPlan::RevertTo("wasapi".into()));
+        assert_eq!(switch_plan("wasapi", "asio", true), SwitchPlan::Keep);
+        assert_eq!(switch_plan("asio", "wasapi", true), SwitchPlan::Keep);
+        assert_eq!(
+            switch_plan("asio", "wasapi", false),
+            SwitchPlan::RevertTo("asio".into())
+        );
     }
 
     #[test]
