@@ -7,6 +7,14 @@ use crossbeam::sync::Unparker;
 use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
 
+/// Whether the backend holds an opened ASIO driver: raised once a duplex open succeeded, lowered
+/// before that driver is released.
+static DRIVER_OPEN: AtomicBool = AtomicBool::new(false);
+
+pub(crate) fn set_driver_open(open: bool) {
+    DRIVER_OPEN.store(open, std::sync::atomic::Ordering::Release);
+}
+
 /// Stops listening for the driver's reset requests when dropped.
 pub(crate) struct ResetListener(Option<Box<dyn FnOnce() + Send>>);
 

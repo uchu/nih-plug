@@ -29,7 +29,9 @@ pub struct AudioDevicesInUse {
     /// The device audio input is read from. `None` is no capture: none was asked for, or the
     /// requested input is not connected or could not open.
     pub input: Option<String>,
-    /// A requested output that is connected but could not open the session's stream.
+    /// A requested output that is connected but could not open the session's stream. On ASIO, a
+    /// driver the user picked that did not load or open while the previous one runs again, or
+    /// [`FIRST_AVAILABLE_REFUSED`].
     pub refused_output: Option<String>,
     /// A requested input that is connected but could not open the session's stream.
     pub refused_input: Option<String>,
@@ -58,6 +60,11 @@ pub struct AudioDevicesInUse {
     /// The ASIO driver's preferred buffer size; `None` on other hosts.
     pub preferred_buffer_size: Option<u32>,
 }
+
+/// [`AudioDevicesInUse::refused_output`] when "First available" was picked on ASIO and no driver
+/// opened; the driver that ran before runs again. No driver name contains a NUL, so this never
+/// names a real one.
+pub const FIRST_AVAILABLE_REFUSED: &str = "\u{0}first-available";
 
 static AUDIO_DEVICES_IN_USE: RwLock<Option<AudioDevicesInUse>> = RwLock::new(None);
 
