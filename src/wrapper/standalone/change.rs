@@ -3,6 +3,7 @@
 
 use crossbeam::sync::Unparker;
 use parking_lot::Mutex;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use super::backend::asio_driver::driver_open;
 
@@ -12,6 +13,8 @@ static PENDING: Mutex<Option<AudioChange>> = Mutex::new(None);
 static WAKE: Mutex<Option<Unparker>> = Mutex::new(None);
 static GUI_RUNNER: Mutex<Option<GuiRunner>> = Mutex::new(None);
 static CONTROL_PANEL: Mutex<Option<fn()>> = Mutex::new(None);
+/// A control panel job is queued on the GUI thread or running there.
+static PANEL_PENDING: AtomicBool = AtomicBool::new(false);
 
 /// These slots are process-global and tests run in parallel: every test that touches one holds
 /// this.
@@ -109,9 +112,10 @@ pub fn register_asio_control_panel(open: fn()) {
 
 /// Open the ASIO driver's control panel on the GUI thread through the function given to
 /// [`register_asio_control_panel()`], without waiting for it. `false` when no ASIO driver is open,
-/// none was given, or the GUI thread does not take the job; a driver released before the job runs
-/// is not opened. A size or clock change made in the panel reaches the stream as the driver's
-/// reset request.
+/// none was given, the GUI thread does not take the job, or a panel job is already queued or
+/// open: the editor keeps taking clicks while a driver's modal panel is up, and a repeat would
+/// reopen the panel once it closes. A driver released before the job runs is not opened. A size
+/// or clock change made in the panel reaches the stream as the driver's reset request.
 pub fn open_asio_control_panel() -> bool {
     if !driver_open() {
         return false;
@@ -119,13 +123,28 @@ pub fn open_asio_control_panel() -> bool {
     let Some(open) = *CONTROL_PANEL.lock() else {
         return false;
     };
-    match GUI_RUNNER.lock().as_ref() {
-        Some(run) => run(Box::new(move || {
-            if driver_open() {
-                open();
-            }
-        })),
-        None => false,
+    let runner = GUI_RUNNER.lock();
+    let Some(run) = runner.as_ref() else {
+        return false;
+    };
+    if PANEL_PENDING.swap(true, Ordering::AcqRel) {
+        return false;
+    }
+    let pending = PanelPending;
+    run(Box::new(move || {
+        let _pending = pending;
+        if driver_open() {
+            open();
+        }
+    }))
+}
+
+/// Lowers [`PANEL_PENDING`] when the panel job is done with: run, refused or dropped unrun.
+struct PanelPending;
+
+impl Drop for PanelPending {
+    fn drop(&mut self) {
+        PANEL_PENDING.store(false, Ordering::Release);
     }
 }
 
@@ -184,6 +203,39 @@ mod tests {
         set_driver_open(false);
         jobs.try_recv().unwrap()();
         assert_eq!(PANELS_OPENED.load(Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn a_second_request_posts_nothing_until_the_first_panel_job_has_run() {
+        let _guard = TEST_LOCK.lock();
+        PANELS_OPENED.store(0, Ordering::SeqCst);
+        let jobs = queueing_gui();
+        register_asio_control_panel(open_panel);
+        set_driver_open(true);
+        assert!(open_asio_control_panel());
+        assert!(!open_asio_control_panel());
+        assert_eq!(jobs.len(), 1);
+        jobs.try_recv().unwrap()();
+        assert_eq!(PANELS_OPENED.load(Ordering::SeqCst), 1);
+        assert!(open_asio_control_panel());
+        jobs.try_recv().unwrap()();
+        assert_eq!(PANELS_OPENED.load(Ordering::SeqCst), 2);
+        set_driver_open(false);
+    }
+
+    #[test]
+    fn a_refused_or_dropped_panel_job_does_not_hold_back_the_next_request() {
+        let _guard = TEST_LOCK.lock();
+        register_asio_control_panel(open_panel);
+        set_driver_open(true);
+        register_gui_runner(Box::new(|_| false));
+        assert!(!open_asio_control_panel());
+        let jobs = queueing_gui();
+        assert!(open_asio_control_panel());
+        drop(jobs.try_recv().unwrap());
+        assert!(open_asio_control_panel());
+        jobs.try_recv().unwrap()();
+        set_driver_open(false);
     }
 
     #[test]
