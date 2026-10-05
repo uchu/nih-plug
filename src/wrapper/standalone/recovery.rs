@@ -5,8 +5,9 @@
 //! alone until the hardware changes; the second always gets a fresh budget. A device that came back
 //! is not a failure at all, nor is a fresh stream the device needs (an ASIO reset request, a rate
 //! that moved): neither spends the budget, unless the device asks again right after the last
-//! restart. A change the app asks for (A16) comes before all of this: it cuts every wait short
-//! and is opened instead of the configuration that failed.
+//! restart, and a long healthy run before one gives a fresh budget too. A change the app asks for
+//! (A16) comes before all of this: it cuts every wait short and is opened instead of the
+//! configuration that failed.
 
 use std::time::Duration;
 
@@ -84,10 +85,14 @@ impl Recovery {
         Action::ReinitNow
     }
 
-    /// The device needs a fresh stream after a run of `ran_for`. After `MIN_RESTART_RUN` that says
-    /// nothing about whether it can hold one, so the budget is left as it is; sooner, it is a
-    /// failure.
+    /// The device needs a fresh stream after a run of `ran_for`. A run of `STABLE_RUN` or longer
+    /// was healthy, so the budget starts fresh, as it does for a stream that dies after one. After
+    /// `MIN_RESTART_RUN` the restart says nothing about whether the device can hold a stream, so
+    /// the budget is left as it is; sooner, it is a failure.
     pub fn restart(&mut self, ran_for: Duration) -> Action {
+        if ran_for >= Self::STABLE_RUN {
+            self.failures = 0;
+        }
         if ran_for < Self::MIN_RESTART_RUN {
             self.stream_failed(ran_for)
         } else {
@@ -211,6 +216,20 @@ mod tests {
             assert_eq!(recovery.restart(quick()), Action::Reinit { backoff });
         }
         assert_eq!(recovery.restart(quick()), Action::WaitForHardware);
+    }
+
+    #[test]
+    fn a_healthy_run_before_a_quick_restart_starts_a_fresh_budget() {
+        let mut recovery = Recovery::new();
+        for _ in 0..=Recovery::MAX_RETRIES {
+            assert_eq!(recovery.restart(Recovery::STABLE_RUN), Action::ReinitNow);
+            assert_eq!(
+                recovery.restart(quick()),
+                Action::Reinit {
+                    backoff: Recovery::BACKOFF[0]
+                }
+            );
+        }
     }
 
     #[test]

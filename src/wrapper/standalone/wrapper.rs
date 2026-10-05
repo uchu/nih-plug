@@ -828,7 +828,7 @@ impl<P: Plugin, B: Backend<P>> Wrapper<P, B> {
                                 nih_error!(
                                     "The audio change could not open anything, recovering: {err:#}"
                                 );
-                                step = Step::Recover;
+                                step = next_step(audio_change_pending());
                             }
                         }
                     }
