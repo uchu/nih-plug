@@ -1,6 +1,6 @@
 use atomic_refcell::AtomicRefCell;
 use baseview::{EventStatus, Window, WindowHandler, WindowOpenOptions};
-use crossbeam::channel::{self, Sender};
+use crossbeam::channel::{self, RecvTimeoutError, Sender};
 use crossbeam::queue::ArrayQueue;
 use parking_lot::Mutex;
 use raw_window_handle::HasRawWindowHandle;
@@ -9,7 +9,7 @@ use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::thread;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use super::backend::{sleep_unless, Backend, RunOutcome};
 use super::config::WrapperConfig;
@@ -179,6 +179,8 @@ pub enum GuiTask {
     Resize(u32, u32),
     /// The close window. This will cause the application to terminate.
     Close,
+    /// Work that must happen on the GUI thread, see [`Backend::reinit_on_gui_thread()`].
+    Run(Box<dyn FnOnce() + Send>),
 }
 
 impl WindowHandler for WrapperWindowHandler {
@@ -194,6 +196,7 @@ impl WindowHandler for WrapperWindowHandler {
                     });
                 }
                 GuiTask::Close => window.close(),
+                GuiTask::Run(job) => job(),
             }
         }
     }
@@ -476,9 +479,14 @@ impl<P: Plugin, B: Backend<P>> Wrapper<P, B> {
             }
             None => {
                 // TODO: Properly block until SIGINT is received if the plugin does not have an editor
-                // TODO: Make sure to handle `GuiTask::Close` here as well
                 nih_log!("{} does not have a GUI, blocking indefinitely...", P::NAME);
-                std::thread::park();
+                while let Ok(task) = gui_task_receiver.recv() {
+                    match task {
+                        GuiTask::Resize(..) => (),
+                        GuiTask::Close => break,
+                        GuiTask::Run(job) => job(),
+                    }
+                }
             }
         }
 
@@ -793,7 +801,10 @@ impl<P: Plugin, B: Backend<P>> Wrapper<P, B> {
                 if should_terminate.load(Ordering::SeqCst) {
                     return;
                 }
-                match self.backend.borrow_mut().reinit() {
+                let Some(reinit) = self.reinit_backend(&gui_task_sender, &should_terminate) else {
+                    return;
+                };
+                match reinit {
                     Ok(()) => {
                         // The stream died mid-note; clear held voices and effect tails that
                         // accumulated across the audio gap before the new stream starts.
@@ -811,6 +822,35 @@ impl<P: Plugin, B: Backend<P>> Wrapper<P, B> {
                             .wait_for_device_change(&should_terminate, Recovery::HARDWARE_WAIT);
                     }
                 }
+            }
+        }
+    }
+
+    /// [`Backend::reinit()`], on the GUI thread when the backend needs it there; this thread waits
+    /// for the result. `None` when the application quits meanwhile.
+    fn reinit_backend(
+        self: &Arc<Self>,
+        gui_task_sender: &channel::Sender<GuiTask>,
+        should_terminate: &AtomicBool,
+    ) -> Option<anyhow::Result<()>> {
+        if !self.backend.borrow().reinit_on_gui_thread() {
+            return Some(self.backend.borrow_mut().reinit());
+        }
+        let (reply_sender, reply) = channel::bounded(1);
+        // Weak: a job still queued when the window closes must not keep the wrapper, and so the
+        // driver, alive past the application.
+        let wrapper = Arc::downgrade(self);
+        let job = Box::new(move || {
+            if let Some(wrapper) = wrapper.upgrade() {
+                let _ = reply_sender.send(wrapper.backend.borrow_mut().reinit());
+            }
+        });
+        gui_task_sender.send(GuiTask::Run(job)).ok()?;
+        loop {
+            match reply.recv_timeout(Duration::from_millis(50)) {
+                Ok(result) => return Some(result),
+                Err(RecvTimeoutError::Timeout) if !should_terminate.load(Ordering::SeqCst) => {}
+                Err(_) => return None,
             }
         }
     }

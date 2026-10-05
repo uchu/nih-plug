@@ -1,5 +1,5 @@
-//! What an open ASIO driver tells the host outside its buffer callbacks, and what reloading one
-//! needs (spec A6). Off ASIO every function here is inert.
+//! What an open ASIO driver tells the host outside its buffer callbacks, and stopping it at the
+//! end of a run (spec A6). Off ASIO every function here is inert.
 
 use cpal::Device;
 use crossbeam::sync::Unparker;
@@ -68,26 +68,20 @@ pub(crate) fn rate_moved(driver_rate: f64, session_rate: f32) -> bool {
     (driver_rate - session_rate as f64).abs() > 0.1
 }
 
-/// Initialise COM on the calling thread, once. Reloading a driver on the audio thread creates its
-/// COM object there (`asiolist.cpp` `CoCreateInstance`), and the SDK initialises COM only on the
-/// thread that first loaded a driver. Never uninitialised: the thread owns the driver until exit.
+/// Stop the driver. Dropping a cpal ASIO stream only removes its callback, and a running driver
+/// keeps replaying its last two periods with nothing writing them; ASIOStop returns after the
+/// last buffer switch, so the hardware is quiet until the driver is released or started again.
 #[cfg(all(target_os = "windows", feature = "asio"))]
-pub(crate) fn com_ready_on_this_thread() {
-    use std::cell::Cell;
-    use windows::Win32::System::Com::{CoInitializeEx, COINIT_APARTMENTTHREADED};
-
-    thread_local!(static TRIED: Cell<bool> = const { Cell::new(false) });
-    TRIED.with(|tried| {
-        if !tried.replace(true) {
-            // RPC_E_CHANGED_MODE leaves the thread in the multithreaded apartment, which serves
-            // CoCreateInstance all the same.
-            let _ = unsafe { CoInitializeEx(None, COINIT_APARTMENTTHREADED) };
+pub(crate) fn stop(device: &Device) {
+    if let cpal::platform::DeviceInner::Asio(asio) = device.as_inner() {
+        if let Err(err) = asio.driver.stop() {
+            nih_error!("Could not stop the ASIO driver: {err}");
         }
-    });
+    }
 }
 
 #[cfg(not(all(target_os = "windows", feature = "asio")))]
-pub(crate) fn com_ready_on_this_thread() {}
+pub(crate) fn stop(_device: &Device) {}
 
 #[cfg(test)]
 mod tests {

@@ -45,13 +45,14 @@ pub struct CpalMidir {
     audio_io_layout: AudioIOLayout,
     /// Needed to re-select devices in `reinit()` after the audio stream died.
     host_id: cpal::HostId,
-    /// The host the devices were opened through, kept for `reinit()`: an ASIO host remembers the
-    /// driver it loaded, so its enumeration hands that driver back and refuses every other one,
-    /// where a fresh host would load (and so unload) drivers under the running one (A7).
+    /// The host the devices were opened through, kept for `reinit()`: on ASIO it is the one
+    /// instance that knows which driver is loaded, so no second instance loads (and so unloads)
+    /// drivers under it (A7).
     host: cpal::Host,
     /// A single-device duplex host, see `single_device_duplex`.
     duplex: bool,
-    /// The period the wrapper was initialized with; a duplex restart never exceeds it.
+    /// The period the wrapper was initialized with. The plugin never processes a larger block; a
+    /// duplex stream's own period follows the driver's range and may exceed it (A6).
     launch_period: u32,
     /// Duplex input samples dropped on a full ring, and output samples silenced on an empty one.
     overflows: Arc<AtomicU64>,
@@ -651,6 +652,9 @@ impl<P: Plugin> Backend<P> for CpalMidir {
                 }
             }
             drop(output_stream);
+            if self.duplex {
+                asio_driver::stop(&output.device);
+            }
             watch_stop.store(true, Ordering::Release);
             if self.duplex {
                 let overflows = self.overflows.swap(0, Ordering::Relaxed);
@@ -708,23 +712,19 @@ impl<P: Plugin> Backend<P> for CpalMidir {
     fn reinit(&mut self) -> Result<()> {
         if self.duplex {
             // A real driver reset (asio.h kAsioResetRequest): every handle to the driver is
-            // released, so it runs ASIOStop, ASIODisposeBuffers and ASIOExit, and the resolution
-            // below loads it afresh with ASIOInit. A replugged interface or a new control-panel
+            // released, so it runs ASIODisposeBuffers and ASIOExit, and the resolution below loads
+            // the same driver afresh with ASIOInit. A replugged interface or a new control-panel
             // buffer size only takes effect that way. No stream is open, so loading drivers here
             // cannot disturb one (A7).
             self.input = None;
             self.output = None;
-            asio_driver::com_ready_on_this_thread();
         }
 
         // Unlike `new()` there is deliberately no native-sample-rate override here:
         // `self.config.sample_rate` is the rate the plugin and the wrapper were initialized with
         // and cannot change mid-session. For a default-device selection this picks up whatever
         // the *current* system default is.
-        let listed = {
-            let in_use = self.in_use.lock();
-            (in_use.outputs.clone(), in_use.inputs.clone())
-        };
+        let previous = self.in_use.lock().clone();
         let device_use = self.device_use();
         let opened = Self::open_devices(
             &self.host,
@@ -733,7 +733,7 @@ impl<P: Plugin> Backend<P> for CpalMidir {
             Start::Restart,
             &self.quarantined,
             device_use,
-            listed,
+            &previous,
         )?;
         self.quarantined.clear();
         self.output = Some(opened.output);
@@ -771,10 +771,14 @@ impl<P: Plugin> Backend<P> for CpalMidir {
         self.duplex
     }
 
+    fn reinit_on_gui_thread(&self) -> bool {
+        self.duplex
+    }
+
     fn quarantine_requested(&mut self) -> bool {
         if self.duplex {
-            // A restart can only land on the driver that is loaded, so there is nothing to stand
-            // in for it: wait for the hardware instead.
+            // A duplex restart reloads only the driver the stream was open on (A7), so there is
+            // nothing to stand in for it: wait for the hardware instead.
             return false;
         }
         let in_use = self.in_use.lock().clone();
@@ -824,9 +828,8 @@ pub(crate) fn dedupe_names(names: Vec<String>) -> Vec<String> {
 /// The output and input lists to publish (spec A3). A duplex (ASIO) host is listed once, at
 /// launch, before any driver is loaded; the input list IS the output list, since a driver is both
 /// and a second listing would load every driver again. A restart carries `listed` (the launch
-/// lists) over: the running driver stays loaded through it, and while one is loaded ASIO lists
-/// only that driver. WASAPI and CoreAudio are never listed here: the default path never listed
-/// devices, and a full listing costs seconds on CoreAudio.
+/// lists) over for the same reason. WASAPI and CoreAudio are never listed here: the default path
+/// never listed devices, and a full listing costs seconds on CoreAudio.
 fn device_lists(
     start: Start,
     duplex: bool,
@@ -1036,7 +1039,7 @@ impl CpalMidir {
             } else {
                 DeviceUse::Shared
             },
-            Default::default(),
+            &AudioDevicesInUse::default(),
         )?;
         if (config.sample_rate - requested_sample_rate).abs() > 0.1 {
             nih_log!(
@@ -1175,8 +1178,8 @@ impl CpalMidir {
         self.config.period_size
     }
 
-    /// How a restart opens the output: a duplex driver follows its range up to the period the
-    /// wrapper was initialized with.
+    /// How a restart opens the output: a duplex stream asks for the launch period clamped into
+    /// the driver's range, and the plugin processes blocks of at most the launch period.
     fn device_use(&self) -> DeviceUse {
         if self.duplex {
             DeviceUse::Duplex {
@@ -1284,7 +1287,11 @@ impl CpalMidir {
     ///
     /// A duplex driver carries both directions: its period is adopted into `config` (A4) and the
     /// input, when the plugin has one and the driver offers input channels, is the output's own
-    /// device (A2); `--input-device` plays no part.
+    /// device (A2); `--input-device` plays no part. A duplex restart reloads the driver `previous`
+    /// was open on and no other (A7): nothing stands in for it, so a driver that does not load is
+    /// an error and the caller retries it.
+    ///
+    /// `previous` is what the stream was open on before a restart; a launch passes the default.
     fn open_devices(
         host: &cpal::Host,
         config: &mut WrapperConfig,
@@ -1292,9 +1299,10 @@ impl CpalMidir {
         start: Start,
         quarantined: &[Wanted],
         device_use: DeviceUse,
-        listed: (Vec<String>, Vec<String>),
+        previous: &AudioDevicesInUse,
     ) -> Result<OpenedDevices> {
         let duplex = device_use.is_duplex();
+        let listed = (previous.outputs.clone(), previous.inputs.clone());
         let (outputs, inputs) = device_lists(start, duplex, listed, || {
             names_of(host.output_devices().ok())
         });
@@ -1308,7 +1316,43 @@ impl CpalMidir {
 
         let output_channels = main_channels(layout.main_output_channels);
         let mut output = None;
-        if let Some(name) = config.output_device.clone() {
+        if duplex && start == Start::Restart {
+            let reloaded = match previous.opened.clone() {
+                Some(name) => {
+                    match Self::resolve_output(
+                        host,
+                        &name,
+                        config,
+                        output_channels,
+                        start,
+                        device_use,
+                    ) {
+                        Resolved::Open(device) => Ok((name, device)),
+                        Resolved::Refused(err) => {
+                            Err(err.context(format!("The ASIO driver '{name}' does not open")))
+                        }
+                        Resolved::Absent => {
+                            Err(anyhow::anyhow!("The ASIO driver '{name}' does not load"))
+                        }
+                    }
+                }
+                None => Err(anyhow::anyhow!("No ASIO driver was open to reload")),
+            };
+            match reloaded {
+                Ok((name, device)) => {
+                    if config.output_device.as_deref() == Some(name.as_str()) {
+                        in_use.output = Some(name);
+                    } else {
+                        in_use.refused_output = previous.refused_output.clone();
+                    }
+                    output = Some(device);
+                }
+                Err(err) => {
+                    publish_audio_devices_in_use(in_use);
+                    return Err(err);
+                }
+            }
+        } else if let Some(name) = config.output_device.clone() {
             let wanted = Wanted {
                 name: name.clone(),
                 kind: Kind::Output,
@@ -1577,8 +1621,7 @@ impl CpalMidir {
             match start {
                 Start::Launch => config.sample_rate = driver_rate,
                 Start::Restart if (driver_rate - config.sample_rate).abs() > 0.1 => nih_log!(
-                    "ASIO driver rate changed to {driver_rate} Hz; restarting at the session rate \
-                     of {} Hz, the new rate applies at the next launch",
+                    "The ASIO driver runs at {driver_rate} Hz; asking it for the session's {} Hz",
                     config.sample_rate
                 ),
                 Start::Restart => {}

@@ -92,4 +92,11 @@ pub trait Backend<P: Plugin>: 'static + Send + Sync {
     fn callback_thread_is_driver_owned(&self) -> bool {
         false
     }
+
+    /// [`reinit()`][Self::reinit()] releases and reloads a driver that is a single-threaded COM
+    /// object (ASIO), so it must run on the thread that loaded it at launch: the GUI thread, which
+    /// pumps the messages such a driver relies on. The audio thread never pumps any.
+    fn reinit_on_gui_thread(&self) -> bool {
+        false
+    }
 }
