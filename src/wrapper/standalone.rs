@@ -6,7 +6,7 @@ use std::sync::RwLock;
 use clap::{CommandFactory, FromArgMatches};
 
 use self::backend::Backend;
-use self::config::WrapperConfig;
+use self::config::{WrapperConfig, DEFAULT_PERIOD_SIZE};
 use self::wrapper::{Wrapper, WrapperError};
 use super::util::setup_logger;
 use crate::prelude::Plugin;
@@ -42,6 +42,18 @@ pub struct AudioDevicesInUse {
     pub outputs: Vec<String>,
     /// Every input the host listed at launch; on a duplex host, the outputs.
     pub inputs: Vec<String>,
+    /// The host the stream runs on, by backend id: `"wasapi"`, `"asio"`, `"core-audio"`, `"alsa"`.
+    pub driver: Option<String>,
+    /// A driver, by backend id, that was asked for but opened nothing; the stream stayed on `driver`.
+    pub refused_driver: Option<String>,
+    /// The stream's sample rate in Hz, once an output is open.
+    pub sample_rate: Option<u32>,
+    /// The stream's period in samples, once an output is open.
+    pub buffer_size: Option<u32>,
+    /// Every buffer size the ASIO driver accepts; empty on other hosts.
+    pub buffer_sizes: Vec<u32>,
+    /// The ASIO driver's preferred buffer size; `None` on other hosts.
+    pub preferred_buffer_size: Option<u32>,
 }
 
 static AUDIO_DEVICES_IN_USE: RwLock<Option<AudioDevicesInUse>> = RwLock::new(None);
@@ -110,13 +122,14 @@ pub fn nih_export_standalone_with_args<P: Plugin, Args: IntoIterator<Item = Stri
     // Instead of parsing this directly, we need to take a bit of a roundabout approach to get the
     // plugin's name and vendor in here since they'd otherwise be taken from NIH-plug's own
     // `Cargo.toml` file.
-    let config = WrapperConfig::from_arg_matches(
+    let mut config = WrapperConfig::from_arg_matches(
         &WrapperConfig::command()
             .name(P::NAME)
             .author(P::VENDOR)
             .get_matches_from(args),
     )
     .unwrap_or_else(|err| err.exit());
+    config.resolve_period();
 
     match config.backend {
         config::BackendType::Auto => {
@@ -264,12 +277,15 @@ pub fn nih_export_standalone_with_args<P: Plugin, Args: IntoIterator<Item = Stri
 }
 
 /// The configuration another host stands in with: the requested devices are the first host's
-/// names (ASIO drivers), which mean nothing to it, so it opens the system default.
+/// names (ASIO drivers), which mean nothing to it, so it opens the system default, and the
+/// requested period was the ASIO driver's, so it runs the shared hosts' default.
 #[cfg_attr(not(all(target_os = "windows", feature = "asio")), allow(dead_code))]
 fn stand_in_config(config: &WrapperConfig) -> WrapperConfig {
     WrapperConfig {
         output_device: None,
         input_device: None,
+        period_request: None,
+        period_size: DEFAULT_PERIOD_SIZE,
         ..config.clone()
     }
 }
@@ -317,7 +333,7 @@ mod tests {
 
     #[test]
     fn a_stand_in_host_opens_the_system_default_and_keeps_the_rest() {
-        let config = WrapperConfig::parse_from([
+        let mut config = WrapperConfig::parse_from([
             "standalone",
             "-b",
             "dummy",
@@ -330,10 +346,12 @@ mod tests {
             "--midi-input",
             "Keystation",
         ]);
+        config.resolve_period();
         let stand_in = stand_in_config(&config);
         assert_eq!(stand_in.output_device, None);
         assert_eq!(stand_in.input_device, None);
-        assert_eq!(stand_in.period_size, 256);
+        assert_eq!(stand_in.period_request, None);
+        assert_eq!(stand_in.period_size, DEFAULT_PERIOD_SIZE);
         assert_eq!(stand_in.midi_input.as_deref(), Some("Keystation"));
     }
 }

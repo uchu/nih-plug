@@ -65,7 +65,6 @@ pub(crate) fn driver_rate(_device: &Device) -> Option<f64> {
 
 /// The loaded driver's buffer sizes. `None` off ASIO.
 #[cfg(all(target_os = "windows", feature = "asio"))]
-#[allow(dead_code)]
 pub(crate) fn buffer_facts(device: &Device) -> Option<anyhow::Result<BufferFacts>> {
     use std::os::raw::c_long;
 
@@ -99,7 +98,6 @@ pub(crate) fn buffer_facts(device: &Device) -> Option<anyhow::Result<BufferFacts
 }
 
 #[cfg(not(all(target_os = "windows", feature = "asio")))]
-#[allow(dead_code)]
 pub(crate) fn buffer_facts(_device: &Device) -> Option<anyhow::Result<BufferFacts>> {
     None
 }

@@ -1,7 +1,6 @@
 //! The buffer sizes an ASIO driver accepts, from what `ASIOGetBufferSize` reports (spec A12).
 
 /// What `ASIOGetBufferSize` reports for the loaded driver.
-#[cfg_attr(not(test), allow(dead_code))]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct BufferFacts {
     pub min: i32,
@@ -12,7 +11,6 @@ pub(crate) struct BufferFacts {
 
 /// The plug-in's block on a duplex host: its own headroom floor, so no driver period up to it is
 /// ever split and no buffer change re-initializes the plug-in (A14).
-#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) const DUPLEX_BLOCK: u32 = 8192;
 
 const LISTED: std::ops::RangeInclusive<u32> = 16..=DUPLEX_BLOCK;
@@ -20,7 +18,6 @@ const LISTED: std::ops::RangeInclusive<u32> = 16..=DUPLEX_BLOCK;
 /// Every size the driver accepts within 16 to [`DUPLEX_BLOCK`] samples, plus its preferred size
 /// wherever that lies. A negative granularity doubles from the minimum, a positive one steps by
 /// that many samples, and zero (or a minimum equal to the maximum) admits the preferred size only.
-#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) fn legal_sizes(facts: BufferFacts) -> anyhow::Result<Vec<u32>> {
     let BufferFacts {
         min,
@@ -62,7 +59,6 @@ pub(crate) fn legal_sizes(facts: BufferFacts) -> anyhow::Result<Vec<u32>> {
 }
 
 /// The legal size nearest `requested`, the larger one on a tie.
-#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) fn snap(requested: u32, legal: &[u32]) -> u32 {
     legal
         .iter()

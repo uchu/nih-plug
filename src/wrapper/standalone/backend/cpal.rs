@@ -17,9 +17,10 @@ use std::sync::Arc;
 use std::thread::ScopedJoinHandle;
 use std::time::{Duration, Instant};
 
-use super::super::config::WrapperConfig;
+use super::super::config::{WrapperConfig, DEFAULT_PERIOD_SIZE};
 use super::super::{publish_audio_devices_in_use, AudioDevicesInUse};
 use super::asio_driver;
+use super::buffer_sizes::{legal_sizes, snap, BufferFacts, DUPLEX_BLOCK};
 use super::device_watch::{DeviceWatch, Kind, Wanted};
 use super::{sleep_unless, Backend, RunOutcome};
 use crate::midi::MidiResult;
@@ -51,9 +52,11 @@ pub struct CpalMidir {
     host: cpal::Host,
     /// A single-device duplex host, see `single_device_duplex`.
     duplex: bool,
-    /// The period the wrapper was initialized with. The plugin never processes a larger block; a
-    /// duplex stream's own period follows the driver's range and may exceed it (A6).
-    launch_period: u32,
+    /// The buffer size the user chose for a duplex driver; `None` follows the driver (A13).
+    period_request: Option<u32>,
+    /// The period every open on a shared host runs: the requested one when the launch host is
+    /// shared, the default when it is duplex, whose request was the driver's.
+    shared_period: u32,
     /// Duplex input samples dropped on a full ring, and output samples silenced on an empty one.
     overflows: Arc<AtomicU64>,
     underruns: Arc<AtomicU64>,
@@ -256,12 +259,14 @@ impl<P: Plugin> Backend<P> for CpalMidir {
                     .main_input_channels
                     .map(NonZeroU32::get)
                     .unwrap_or(0) as usize;
-                let period = self.config.period_size as usize;
+                // The stream's period, not the plugin's block, which is DUPLEX_BLOCK on a duplex
+                // host (A14).
+                let period = stream_period(output).unwrap_or(self.config.period_size as usize);
                 // A duplex ring holds whole frames, so a full one drops whole frames, and two
                 // driver periods of them: the driver's period is fixed and both callbacks run once
-                // per period, input first (A5). That period can be larger than the plugin's block.
+                // per period, input first (A5).
                 let capacity = if self.duplex {
-                    ring_channels * stream_period(output).map_or(period, |p| p.max(period)) * 2
+                    ring_channels * period * 2
                 } else {
                     (output.config.channels as usize).max(ring_channels) * period
                 };
@@ -727,6 +732,7 @@ impl<P: Plugin> Backend<P> for CpalMidir {
         // the *current* system default is.
         let previous = self.in_use.lock().clone();
         let device_use = self.device_use();
+        self.config.period_size = open_period(self.duplex, self.shared_period);
         let opened = Self::open_devices(
             &self.host,
             &mut self.config,
@@ -877,36 +883,16 @@ enum DeviceUse {
     /// WASAPI and CoreAudio: the period as requested, and a restart refuses a device that runs at
     /// another rate rather than switch it under other applications.
     Shared,
-    /// A single-device duplex driver (ASIO), which this application alone uses: the stream's
-    /// period follows the driver's buffer-size range and a restart sets the driver back to the
-    /// session's rate (A4, A6). On a restart the plugin still processes blocks of at most
-    /// `period_cap`, the wrapper's `max_buffer_size`, so a driver period above it is split.
-    Duplex { period_cap: Option<u32> },
+    /// A single-device duplex driver (ASIO), which this application alone uses: the stream runs
+    /// the driver's preferred size, or `requested` snapped to a size the driver accepts, and a
+    /// restart sets the driver back to the session's rate (A6, A13). The plugin processes blocks
+    /// of up to `DUPLEX_BLOCK`, so no driver period up to it is split (A14).
+    Duplex { requested: Option<u32> },
 }
 
 impl DeviceUse {
     fn is_duplex(self) -> bool {
         matches!(self, DeviceUse::Duplex { .. })
-    }
-
-    /// The period the stream asks the device for.
-    fn period(self, requested: u32, range: cpal::SupportedBufferSize) -> u32 {
-        match self {
-            DeviceUse::Shared => requested,
-            DeviceUse::Duplex { period_cap } => {
-                clamp_period(period_cap.unwrap_or(requested), range)
-            }
-        }
-    }
-
-    /// The largest block the plugin processes for a stream period.
-    fn block(self, stream_period: u32) -> u32 {
-        match self {
-            DeviceUse::Duplex {
-                period_cap: Some(cap),
-            } => stream_period.min(cap),
-            _ => stream_period,
-        }
     }
 }
 
@@ -918,13 +904,36 @@ fn stream_period(device: &CpalDevice) -> Option<usize> {
     }
 }
 
-/// The period a duplex driver is asked for: the request clamped into the driver's range. cpal
-/// hands `BufferSize::Fixed` to ASIO checking only the maximum (A4).
-pub(crate) fn clamp_period(requested: u32, range: cpal::SupportedBufferSize) -> u32 {
-    match range {
-        cpal::SupportedBufferSize::Range { min, max } if min <= max => requested.clamp(min, max),
-        _ => requested,
+/// The period a duplex driver is asked for: the driver's preferred size, or the requested one
+/// snapped to a size the driver accepts (A12, A13).
+pub(crate) fn duplex_period(requested: Option<u32>, facts: BufferFacts) -> Result<u32> {
+    let legal = legal_sizes(facts)?;
+    Ok(match requested {
+        None => facts.preferred as u32,
+        Some(requested) => snap(requested, &legal),
+    })
+}
+
+/// The plugin's block for an open on a duplex or a shared host. A shared open never inherits the
+/// duplex block a previous open left in the configuration.
+pub(crate) fn open_period(duplex: bool, shared_period: u32) -> u32 {
+    if duplex {
+        DUPLEX_BLOCK
+    } else {
+        shared_period
     }
+}
+
+/// The `-b` id of the host a stream runs on, as the app names drivers.
+pub(crate) fn backend_id(host_id: cpal::HostId) -> String {
+    match host_id.name() {
+        "ASIO" => "asio",
+        "WASAPI" => "wasapi",
+        "CoreAudio" => "core-audio",
+        "ALSA" => "alsa",
+        other => other,
+    }
+    .to_string()
 }
 
 /// How many input channels to open on a duplex driver: the fewest that cover the plugin, else the
@@ -1029,6 +1038,12 @@ impl CpalMidir {
 
         let mut config = config;
         let requested_sample_rate = config.sample_rate;
+        let period_request = config.period_request;
+        let shared_period = if duplex {
+            DEFAULT_PERIOD_SIZE
+        } else {
+            config.period_size
+        };
         let opened = Self::open_devices(
             &host,
             &mut config,
@@ -1036,7 +1051,9 @@ impl CpalMidir {
             Start::Launch,
             &[],
             if duplex {
-                DeviceUse::Duplex { period_cap: None }
+                DeviceUse::Duplex {
+                    requested: period_request,
+                }
             } else {
                 DeviceUse::Shared
             },
@@ -1141,14 +1158,14 @@ impl CpalMidir {
             None => None,
         };
 
-        let launch_period = config.period_size;
         Ok(CpalMidir {
             config,
             audio_io_layout,
             host_id: cpal_host_id,
             host,
             duplex,
-            launch_period,
+            period_request,
+            shared_period,
             overflows: Arc::new(AtomicU64::new(0)),
             underruns: Arc::new(AtomicU64::new(0)),
 
@@ -1174,17 +1191,17 @@ impl CpalMidir {
         self.config.sample_rate
     }
 
-    /// The period the stream was opened with; a duplex driver may have clamped it.
+    /// The plugin's block: the stream's period on a shared host, `DUPLEX_BLOCK` on a duplex one.
     pub fn actual_period_size(&self) -> u32 {
         self.config.period_size
     }
 
-    /// How a restart opens the output: a duplex stream asks for the launch period clamped into
-    /// the driver's range, and the plugin processes blocks of at most the launch period.
+    /// How a restart opens the output: a duplex driver is asked for the user's buffer size, or
+    /// runs its own preferred one.
     fn device_use(&self) -> DeviceUse {
         if self.duplex {
             DeviceUse::Duplex {
-                period_cap: Some(self.launch_period),
+                requested: self.period_request,
             }
         } else {
             DeviceUse::Shared
@@ -1286,11 +1303,12 @@ impl CpalMidir {
     /// open on is published either way, so the host application's status is true even while
     /// nothing could be opened.
     ///
-    /// A duplex driver carries both directions: its period is adopted into `config` (A4) and the
-    /// input, when the plugin has one and the driver offers input channels, is the output's own
-    /// device (A2); `--input-device` plays no part. A duplex restart loads the driver `previous`
-    /// was open on by name, so no other driver is loaded (A7): nothing stands in for it, so a
-    /// driver that does not load is an error and the caller retries it.
+    /// A duplex driver carries both directions: the stream runs the driver's period while the
+    /// plugin's block in `config` becomes `DUPLEX_BLOCK` (A13, A14), the sizes the driver accepts
+    /// are published with it, and the input, when the plugin has one and the driver offers input
+    /// channels, is the output's own device (A2); `--input-device` plays no part. A duplex restart
+    /// loads the driver `previous` was open on by name, so no other driver is loaded (A7): nothing
+    /// stands in for it, so a driver that does not load is an error and the caller retries it.
     ///
     /// `previous` is what the stream was open on before a restart; a launch passes the default.
     fn open_devices(
@@ -1311,6 +1329,7 @@ impl CpalMidir {
             outputs,
             inputs,
             duplex,
+            driver: Some(backend_id(host.id())),
             ..Default::default()
         };
         let mut opened = OpenedDevicesSoFar::default();
@@ -1403,18 +1422,32 @@ impl CpalMidir {
                 }
             }
         };
+        // The loaded driver is still the output's and no stream runs yet, so this reads the
+        // same driver `open_output` sized the stream from (A12).
+        if let Some(facts) = duplex
+            .then(|| asio_driver::buffer_facts(&output.device))
+            .flatten()
+        {
+            match facts.and_then(|facts| Ok((legal_sizes(facts)?, facts.preferred as u32))) {
+                Ok((sizes, preferred)) => {
+                    in_use.buffer_sizes = sizes;
+                    in_use.preferred_buffer_size = Some(preferred);
+                }
+                Err(err) => {
+                    publish_audio_devices_in_use(in_use);
+                    return Err(err);
+                }
+            }
+        }
         in_use.opened = output.device.name().ok();
+        in_use.sample_rate = Some(output.config.sample_rate.0);
+        in_use.buffer_size = stream_period(&output).map(|period| period as u32);
         if start == Start::Launch {
             config.sample_rate = output.config.sample_rate.0 as f32;
         }
         if let (true, cpal::BufferSize::Fixed(period)) = (duplex, output.config.buffer_size) {
-            let block = device_use.block(period);
-            if period != config.period_size {
-                nih_log!(
-                    "The driver runs a period of {period} samples, processed in blocks of {block}"
-                );
-            }
-            config.period_size = block;
+            nih_log!("The driver runs a period of {period} samples");
+            config.period_size = DUPLEX_BLOCK;
         }
 
         let mut input = None;
@@ -1619,7 +1652,8 @@ impl CpalMidir {
 
     /// The output configuration `device` runs the stream with: at its own native rate on a start
     /// (the rate the session then adopts), at the session's rate on a restart. A duplex driver's
-    /// period follows its buffer-size range (`DeviceUse::period`).
+    /// period comes from its buffer facts (`duplex_period`); a driver whose facts cannot be read
+    /// or are unusable is refused before cpal is asked for a stream (A12).
     fn open_output(
         device: Device,
         config: &WrapperConfig,
@@ -1642,9 +1676,17 @@ impl CpalMidir {
                 ),
                 Start::Restart => {}
             }
-            if device_use.is_duplex() {
-                config.period_size = device_use.period(config.period_size, *current.buffer_size());
+        }
+        if let DeviceUse::Duplex { requested } = device_use {
+            let facts = match asio_driver::buffer_facts(&device) {
+                Some(facts) => facts?,
+                None => anyhow::bail!("not an ASIO device"),
+            };
+            let period = duplex_period(requested, facts)?;
+            if let Some(requested) = requested.filter(|&requested| requested != period) {
+                nih_log!("The ASIO driver runs {period} samples (requested {requested})");
             }
+            config.period_size = period;
         }
         Self::build_output_cpal_device(device, &config, num_output_channels)
     }
@@ -2429,53 +2471,52 @@ mod tests {
         assert!(!liveness_expired(5, 10), "clock skew never trips it");
     }
 
-    fn range(min: u32, max: u32) -> cpal::SupportedBufferSize {
-        cpal::SupportedBufferSize::Range { min, max }
+    fn facts(min: i32, max: i32, preferred: i32, granularity: i32) -> BufferFacts {
+        BufferFacts {
+            min,
+            max,
+            preferred,
+            granularity,
+        }
     }
 
     #[test]
-    fn period_is_clamped_into_the_driver_range() {
-        assert_eq!(clamp_period(64, range(128, 2048)), 128);
-        assert_eq!(clamp_period(4096, range(128, 2048)), 2048);
-        assert_eq!(clamp_period(512, range(128, 2048)), 512);
-        assert_eq!(clamp_period(512, cpal::SupportedBufferSize::Unknown), 512);
-        assert_eq!(clamp_period(512, range(2048, 128)), 512);
+    fn a_duplex_stream_follows_the_drivers_preferred_size_unless_one_is_requested() {
+        assert_eq!(duplex_period(None, facts(64, 2048, 256, -1)).unwrap(), 256);
+        assert_eq!(
+            duplex_period(Some(512), facts(64, 2048, 256, -1)).unwrap(),
+            512
+        );
+        assert_eq!(
+            duplex_period(Some(300), facts(64, 2048, 256, -1)).unwrap(),
+            256
+        );
     }
 
     #[test]
-    fn a_shared_device_keeps_the_requested_period() {
-        assert_eq!(DeviceUse::Shared.period(64, range(128, 2048)), 64);
+    fn a_fixed_size_driver_overrides_any_request() {
+        assert_eq!(
+            duplex_period(Some(512), facts(64, 2048, 128, 0)).unwrap(),
+            128
+        );
     }
 
     #[test]
-    fn a_duplex_launch_adopts_the_driver_period_as_its_block() {
-        let launch = DeviceUse::Duplex { period_cap: None };
-        assert_eq!(launch.period(64, range(128, 2048)), 128);
-        assert_eq!(launch.block(128), 128);
-    }
-
-    /// A control-panel buffer raised past the launch period (min == max on many drivers) still
-    /// opens: the stream runs at the driver's period and the plugin gets it in launch-sized blocks.
-    #[test]
-    fn a_duplex_restart_follows_the_driver_and_splits_a_larger_period() {
-        let restart = DeviceUse::Duplex {
-            period_cap: Some(512),
-        };
-        assert_eq!(restart.period(512, range(1024, 1024)), 1024);
-        assert_eq!(restart.block(1024), 512);
-        assert_eq!(restart.period(512, range(64, 256)), 256);
-        assert_eq!(restart.block(256), 256);
+    fn an_unusable_driver_report_is_an_error() {
+        assert!(duplex_period(None, facts(64, 2048, 0, -1)).is_err());
     }
 
     #[test]
-    fn a_duplex_restart_returns_to_the_launch_period_once_the_driver_allows_it() {
-        let restart = DeviceUse::Duplex {
-            period_cap: Some(512),
-        };
-        let shrunk = restart.period(512, range(64, 256));
-        assert_eq!(shrunk, 256);
-        assert_eq!(restart.period(shrunk, range(64, 2048)), 512);
-        assert_eq!(DeviceUse::Shared.block(1024), 1024);
+    fn a_shared_open_after_a_duplex_one_runs_the_shared_period() {
+        let shared_period = 256;
+        assert_eq!(open_period(true, shared_period), DUPLEX_BLOCK);
+        assert_eq!(open_period(false, shared_period), shared_period);
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn a_stream_names_its_driver_by_the_backend_id() {
+        assert_eq!(backend_id(cpal::HostId::CoreAudio), "core-audio");
     }
 
     #[test]

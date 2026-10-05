@@ -3,6 +3,9 @@ use std::num::NonZeroU32;
 
 use crate::prelude::{AudioIOLayout, Plugin};
 
+/// The period the standalone uses when none is requested: the plug-in's block on shared hosts.
+pub const DEFAULT_PERIOD_SIZE: u32 = 512;
+
 /// Configuration for a standalone plugin that would normally be provided by the DAW.
 #[derive(Debug, Clone, Parser)]
 #[clap(about = None, long_about = None)]
@@ -26,10 +29,15 @@ pub struct WrapperConfig {
     /// This setting is ignored when using the JACK backend.
     #[clap(value_parser, short = 'r', long, default_value = "48000")]
     pub sample_rate: f32,
-    /// The audio backend's period size.
+    /// The audio backend's period size. Without it, shared hosts use 512 samples and an ASIO driver
+    /// runs its own preferred size.
     ///
     /// This setting is ignored when using the JACK backend.
-    #[clap(value_parser, short = 'p', long, default_value = "512")]
+    #[clap(value_parser, short = 'p', long = "period-size")]
+    pub period_request: Option<u32>,
+    /// The plug-in's block size, resolved from `period_request` after parsing and adopted from the
+    /// stream once a backend opens it.
+    #[clap(skip = DEFAULT_PERIOD_SIZE)]
     pub period_size: u32,
 
     /// The input device for the ALSA, CoreAudio, and WASAPI backends. No input will be connected if
@@ -121,6 +129,12 @@ pub enum BackendType {
 }
 
 impl WrapperConfig {
+    /// Resolve the plug-in's block from the requested period, or [`DEFAULT_PERIOD_SIZE`] when none
+    /// was requested. Called once, right after parsing.
+    pub fn resolve_period(&mut self) {
+        self.period_size = self.period_request.unwrap_or(DEFAULT_PERIOD_SIZE);
+    }
+
     /// Get the audio IO layout for a plugin based on this configuration. Exits the application if
     /// the IO layout could not be parsed from the config. This doesn't return a `Result` to be able to differentiate between backend-specific errors and config parsing errors.
     pub fn audio_io_layout_or_exit<P: Plugin>(&self) -> AudioIOLayout {
@@ -181,5 +195,26 @@ impl WrapperConfig {
             }
             _ => P::AUDIO_IO_LAYOUTS.first().copied().unwrap_or_default(),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn without_p_the_period_is_unrequested_and_resolves_to_512() {
+        let mut config = WrapperConfig::parse_from(["standalone", "-b", "dummy"]);
+        config.resolve_period();
+        assert_eq!(config.period_request, None);
+        assert_eq!(config.period_size, DEFAULT_PERIOD_SIZE);
+    }
+
+    #[test]
+    fn an_explicit_period_is_both_requested_and_resolved() {
+        let mut config = WrapperConfig::parse_from(["standalone", "-b", "dummy", "-p", "256"]);
+        config.resolve_period();
+        assert_eq!(config.period_request, Some(256));
+        assert_eq!(config.period_size, 256);
     }
 }
