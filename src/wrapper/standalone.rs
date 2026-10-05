@@ -29,10 +29,10 @@ pub struct AudioDevicesInUse {
     /// The device audio input is read from. `None` is no capture: none was asked for, or the
     /// requested input is not connected or could not open.
     pub input: Option<String>,
-    /// A requested output that is connected but could not open the session's stream. On ASIO, a
-    /// driver the user picked that did not load or open while the previous one runs again, or
-    /// [`FIRST_AVAILABLE_REFUSED`]. After a switch to ASIO that opened nothing (`refused_driver`),
-    /// the driver it picked by name, if it picked one.
+    /// A requested output that is connected but could not open the session's stream, on the host
+    /// that runs. On ASIO, the requested driver that did not open at launch while another one
+    /// stands in for it; restarts keep it while that one does. A driver the user picks live that
+    /// does not open is `refused_asio`.
     pub refused_output: Option<String>,
     /// A requested input that is connected but could not open the session's stream.
     pub refused_input: Option<String>,
@@ -53,6 +53,11 @@ pub struct AudioDevicesInUse {
     /// A driver, by backend id, that was asked for but opened nothing; the stream stayed on `driver`.
     /// Kept through restarts; a device or driver change that opens clears it.
     pub refused_driver: Option<String>,
+    /// The ASIO driver the user last picked that did not open: a driver name, or
+    /// [`FIRST_AVAILABLE_REFUSED`] when "First available" opened nothing. What ran before runs
+    /// again, on another host when `refused_driver` says so. Restarts on either host keep it; it
+    /// is cleared once an ASIO driver opens on a change or the user picks again.
+    pub refused_asio: Option<String>,
     /// The stream's sample rate in Hz, once an output is open.
     pub sample_rate: Option<u32>,
     /// The stream's period in samples, once an output is open.
@@ -63,9 +68,9 @@ pub struct AudioDevicesInUse {
     pub preferred_buffer_size: Option<u32>,
 }
 
-/// [`AudioDevicesInUse::refused_output`] when "First available" was picked on ASIO and no driver
-/// opened; the driver that ran before runs again. No driver name contains a NUL, so this never
-/// names a real one.
+/// [`AudioDevicesInUse::refused_asio`] when "First available" was picked on ASIO and no driver
+/// opened; what ran before runs again. No driver name contains a NUL, so this never names a real
+/// one.
 pub const FIRST_AVAILABLE_REFUSED: &str = "\u{0}first-available";
 
 static AUDIO_DEVICES_IN_USE: RwLock<Option<AudioDevicesInUse>> = RwLock::new(None);

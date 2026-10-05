@@ -5,7 +5,7 @@ use anyhow::Result;
 
 use super::Start;
 use crate::wrapper::standalone::change::AudioChange;
-use crate::wrapper::standalone::FIRST_AVAILABLE_REFUSED;
+use crate::wrapper::standalone::{AudioDevicesInUse, FIRST_AVAILABLE_REFUSED};
 
 /// A configuration the backend opens: the host, the requested devices and the ASIO buffer size.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -74,15 +74,47 @@ pub(super) fn reconfigure_start(duplex: bool, change: &AudioChange) -> Start {
     }
 }
 
-/// What a duplex change that opened nothing publishes in `refused_output` while the previous
-/// driver runs again: the driver it picked, or [`FIRST_AVAILABLE_REFUSED`]. A change that picked
-/// no driver refuses none.
+/// What a duplex change that opened nothing publishes in `refused_asio` while the previous driver
+/// runs again (see `refused_name`). A change that picked no driver refuses none.
 pub(super) fn refused_pick(change: &AudioChange) -> Option<String> {
-    change.output.as_ref().map(|picked| {
-        picked
-            .clone()
-            .unwrap_or_else(|| FIRST_AVAILABLE_REFUSED.to_string())
-    })
+    change.output.as_ref().map(refused_name)
+}
+
+/// An ASIO pick that opened nothing, as `refused_asio` names it: the driver, or
+/// [`FIRST_AVAILABLE_REFUSED`] for "First available".
+pub(super) fn refused_name(picked: &Option<String>) -> String {
+    picked
+        .clone()
+        .unwrap_or_else(|| FIRST_AVAILABLE_REFUSED.to_string())
+}
+
+/// The refusals a failed change left that an open publishes again. A restart stays where that
+/// change left the stream, on either host, so it keeps them; a launch or a change that opens
+/// starts clean (A16, A18). A host's own device refusals are found afresh by every open.
+pub(super) fn keep_refusals(
+    start: Start,
+    previous: &AudioDevicesInUse,
+    in_use: &mut AudioDevicesInUse,
+) {
+    if start == Start::Restart {
+        in_use.refused_driver = previous.refused_driver.clone();
+        in_use.refused_asio = previous.refused_asio.clone();
+    }
+}
+
+/// `refused_output` after a duplex open that is not the launch, which reopens a driver by name: a
+/// restart onto a driver standing in for the requested one keeps the refusal that put it there,
+/// and any other such open refuses nothing.
+pub(super) fn duplex_refused_output(
+    start: Start,
+    requested_opened: bool,
+    previous: &AudioDevicesInUse,
+) -> Option<String> {
+    if start == Start::Restart && !requested_opened {
+        previous.refused_output.clone()
+    } else {
+        None
+    }
 }
 
 /// The host a switch leaves the stream on.
@@ -233,6 +265,54 @@ mod tests {
             Some(FIRST_AVAILABLE_REFUSED)
         );
         assert_eq!(refused_pick(&pick(None)), None);
+        assert_eq!(
+            refused_name(&Some("Focusrite USB ASIO".into())),
+            "Focusrite USB ASIO"
+        );
+        assert_eq!(refused_name(&None), FIRST_AVAILABLE_REFUSED);
+    }
+
+    #[test]
+    fn refusals_last_through_restarts_on_either_host_and_clear_on_a_change_that_opens() {
+        let previous = AudioDevicesInUse {
+            refused_driver: Some("asio".into()),
+            refused_asio: Some("Focusrite USB ASIO".into()),
+            refused_output: Some("Speakers".into()),
+            ..Default::default()
+        };
+        let mut restarted = AudioDevicesInUse::default();
+        keep_refusals(Start::Restart, &previous, &mut restarted);
+        assert_eq!(restarted.refused_driver.as_deref(), Some("asio"));
+        assert_eq!(
+            restarted.refused_asio.as_deref(),
+            Some("Focusrite USB ASIO")
+        );
+        assert_eq!(
+            restarted.refused_output, None,
+            "a host finds its own refusals"
+        );
+        for start in [Start::Launch, Start::Reconfigure] {
+            let mut opened = AudioDevicesInUse::default();
+            keep_refusals(start, &previous, &mut opened);
+            assert_eq!(opened, AudioDevicesInUse::default());
+        }
+    }
+
+    #[test]
+    fn a_duplex_restart_keeps_only_the_refusal_a_stand_in_driver_runs_for() {
+        let previous = AudioDevicesInUse {
+            refused_output: Some("Focusrite USB ASIO".into()),
+            ..Default::default()
+        };
+        assert_eq!(
+            duplex_refused_output(Start::Restart, false, &previous).as_deref(),
+            Some("Focusrite USB ASIO")
+        );
+        assert_eq!(duplex_refused_output(Start::Restart, true, &previous), None);
+        assert_eq!(
+            duplex_refused_output(Start::Reconfigure, false, &previous),
+            None
+        );
     }
 
     #[test]
