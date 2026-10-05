@@ -19,6 +19,7 @@ use std::time::{Duration, Instant};
 
 use super::super::config::WrapperConfig;
 use super::super::{publish_audio_devices_in_use, AudioDevicesInUse};
+use super::asio_driver;
 use super::device_watch::{DeviceWatch, Kind, Wanted};
 use super::{sleep_unless, Backend, RunOutcome};
 use crate::midi::MidiResult;
@@ -57,7 +58,8 @@ pub struct CpalMidir {
     underruns: Arc<AtomicU64>,
 
     input: Option<CpalDevice>,
-    output: CpalDevice,
+    /// `None` only between a duplex restart releasing its driver and reloading it.
+    output: Option<CpalDevice>,
 
     midi_input: Mutex<Option<MidirInputDevice>>,
     midi_output: Mutex<Option<MidirOutputDevice>>,
@@ -210,6 +212,10 @@ impl<P: Plugin> Backend<P> for CpalMidir {
         // A duplex driver never reports a dead stream, so the output callback stamps this and the
         // wait below watches it (A6).
         let liveness = Liveness::new();
+        let Some(output) = self.output.as_ref() else {
+            nih_error!("No audio output is open");
+            return RunOutcome::StreamFailed;
+        };
         // So this is a lot of fun. There are up to four separate streams here, all using their own
         // callbacks. The audio output stream acts as the primary stream, and everything else either
         // sends data to it or (in the case of the MIDI output stream) receives data from it using
@@ -251,12 +257,12 @@ impl<P: Plugin> Backend<P> for CpalMidir {
                     .unwrap_or(0) as usize;
                 let period = self.config.period_size as usize;
                 // A duplex ring holds whole frames, so a full one drops whole frames, and two
-                // periods of them: the driver's period is fixed and both callbacks run once per
-                // period, input first (A5).
+                // driver periods of them: the driver's period is fixed and both callbacks run once
+                // per period, input first (A5). That period can be larger than the plugin's block.
                 let capacity = if self.duplex {
-                    ring_channels * period * 2
+                    ring_channels * stream_period(output).map_or(period, |p| p.max(period)) * 2
                 } else {
-                    (self.output.config.channels as usize).max(ring_channels) * period
+                    (output.config.channels as usize).max(ring_channels) * period
                 };
                 let (rb_producer, rb_consumer) = RingBuffer::new(capacity);
                 input_rb_consumer = Some(rb_consumer);
@@ -498,6 +504,15 @@ impl<P: Plugin> Backend<P> for CpalMidir {
                     }
                 });
 
+            let reset_requested = Arc::new(AtomicBool::new(false));
+            let _reset_listener = self.duplex.then(|| {
+                asio_driver::listen_for_reset(
+                    &output.device,
+                    reset_requested.clone(),
+                    unparker.clone(),
+                )
+            });
+
             let error_cb = {
                 let unparker = unparker.clone();
                 let stream_error = stream_error.clone();
@@ -528,8 +543,8 @@ impl<P: Plugin> Backend<P> for CpalMidir {
             macro_rules! build_output_streams {
                 ($sample_format:expr, $(($format:path, $primitive_type:ty)),*) => {
                     match $sample_format {
-                        $($format => self.output.device.build_output_stream(
-                            &self.output.config,
+                        $($format => output.device.build_output_stream(
+                            &output.config,
                             self.build_output_data_callback::<P, $primitive_type>(
                                 unparker,
                                 input_rb_consumer,
@@ -556,7 +571,7 @@ impl<P: Plugin> Backend<P> for CpalMidir {
             // it receives a `Terminate` task).
             let mut setup_failed = false;
             let output_stream = match build_output_streams!(
-                self.output.sample_format,
+                output.sample_format,
                 (SampleFormat::I8, i8),
                 (SampleFormat::I16, i16),
                 (SampleFormat::I32, i32),
@@ -594,6 +609,7 @@ impl<P: Plugin> Backend<P> for CpalMidir {
             if !setup_failed {
                 // The first callback gets the whole timeout
                 liveness.stamp();
+                let mut rate_checked = Instant::now();
                 loop {
                     parker.park_timeout(Duration::from_millis(100));
                     if stream_error.load(Ordering::Acquire)
@@ -610,6 +626,27 @@ impl<P: Plugin> Backend<P> for CpalMidir {
                         );
                         stream_error.store(true, Ordering::Release);
                         break;
+                    }
+                    if self.duplex && reset_requested.load(Ordering::Acquire) {
+                        nih_log!("The ASIO driver asked for a reset, restarting the stream");
+                        stream_error.store(true, Ordering::Release);
+                        break;
+                    }
+                    // A driver whose rate moves (a control-panel or external clock change) may
+                    // keep calling back at the new rate; the restart sets it back (A6).
+                    if self.duplex && rate_checked.elapsed() >= DUPLEX_RATE_CHECK_INTERVAL {
+                        rate_checked = Instant::now();
+                        if let Some(rate) = asio_driver::driver_rate(&output.device)
+                            .filter(|&rate| asio_driver::rate_moved(rate, self.config.sample_rate))
+                        {
+                            nih_log!(
+                                "The ASIO driver now runs at {rate} Hz, restarting the stream at \
+                                 the session's {} Hz",
+                                self.config.sample_rate
+                            );
+                            stream_error.store(true, Ordering::Release);
+                            break;
+                        }
                     }
                 }
             }
@@ -670,11 +707,14 @@ impl<P: Plugin> Backend<P> for CpalMidir {
 
     fn reinit(&mut self) -> Result<()> {
         if self.duplex {
-            // A7: the input shares the output's driver; drop it first so no second handle
-            // outlives the restart. The output `CpalDevice` stays alive and keeps its driver
-            // loaded: the kept host's enumeration then returns that driver and skips the others,
-            // so a restart always lands on the same driver. Another driver needs a relaunch (A10).
+            // A real driver reset (asio.h kAsioResetRequest): every handle to the driver is
+            // released, so it runs ASIOStop, ASIODisposeBuffers and ASIOExit, and the resolution
+            // below loads it afresh with ASIOInit. A replugged interface or a new control-panel
+            // buffer size only takes effect that way. No stream is open, so loading drivers here
+            // cannot disturb one (A7).
             self.input = None;
+            self.output = None;
+            asio_driver::com_ready_on_this_thread();
         }
 
         // Unlike `new()` there is deliberately no native-sample-rate override here:
@@ -696,7 +736,7 @@ impl<P: Plugin> Backend<P> for CpalMidir {
             listed,
         )?;
         self.quarantined.clear();
-        self.output = opened.output;
+        self.output = Some(opened.output);
         self.input = opened.input;
         let now = Instant::now();
         let mut watch = DeviceWatch::new(opened.absent, opened.refused, now);
@@ -833,9 +873,10 @@ enum DeviceUse {
     /// WASAPI and CoreAudio: the period as requested, and a restart refuses a device that runs at
     /// another rate rather than switch it under other applications.
     Shared,
-    /// A single-device duplex driver (ASIO), which this application alone uses: the period
-    /// follows the driver's buffer-size range, capped on a restart at the wrapper's
-    /// `max_buffer_size`, and a restart sets the driver back to the session's rate (A4, A6).
+    /// A single-device duplex driver (ASIO), which this application alone uses: the stream's
+    /// period follows the driver's buffer-size range and a restart sets the driver back to the
+    /// session's rate (A4, A6). On a restart the plugin still processes blocks of at most
+    /// `period_cap`, the wrapper's `max_buffer_size`, so a driver period above it is split.
     Duplex { period_cap: Option<u32> },
 }
 
@@ -849,10 +890,27 @@ impl DeviceUse {
         match self {
             DeviceUse::Shared => requested,
             DeviceUse::Duplex { period_cap } => {
-                let clamped = clamp_period(period_cap.unwrap_or(requested), range);
-                period_cap.map_or(clamped, |cap| clamped.min(cap))
+                clamp_period(period_cap.unwrap_or(requested), range)
             }
         }
+    }
+
+    /// The largest block the plugin processes for a stream period.
+    fn block(self, stream_period: u32) -> u32 {
+        match self {
+            DeviceUse::Duplex {
+                period_cap: Some(cap),
+            } => stream_period.min(cap),
+            _ => stream_period,
+        }
+    }
+}
+
+/// The period a stream was opened with, when it fixed one.
+fn stream_period(device: &CpalDevice) -> Option<usize> {
+    match device.config.buffer_size {
+        cpal::BufferSize::Fixed(period) => Some(period as usize),
+        cpal::BufferSize::Default => None,
     }
 }
 
@@ -877,6 +935,9 @@ pub(crate) fn duplex_input_channels(wanted: u16, available: &[u16]) -> Option<u1
 
 /// No error callback ever fires on ASIO (cpal ignores it), so silence is the signal (A6).
 const DUPLEX_LIVENESS_TIMEOUT_MS: u64 = 2000;
+
+/// How often a running duplex stream reads the driver's rate.
+const DUPLEX_RATE_CHECK_INTERVAL: Duration = Duration::from_secs(1);
 
 pub(crate) fn liveness_expired(now_ms: u64, last_ms: u64) -> bool {
     now_ms.saturating_sub(last_ms) > DUPLEX_LIVENESS_TIMEOUT_MS
@@ -1088,7 +1149,7 @@ impl CpalMidir {
             underruns: Arc::new(AtomicU64::new(0)),
 
             input: opened.input,
-            output: opened.output,
+            output: Some(opened.output),
 
             midi_input: Mutex::new(midi_input),
             midi_output: Mutex::new(midi_output),
@@ -1240,6 +1301,7 @@ impl CpalMidir {
         let mut in_use = AudioDevicesInUse {
             outputs,
             inputs,
+            duplex,
             ..Default::default()
         };
         let mut opened = OpenedDevicesSoFar::default();
@@ -1297,17 +1359,18 @@ impl CpalMidir {
                 }
             }
         };
+        in_use.opened = output.device.name().ok();
         if start == Start::Launch {
             config.sample_rate = output.config.sample_rate.0 as f32;
         }
         if let (true, cpal::BufferSize::Fixed(period)) = (duplex, output.config.buffer_size) {
+            let block = device_use.block(period);
             if period != config.period_size {
                 nih_log!(
-                    "A period of {} samples is outside the driver's range, using {period}",
-                    config.period_size
+                    "The driver runs a period of {period} samples, processed in blocks of {block}"
                 );
-                config.period_size = period;
             }
+            config.period_size = block;
         }
 
         let mut input = None;
@@ -1521,15 +1584,7 @@ impl CpalMidir {
                 Start::Restart => {}
             }
             if device_use.is_duplex() {
-                let range = *current.buffer_size();
-                let period = device_use.period(config.period_size, range);
-                if period < clamp_period(period, range) {
-                    nih_log!(
-                        "The driver's smallest buffer is now larger than this session's {period} \
-                         samples; relaunch to use it"
-                    );
-                }
-                config.period_size = period;
+                config.period_size = device_use.period(config.period_size, *current.buffer_size());
             }
         }
         Self::build_output_cpal_device(device, &config, num_output_channels)
@@ -1761,7 +1816,9 @@ impl CpalMidir {
             .map(NonZeroU32::get)
             .unwrap_or(0) as usize;
         // The device may have more channels than the plugin needs (e.g. multichannel interfaces)
-        let device_output_channels = self.output.config.channels as usize;
+        let device_output_channels = self.output.as_ref().map_or(num_output_channels, |output| {
+            output.config.channels as usize
+        });
         // This may contain excess unused space at the end if we get fewer samples than configured
         // from CPAL
         let mut main_io_storage = vec![vec![0.0f32; buffer_size]; num_output_channels];
@@ -2332,15 +2389,23 @@ mod tests {
     }
 
     #[test]
-    fn a_duplex_restart_follows_the_driver_but_never_past_the_wrapper_buffer() {
+    fn a_duplex_launch_adopts_the_driver_period_as_its_block() {
         let launch = DeviceUse::Duplex { period_cap: None };
         assert_eq!(launch.period(64, range(128, 2048)), 128);
+        assert_eq!(launch.block(128), 128);
+    }
+
+    /// A control-panel buffer raised past the launch period (min == max on many drivers) still
+    /// opens: the stream runs at the driver's period and the plugin gets it in launch-sized blocks.
+    #[test]
+    fn a_duplex_restart_follows_the_driver_and_splits_a_larger_period() {
         let restart = DeviceUse::Duplex {
             period_cap: Some(512),
         };
-        assert_eq!(restart.period(512, range(1024, 2048)), 512);
+        assert_eq!(restart.period(512, range(1024, 1024)), 1024);
+        assert_eq!(restart.block(1024), 512);
         assert_eq!(restart.period(512, range(64, 256)), 256);
-        assert_eq!(restart.period(256, range(64, 2048)), 512);
+        assert_eq!(restart.block(256), 256);
     }
 
     #[test]
@@ -2351,6 +2416,7 @@ mod tests {
         let shrunk = restart.period(512, range(64, 256));
         assert_eq!(shrunk, 256);
         assert_eq!(restart.period(shrunk, range(64, 2048)), 512);
+        assert_eq!(DeviceUse::Shared.block(1024), 1024);
     }
 
     #[test]

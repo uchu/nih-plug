@@ -4,6 +4,7 @@ use std::time::{Duration, Instant};
 
 use crate::prelude::{AuxiliaryBuffers, PluginNoteEvent, Transport};
 
+mod asio_driver;
 mod cpal;
 pub mod device_watch;
 mod dummy;

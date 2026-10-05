@@ -30,6 +30,12 @@ pub struct AudioDevicesInUse {
     pub refused_output: Option<String>,
     /// A requested input that is connected but could not open the session's stream.
     pub refused_input: Option<String>,
+    /// The device the output stream is open on, by name, however it was picked: the requested
+    /// one, or the default standing in. On a duplex host this is the driver.
+    pub opened: Option<String>,
+    /// Whether the stream runs on a single-device duplex host (ASIO). `false` on a launch that
+    /// asked for ASIO is WASAPI standing in for a driver that could not open.
+    pub duplex: bool,
     /// Every output the host listed at launch (spec A3), carried through restarts: the app's
     /// pickers read these instead of enumerating on their own, which on ASIO would load and unload
     /// every driver under a running stream. Empty on hosts that are not duplex.
@@ -43,7 +49,10 @@ static AUDIO_DEVICES_IN_USE: RwLock<Option<AudioDevicesInUse>> = RwLock::new(Non
 /// What the running standalone's audio stream is open on. `None` until a backend that names its
 /// devices (CPAL) has opened one. Follows the stream across an unplug, the stand-in and the return.
 pub fn audio_devices_in_use() -> Option<AudioDevicesInUse> {
-    AUDIO_DEVICES_IN_USE.read().ok().and_then(|slot| slot.clone())
+    AUDIO_DEVICES_IN_USE
+        .read()
+        .ok()
+        .and_then(|slot| slot.clone())
 }
 
 pub(crate) fn publish_audio_devices_in_use(in_use: AudioDevicesInUse) {
@@ -219,6 +228,9 @@ pub fn nih_export_standalone_with_args<P: Plugin, Args: IntoIterator<Item = Stri
                 }
             }
         }
+        // No ASIO driver that loads (none installed, the interface off, a single-client driver
+        // held by another application) must not leave the application without a window: WASAPI
+        // stands in on the system default, and the stand-in is published (`duplex: false`).
         #[cfg(all(target_os = "windows", feature = "asio"))]
         config::BackendType::Asio => {
             match backend::CpalMidir::new::<P>(config.clone(), cpal::HostId::Asio) {
@@ -227,14 +239,38 @@ pub fn nih_export_standalone_with_args<P: Plugin, Args: IntoIterator<Item = Stri
                     run_wrapper::<P, _>(backend, actual_config)
                 }
                 Err(err) => {
-                    nih_error!("Could not initialize the ASIO backend: {:#}", err);
-                    false
+                    nih_error!(
+                        "Could not open an ASIO driver, WASAPI stands in on the system default: \
+                         {err:#}"
+                    );
+                    let config = stand_in_config(&config);
+                    match backend::CpalMidir::new::<P>(config.clone(), cpal::HostId::Wasapi) {
+                        Ok(backend) => {
+                            let actual_config = config_with_actual_rate(&config, &backend);
+                            run_wrapper::<P, _>(backend, actual_config)
+                        }
+                        Err(err) => {
+                            nih_error!("Could not initialize the WASAPI backend: {err:#}");
+                            false
+                        }
+                    }
                 }
             }
         }
         config::BackendType::Dummy => {
             run_wrapper::<P, _>(backend::Dummy::new::<P>(config.clone()), config)
         }
+    }
+}
+
+/// The configuration another host stands in with: the requested devices are the first host's
+/// names (ASIO drivers), which mean nothing to it, so it opens the system default.
+#[cfg_attr(not(all(target_os = "windows", feature = "asio")), allow(dead_code))]
+fn stand_in_config(config: &WrapperConfig) -> WrapperConfig {
+    WrapperConfig {
+        output_device: None,
+        input_device: None,
+        ..config.clone()
     }
 }
 
@@ -271,5 +307,33 @@ fn print_error(error: WrapperError) {
         WrapperError::InitializationFailed => {
             nih_error!("The plugin failed to initialize");
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use clap::Parser;
+
+    #[test]
+    fn a_stand_in_host_opens_the_system_default_and_keeps_the_rest() {
+        let config = WrapperConfig::parse_from([
+            "standalone",
+            "-b",
+            "dummy",
+            "--output-device",
+            "Focusrite USB ASIO",
+            "--input-device",
+            "Focusrite USB ASIO",
+            "--period-size",
+            "256",
+            "--midi-input",
+            "Keystation",
+        ]);
+        let stand_in = stand_in_config(&config);
+        assert_eq!(stand_in.output_device, None);
+        assert_eq!(stand_in.input_device, None);
+        assert_eq!(stand_in.period_size, 256);
+        assert_eq!(stand_in.midi_input.as_deref(), Some("Keystation"));
     }
 }
