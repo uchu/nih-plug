@@ -1,6 +1,7 @@
 //! What an open ASIO driver tells the host outside its buffer callbacks, stopping it at the end
 //! of a run (spec A6), and reloading it by name (A7). Off ASIO every function here is inert.
 
+use super::buffer_sizes::BufferFacts;
 use cpal::Device;
 use crossbeam::sync::Unparker;
 use std::sync::atomic::AtomicBool;
@@ -59,6 +60,47 @@ pub(crate) fn driver_rate(device: &Device) -> Option<f64> {
 
 #[cfg(not(all(target_os = "windows", feature = "asio")))]
 pub(crate) fn driver_rate(_device: &Device) -> Option<f64> {
+    None
+}
+
+/// The loaded driver's buffer sizes. `None` off ASIO.
+#[cfg(all(target_os = "windows", feature = "asio"))]
+#[allow(dead_code)]
+pub(crate) fn buffer_facts(device: &Device) -> Option<anyhow::Result<BufferFacts>> {
+    use std::os::raw::c_long;
+
+    let cpal::platform::DeviceInner::Asio(_) = device.as_inner() else {
+        return None;
+    };
+    let (mut min, mut max, mut preferred, mut granularity): (c_long, c_long, c_long, c_long) =
+        (0, 0, 0, 0);
+    // The device holds the loaded driver, which `ASIOGetBufferSize` reads. asio-sys's safe
+    // `buffersize_range()` drops the preferred size and the granularity (A12).
+    let result = unsafe {
+        asio_sys::bindings::asio_import::ASIOGetBufferSize(
+            &mut min,
+            &mut max,
+            &mut preferred,
+            &mut granularity,
+        )
+    };
+    Some(if result == 0 {
+        Ok(BufferFacts {
+            min,
+            max,
+            preferred,
+            granularity,
+        })
+    } else {
+        Err(anyhow::anyhow!(
+            "ASIOGetBufferSize failed with ASIO error {result}"
+        ))
+    })
+}
+
+#[cfg(not(all(target_os = "windows", feature = "asio")))]
+#[allow(dead_code)]
+pub(crate) fn buffer_facts(_device: &Device) -> Option<anyhow::Result<BufferFacts>> {
     None
 }
 
