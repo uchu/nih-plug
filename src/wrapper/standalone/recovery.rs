@@ -4,8 +4,9 @@
 //! a long healthy run is an unplug. The first is retried a few times with growing pauses, then left
 //! alone until the hardware changes; the second always gets a fresh budget. A device that came back
 //! is not a failure at all, nor is a fresh stream the device needs (an ASIO reset request, a rate
-//! that moved): neither spends the budget. A change the app asks for (A16) comes before all of
-//! this: it cuts every wait short and is opened instead of the configuration that failed.
+//! that moved): neither spends the budget, unless the device asks again right after the last
+//! restart. A change the app asks for (A16) comes before all of this: it cuts every wait short
+//! and is opened instead of the configuration that failed.
 
 use std::time::Duration;
 
@@ -53,6 +54,10 @@ impl Recovery {
     ];
     /// A run at least this long counts as healthy: the next failure starts a fresh budget.
     pub const STABLE_RUN: Duration = Duration::from_secs(10);
+    /// A restart the device asks for after a shorter run counts as a failure, so a driver that
+    /// asks at every start, or a rate that keeps flapping, backs off like a stream that keeps
+    /// dying.
+    pub const MIN_RESTART_RUN: Duration = Duration::from_secs(2);
     /// The longest a wait for a hardware change lasts before trying again regardless.
     pub const HARDWARE_WAIT: Duration = Duration::from_secs(30);
 
@@ -79,10 +84,15 @@ impl Recovery {
         Action::ReinitNow
     }
 
-    /// The device needs a fresh stream. Says nothing about whether it can hold one, so the budget
-    /// is left as it is.
-    pub fn restart(&mut self) -> Action {
-        Action::ReinitNow
+    /// The device needs a fresh stream after a run of `ran_for`. After `MIN_RESTART_RUN` that says
+    /// nothing about whether it can hold one, so the budget is left as it is; sooner, it is a
+    /// failure.
+    pub fn restart(&mut self, ran_for: Duration) -> Action {
+        if ran_for < Self::MIN_RESTART_RUN {
+            self.stream_failed(ran_for)
+        } else {
+            Action::ReinitNow
+        }
     }
 }
 
@@ -143,11 +153,14 @@ mod tests {
     }
 
     #[test]
-    fn a_restart_the_device_needs_never_touches_the_failure_budget() {
+    fn a_restart_after_a_long_run_never_touches_the_failure_budget() {
         let mut recovery = Recovery::new();
         recovery.stream_failed(quick());
         recovery.stream_failed(quick());
-        assert_eq!(recovery.restart(), Action::ReinitNow);
+        assert_eq!(
+            recovery.restart(Recovery::MIN_RESTART_RUN),
+            Action::ReinitNow
+        );
         assert_eq!(
             recovery.stream_failed(quick()),
             Action::Reinit {
@@ -157,10 +170,13 @@ mod tests {
     }
 
     #[test]
-    fn restarts_in_a_row_never_wait_for_hardware() {
+    fn restarts_after_long_runs_never_wait_for_hardware() {
         let mut recovery = Recovery::new();
         for _ in 0..=Recovery::MAX_RETRIES {
-            assert_eq!(recovery.restart(), Action::ReinitNow);
+            assert_eq!(
+                recovery.restart(Recovery::MIN_RESTART_RUN),
+                Action::ReinitNow
+            );
         }
         assert_eq!(
             recovery.stream_failed(quick()),
@@ -168,6 +184,33 @@ mod tests {
                 backoff: Recovery::BACKOFF[0]
             }
         );
+    }
+
+    #[test]
+    fn a_quick_restart_spends_the_failure_budget() {
+        let mut recovery = Recovery::new();
+        let quick_restart = Recovery::MIN_RESTART_RUN - Duration::from_millis(1);
+        assert_eq!(
+            recovery.restart(quick_restart),
+            Action::Reinit {
+                backoff: Recovery::BACKOFF[0]
+            }
+        );
+        assert_eq!(
+            recovery.stream_failed(quick()),
+            Action::Reinit {
+                backoff: Recovery::BACKOFF[1]
+            }
+        );
+    }
+
+    #[test]
+    fn quick_restarts_in_a_row_back_off_then_wait_for_hardware() {
+        let mut recovery = Recovery::new();
+        for backoff in Recovery::BACKOFF {
+            assert_eq!(recovery.restart(quick()), Action::Reinit { backoff });
+        }
+        assert_eq!(recovery.restart(quick()), Action::WaitForHardware);
     }
 
     #[test]

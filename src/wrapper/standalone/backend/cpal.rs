@@ -1005,9 +1005,12 @@ pub(crate) fn adopted_rate(current: Option<cpal::SampleRate>, session: f32) -> f
 }
 
 /// An output that keeps streaming at another rate leaves the plugin processing at the session's
-/// rate on hardware running at a different one.
+/// rate on hardware running at a different one. The device's rate is taken as a reopen would adopt
+/// it, through cpal's whole-hertz `SampleRate`: a device reporting a fraction must not restart a
+/// stream whose reopen lands on the rate it already runs.
 pub(crate) fn rate_moved(device_rate: f64, session_rate: f32) -> bool {
-    (device_rate - session_rate as f64).abs() > 0.1
+    let adopted = adopted_rate(Some(cpal::SampleRate(device_rate as u32)), session_rate);
+    (adopted - session_rate).abs() > 0.1
 }
 
 /// Whether a running stream polls its output's rate. An ASIO driver keeps calling back at its new
@@ -1073,7 +1076,8 @@ fn output_rate_now(duplex: bool, output: &CpalDevice) -> Option<f64> {
 
 /// The device a shared output named `name` opened on, watched only when its nominal rate is the
 /// rate the open adopted from cpal's read. Any other device, a wrong one of two alike or one whose
-/// rate cpal rounds, would restart the stream on every check; that run goes unwatched instead.
+/// nominal rate is not the stream format's, would restart the stream on every check; that run goes
+/// unwatched instead.
 fn watched_rate(name: Option<&str>, on_default: bool, session: f32) -> Option<DeviceRate> {
     let device = DeviceRate::resolve(name?, on_default)?;
     match device.read() {
@@ -2908,11 +2912,20 @@ mod tests {
     }
 
     #[test]
-    fn a_rate_change_is_anything_past_a_tenth_of_a_hertz() {
+    fn a_rate_moves_to_another_whole_hertz_rate() {
         assert!(!rate_moved(48_000.0, 48_000.0));
         assert!(!rate_moved(48_000.05, 48_000.0));
         assert!(rate_moved(44_100.0, 48_000.0));
         assert!(rate_moved(96_000.0, 48_000.0));
+    }
+
+    #[test]
+    fn a_fractional_rate_moves_only_when_a_reopen_would_adopt_another() {
+        let adopted = adopted_rate(Some(cpal::SampleRate(47_999.6 as u32)), 48_000.0);
+        assert_eq!(adopted, 47_999.0);
+        assert!(!rate_moved(47_999.6, adopted));
+        assert!(rate_moved(47_999.6, 48_000.0));
+        assert!(!rate_moved(44_100.9, 44_100.0));
     }
 
     #[test]
@@ -2997,7 +3010,7 @@ mod tests {
     fn only_a_device_at_the_adopted_rate_is_watched() {
         assert!(agrees(Some(48_000.0), 48_000.0));
         assert!(!agrees(Some(44_100.0), 48_000.0));
-        assert!(!agrees(Some(47_999.7), 47_999.0));
+        assert!(agrees(Some(47_999.7), 47_999.0));
         assert!(!agrees(None, 48_000.0));
     }
 

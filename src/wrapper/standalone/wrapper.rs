@@ -772,7 +772,17 @@ impl<P: Plugin, B: Backend<P>> Wrapper<P, B> {
                     Some(recovery.device_returned())
                 }
                 // The backend logged why.
-                RunOutcome::Restart => Some(recovery.restart()),
+                RunOutcome::Restart => {
+                    let action = recovery.restart(run_started.elapsed());
+                    if action != Action::ReinitNow {
+                        nih_log!(
+                            "The device needed a fresh stream less than {:?} into the run; \
+                             counting it as a failure",
+                            Recovery::MIN_RESTART_RUN
+                        );
+                    }
+                    Some(action)
+                }
                 RunOutcome::Reconfigure => None,
             };
             let mut step = match action {
