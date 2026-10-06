@@ -220,6 +220,10 @@ impl ParamMut for IntParam {
     }
 
     fn set_normalized_value(&self, normalized: f32) -> bool {
+        if normalized.is_nan() {
+            return false;
+        }
+
         // NOTE: The double conversion here is to make sure the state is reproducible. State is
         //       saved and restored using plain values, and the new normalized value will be
         //       different from `normalized`. This is not necessary for the modulation as these
@@ -228,6 +232,10 @@ impl ParamMut for IntParam {
     }
 
     fn modulate_value(&self, modulation_offset: f32) -> bool {
+        if modulation_offset.is_nan() {
+            return false;
+        }
+
         self.modulation_offset
             .store(modulation_offset, Ordering::Relaxed);
 
@@ -386,5 +394,18 @@ impl IntParam {
     pub fn hide_in_generic_ui(mut self) -> Self {
         self.flags.insert(ParamFlags::HIDE_IN_GENERIC_UI);
         self
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn nan_writes_are_no_ops() {
+        let param = IntParam::new("Test", 3, IntRange::Linear { min: 0, max: 10 });
+        assert!(!param.set_normalized_value(f32::NAN));
+        assert!(!param.modulate_value(f32::NAN));
+        assert_eq!(param.modulated_plain_value(), 3);
     }
 }

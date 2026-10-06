@@ -894,6 +894,13 @@ impl<P: ClapPlugin> Wrapper<P> {
         update_type: ClapParamUpdate,
         sample_rate: Option<f32>,
     ) -> bool {
+        let raw_value = match update_type {
+            ClapParamUpdate::PlainValueSet(value) | ClapParamUpdate::PlainValueMod(value) => value,
+        };
+        if !(raw_value as f32).is_finite() {
+            return false;
+        }
+
         match self.param_by_hash.get(&hash) {
             Some(param_ptr) => {
                 match update_type {
@@ -1501,6 +1508,10 @@ impl<P: ClapPlugin> Wrapper<P> {
         match (raw_event.space_id, raw_event.type_) {
             (CLAP_CORE_EVENT_SPACE_ID, CLAP_EVENT_PARAM_VALUE) => {
                 let event = &*(event as *const clap_event_param_value);
+                if !(event.value as f32).is_finite() {
+                    return;
+                }
+
                 self.update_plain_value_by_hash(
                     event.param_id,
                     ClapParamUpdate::PlainValueSet(event.value),
@@ -1527,6 +1538,9 @@ impl<P: ClapPlugin> Wrapper<P> {
             }
             (CLAP_CORE_EVENT_SPACE_ID, CLAP_EVENT_PARAM_MOD) => {
                 let event = &*(event as *const clap_event_param_mod);
+                if !(event.amount as f32).is_finite() {
+                    return;
+                }
 
                 if event.note_id != -1 && P::MIDI_INPUT >= MidiConfig::Basic {
                     match self.poly_mod_ids_by_hash.get(&event.param_id) {

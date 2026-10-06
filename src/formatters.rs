@@ -101,17 +101,35 @@ pub fn v2s_f32_gain_to_db(digits: usize) -> Arc<dyn Fn(f32) -> String + Send + S
 }
 
 /// Parse a decibel value to a linear voltage gain ratio. Handles the `dB` or `dBFS` units for you.
-/// Used in conjunction with [`v2s_f32_gain_to_db()`]. `-inf dB` will be parsed to 0.0.
+/// Used in conjunction with [`v2s_f32_gain_to_db()`]. `-inf`, `-inf dB` and `off` are parsed to
+/// 0.0. Any other non-finite input, or a decibel value whose gain overflows, is refused.
 pub fn s2v_f32_gain_to_db() -> Arc<dyn Fn(&str) -> Option<f32> + Send + Sync> {
     Arc::new(|string| {
-        let string = string.trim_end_matches(&[' ', 'd', 'D', 'b', 'B', 'f', 'F', 's', 'S']);
-        // NOTE: The above line strips the `f`, so checked for `-inf` here will always return false
-        if string.eq_ignore_ascii_case("-in") {
-            Some(0.0)
-        } else {
-            string.parse().ok().map(util::db_to_gain)
+        let string = strip_db_unit(string);
+        if string.eq_ignore_ascii_case("-inf") || string.eq_ignore_ascii_case("off") {
+            return Some(0.0);
         }
+
+        let gain = util::db_to_gain(string.parse::<f32>().ok().filter(|db| db.is_finite())?);
+        gain.is_finite().then_some(gain)
     })
+}
+
+/// Trims a trailing `dB` or `dBFS` unit (any case) and the whitespace around it.
+fn strip_db_unit(string: &str) -> &str {
+    let string = string.trim();
+    for unit in ["dbfs", "db"] {
+        let Some(split) = string.len().checked_sub(unit.len()) else {
+            continue;
+        };
+        if let (Some(number), Some(suffix)) = (string.get(..split), string.get(split..)) {
+            if suffix.eq_ignore_ascii_case(unit) {
+                return number.trim_end();
+            }
+        }
+    }
+
+    string
 }
 
 /// Turn an `f32` `[-1, 1]` value to a panning value where negative values are represented by
@@ -350,6 +368,35 @@ mod tests {
         // Sanity check
         assert_eq!("-0.01", v2s(-0.009));
         assert_eq!("0.01", v2s(0.009));
+    }
+
+    #[test]
+    fn s2v_f32_gain_to_db_silence_words_and_non_finite() {
+        let s2v = s2v_f32_gain_to_db();
+
+        for silence in ["-inf", "-inf dB", "-INF dBFS", "off", " Off ", "-inf db"] {
+            assert_eq!(s2v(silence), Some(0.0), "{silence:?}");
+        }
+        for refused in [
+            "nan",
+            "NaN dB",
+            "inf",
+            "+inf dB",
+            "infinity",
+            "-infinity",
+            "1e40",
+            "1e30 dB",
+            "",
+            "dB",
+        ] {
+            assert_eq!(s2v(refused), None, "{refused:?}");
+        }
+
+        assert_eq!(s2v("0 dB"), Some(1.0));
+        assert_eq!(s2v("-6.00 dBFS"), Some(util::db_to_gain(-6.0)));
+        assert_eq!(s2v("12"), Some(util::db_to_gain(12.0)));
+        assert_eq!(s2v("-120 dB"), Some(0.0));
+        assert_eq!(s2v("6 dBé"), None);
     }
 
     // More of these validators could use tests, but this one in particular is tricky and I noticed

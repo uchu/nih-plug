@@ -176,8 +176,12 @@ impl Param for FloatParam {
             // In the CLAP wrapper the unit will be included, so make sure to handle that
             None => string.trim().trim_end_matches(self.unit).parse().ok(),
         }?;
+        if !value.is_finite() {
+            return None;
+        }
 
-        Some(self.preview_normalized(value))
+        let normalized = self.preview_normalized(value);
+        normalized.is_finite().then_some(normalized)
     }
 
     #[inline]
@@ -205,6 +209,10 @@ impl Param for FloatParam {
 
 impl ParamMut for FloatParam {
     fn set_plain_value(&self, plain: Self::Plain) -> bool {
+        if plain.is_nan() {
+            return false;
+        }
+
         let unmodulated_value = plain;
         let unmodulated_normalized_value = self.preview_normalized(plain);
 
@@ -248,6 +256,10 @@ impl ParamMut for FloatParam {
     }
 
     fn modulate_value(&self, modulation_offset: f32) -> bool {
+        if modulation_offset.is_nan() {
+            return false;
+        }
+
         self.modulation_offset
             .store(modulation_offset, Ordering::Relaxed);
 
@@ -440,4 +452,84 @@ fn decimals_from_step_size(step_size: f32) -> usize {
     }
 
     num_digits as usize
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::formatters;
+    use crate::util;
+
+    fn param() -> FloatParam {
+        FloatParam::new("Test", 0.5, FloatRange::Linear { min: 0.0, max: 1.0 })
+    }
+
+    #[test]
+    fn text_refuses_non_finite_and_overflow() {
+        let param = param();
+        for refused in [
+            "nan",
+            "NaN",
+            "inf",
+            "-inf",
+            "infinity",
+            "-infinity",
+            "1e40",
+            "-1e40",
+        ] {
+            assert_eq!(
+                param.string_to_normalized_value(refused),
+                None,
+                "{refused:?}"
+            );
+        }
+
+        assert_eq!(param.string_to_normalized_value("5"), Some(1.0));
+        assert_eq!(param.string_to_normalized_value("-5"), Some(0.0));
+        assert_eq!(param.string_to_normalized_value("0.25"), Some(0.25));
+    }
+
+    #[test]
+    fn text_refuses_non_finite_from_a_custom_parser() {
+        let param = param().with_string_to_value(Arc::new(|s| s.parse().ok()));
+        assert_eq!(param.string_to_normalized_value("nan"), None);
+        assert_eq!(param.string_to_normalized_value("inf"), None);
+        assert_eq!(param.string_to_normalized_value("2"), Some(1.0));
+    }
+
+    #[test]
+    fn gain_knob_text_reads_minus_inf_and_off_as_silence() {
+        let param = FloatParam::new(
+            "Gain",
+            1.0,
+            FloatRange::Skewed {
+                min: 0.0,
+                max: util::db_to_gain(12.0),
+                factor: FloatRange::gain_skew_factor(-60.0, 12.0),
+            },
+        )
+        .with_unit(" dB")
+        .with_value_to_string(formatters::v2s_f32_gain_to_db(2))
+        .with_string_to_value(formatters::s2v_f32_gain_to_db());
+
+        assert_eq!(param.string_to_normalized_value("-inf dB"), Some(0.0));
+        assert_eq!(param.string_to_normalized_value("off"), Some(0.0));
+        assert_eq!(param.string_to_normalized_value("inf"), None);
+        assert_eq!(param.string_to_normalized_value("nan dB"), None);
+        assert_eq!(param.string_to_normalized_value("40 dB"), Some(1.0));
+        assert_eq!(param.normalized_value_to_string(0.0, true), "-inf dB");
+    }
+
+    #[test]
+    fn nan_writes_are_no_ops() {
+        let param = param();
+        assert!(param.set_plain_value(0.25));
+
+        assert!(!param.set_plain_value(f32::NAN));
+        assert!(!param.set_normalized_value(f32::NAN));
+        assert!(!param.modulate_value(f32::NAN));
+        assert_eq!(param.modulated_plain_value(), 0.25);
+        assert_eq!(param.unmodulated_normalized_value(), 0.25);
+        assert_eq!(param.modulation_offset.load(Ordering::Relaxed), 0.0);
+    }
 }

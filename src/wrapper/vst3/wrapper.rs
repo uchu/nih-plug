@@ -1091,6 +1091,9 @@ impl<P: Vst3Plugin> IAudioProcessorTrait for Wrapper<P> {
                                     total_buffer_len as u32,
                                 );
                                 let value = value as f32;
+                                if !value.is_finite() {
+                                    continue;
+                                }
 
                                 // MIDI CC messages, channel pressure, and pitch bend are also sent
                                 // as parameter changes

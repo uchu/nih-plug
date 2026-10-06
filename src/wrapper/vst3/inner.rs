@@ -8,7 +8,7 @@ use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 use vst3::Steinberg::Vst::{IComponentHandler, IComponentHandlerTrait, RestartFlags_};
-use vst3::Steinberg::{kInvalidArgument, kResultOk, tresult};
+use vst3::Steinberg::{kInvalidArgument, kResultFalse, kResultOk, tresult};
 use vst3::{ComPtr, ComWrapper};
 
 use super::context::{WrapperGuiContext, WrapperInitContext, WrapperProcessContext};
@@ -508,6 +508,10 @@ impl<P: Vst3Plugin> WrapperInner<P> {
         normalized_value: f32,
         sample_rate: Option<f32>,
     ) -> tresult {
+        if !normalized_value.is_finite() {
+            return kResultFalse;
+        }
+
         match self.param_by_hash.get(&hash) {
             Some(param_ptr) => {
                 if unsafe { param_ptr.set_normalized_value(normalized_value) } {
