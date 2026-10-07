@@ -1232,24 +1232,71 @@ impl Liveness {
     }
 }
 
-/// A full input ring drops the sample and counts it, never spins (A5): duplex callbacks share the
-/// driver thread, so a spin there never ends, and on a shared host the output may have stopped for
-/// good while the capture still runs, which a spin turns into a hang when the capture stream is
-/// dropped.
-pub(crate) fn ring_push(producer: &mut rtrb::Producer<f32>, sample: f32, overflows: &AtomicU64) {
-    if producer.push(sample).is_err() {
-        overflows.fetch_add(1, Ordering::Relaxed);
+/// The capture callback's body: folds the device's interleaved frames into frames of the plugin's
+/// main input channel count and pushes each one whole, or drops it whole and counts its samples
+/// when the ring has no room for it. It never spins (A5): duplex callbacks share the driver
+/// thread, so a spin there never ends, and on a shared host the output may have stopped for good
+/// while the capture still runs, which a spin turns into a hang when the capture stream is
+/// dropped. Each frame reaches the output in a single commit, so an output callback running
+/// concurrently on another thread never sees half of one.
+fn capture_into_ring<T>(
+    data: &[T],
+    device_channels: usize,
+    plugin_channels: usize,
+    producer: &mut rtrb::Producer<f32>,
+    overflows: &AtomicU64,
+) where
+    T: Sample,
+    f32: FromSample<T>,
+{
+    for frame in data.chunks_exact(device_channels.max(1)) {
+        match producer.write_chunk_uninit(plugin_channels) {
+            Ok(chunk) => {
+                chunk.fill_from_iter(fold_frame(frame, device_channels, plugin_channels));
+            }
+            Err(_) => {
+                overflows.fetch_add(plugin_channels as u64, Ordering::Relaxed);
+            }
+        }
     }
 }
 
-/// An empty input ring on the output side is silence for this sample, counted (A5). The output
-/// never waits for the capture: a capture that died would hold the output callback, and with it
-/// the end of the run, forever.
-pub(crate) fn ring_pop(consumer: &mut rtrb::Consumer<f32>, underruns: &AtomicU64) -> f32 {
-    consumer.pop().unwrap_or_else(|_| {
-        underruns.fetch_add(1, Ordering::Relaxed);
-        0.0
-    })
+/// The output callback's input read: fills `frames` frames of channel-major `storage` from whole
+/// interleaved frames of `ring_channels` samples. A ring holding less than a frame is silence for
+/// that frame, counted (A5), and the samples already there stay for the next read, so the ring
+/// stays frame-aligned while the capture pushes concurrently. The output never waits for the
+/// capture: a capture that died would hold the output callback, and with it the end of the run,
+/// forever. Storage channels past the ring's are silenced; ring channels without a storage
+/// channel are still consumed.
+fn ring_into_storage(
+    consumer: &mut rtrb::Consumer<f32>,
+    storage: &mut [Vec<f32>],
+    ring_channels: usize,
+    frames: usize,
+    underruns: &AtomicU64,
+) {
+    for frame in 0..frames {
+        match consumer.read_chunk(ring_channels) {
+            Ok(chunk) => {
+                let (first, second) = chunk.as_slices();
+                for (channel, &sample) in first.iter().chain(second).enumerate() {
+                    if let Some(dst) = storage.get_mut(channel) {
+                        dst[frame] = sample;
+                    }
+                }
+                chunk.commit_all();
+            }
+            Err(_) => {
+                for dst in storage.iter_mut().take(ring_channels) {
+                    dst[frame] = 0.0;
+                }
+                underruns.fetch_add(ring_channels as u64, Ordering::Relaxed);
+            }
+        }
+    }
+    for dst in storage.iter_mut().skip(ring_channels) {
+        dst[..frames].fill(0.0);
+    }
 }
 
 /// Discards all but the newest `keep` samples. The capture can run alone for a period between its
@@ -2290,9 +2337,13 @@ impl CpalMidir {
                 super::super::wrapper::promote_audio_thread();
             }
 
-            fold_input_frames(data, device_channels, plugin_channels, |sample| {
-                ring_push(&mut input_rb_producer, sample, &overflows);
-            });
+            capture_into_ring(
+                data,
+                device_channels,
+                plugin_channels,
+                &mut input_rb_producer,
+                &overflows,
+            );
 
             // The run function is blocked until a single period has been processed here. After this
             // point output playback can start.
@@ -2452,11 +2503,12 @@ impl CpalMidir {
                 // write-only (with `BufferManager` always zeroing them out when creating the buffers).
                 match &mut input_rb_consumer {
                     Some(input_rb_consumer) => {
-                        deinterleave_frames(
-                            || ring_pop(input_rb_consumer, &underruns),
+                        ring_into_storage(
+                            input_rb_consumer,
                             &mut main_io_storage,
                             num_input_channels,
                             chunk_size,
+                            &underruns,
                         );
                     }
                     None => {
@@ -2615,49 +2667,22 @@ fn input_source_channel(plugin_channel: usize, device_channels: usize) -> Option
     }
 }
 
-/// Converts one capture callback's interleaved device frames into interleaved frames of the
-/// plugin's main input channel count, handing each sample to `push` in order.
-fn fold_input_frames<T>(
-    data: &[T],
+/// One interleaved device frame as a frame of the plugin's main input channel count.
+fn fold_frame<T>(
+    frame: &[T],
     device_channels: usize,
     plugin_channels: usize,
-    mut push: impl FnMut(f32),
-) where
+) -> impl Iterator<Item = f32> + '_
+where
     T: Sample,
     f32: FromSample<T>,
 {
-    for frame in data.chunks_exact(device_channels.max(1)) {
-        for plugin_channel in 0..plugin_channels {
-            push(
-                match input_source_channel(plugin_channel, device_channels) {
-                    Some(source) => frame[source].to_sample::<f32>(),
-                    None => 0.0,
-                },
-            );
+    (0..plugin_channels).map(move |plugin_channel| {
+        match input_source_channel(plugin_channel, device_channels) {
+            Some(source) => frame[source].to_sample::<f32>(),
+            None => 0.0,
         }
-    }
-}
-
-/// Fills channel-major `storage` from `frames` interleaved frames of `ring_channels` samples
-/// each, pulled in order from `next_sample`. Storage channels past the ring's are silenced; ring
-/// channels without a storage channel are still consumed so the ring stays frame-aligned.
-fn deinterleave_frames(
-    mut next_sample: impl FnMut() -> f32,
-    storage: &mut [Vec<f32>],
-    ring_channels: usize,
-    frames: usize,
-) {
-    for frame in 0..frames {
-        for channel in 0..ring_channels {
-            let sample = next_sample();
-            if let Some(dst) = storage.get_mut(channel) {
-                dst[frame] = sample;
-            }
-        }
-    }
-    for dst in storage.iter_mut().skip(ring_channels) {
-        dst[..frames].fill(0.0);
-    }
+    })
 }
 
 /// Sort key over the capture configurations that can run the stream: the fewest channels that
@@ -2712,12 +2737,23 @@ mod tests {
     use clap::Parser;
 
     fn through_the_backend(device: &[f32], device_channels: usize, frames: usize) -> Vec<Vec<f32>> {
-        let mut ring = Vec::new();
-        fold_input_frames(device, device_channels, 2, |sample| ring.push(sample));
+        let (mut producer, mut consumer) = rtrb::RingBuffer::<f32>::new(2 * frames);
+        let overflows = AtomicU64::new(0);
+        capture_into_ring(device, device_channels, 2, &mut producer, &overflows);
         let mut storage = vec![vec![f32::NAN; frames]; 2];
-        let mut popped = ring.into_iter();
-        deinterleave_frames(|| popped.next().unwrap(), &mut storage, 2, frames);
+        let underruns = AtomicU64::new(0);
+        ring_into_storage(&mut consumer, &mut storage, 2, frames, &underruns);
+        assert_eq!(overflows.load(Ordering::Relaxed), 0);
+        assert_eq!(underruns.load(Ordering::Relaxed), 0);
         storage
+    }
+
+    fn ring_of(samples: &[f32]) -> rtrb::Consumer<f32> {
+        let (mut producer, consumer) = rtrb::RingBuffer::<f32>::new(samples.len());
+        for &sample in samples {
+            producer.push(sample).unwrap();
+        }
+        consumer
     }
 
     #[test]
@@ -2793,26 +2829,28 @@ mod tests {
 
     #[test]
     fn storage_channels_past_the_ring_are_silenced_and_extra_ring_channels_dropped() {
+        let underruns = AtomicU64::new(0);
         let mut wide = vec![vec![f32::NAN; 3]; 4];
-        let mut ring = [1.0f32, 2.0, 3.0, 4.0, 5.0, 6.0].into_iter();
-        deinterleave_frames(|| ring.next().unwrap(), &mut wide, 2, 3);
+        let mut ring = ring_of(&[1.0, 2.0, 3.0, 4.0, 5.0, 6.0]);
+        ring_into_storage(&mut ring, &mut wide, 2, 3, &underruns);
         assert_eq!(wide[0], vec![1.0, 3.0, 5.0]);
         assert_eq!(wide[1], vec![2.0, 4.0, 6.0]);
         assert_eq!(wide[2], vec![0.0; 3]);
         assert_eq!(wide[3], vec![0.0; 3]);
 
         let mut narrow = vec![vec![f32::NAN; 2]; 1];
-        let mut ring = [1.0f32, 2.0, 3.0, 4.0].into_iter();
-        deinterleave_frames(|| ring.next().unwrap(), &mut narrow, 2, 2);
+        let mut ring = ring_of(&[1.0, 2.0, 3.0, 4.0]);
+        ring_into_storage(&mut ring, &mut narrow, 2, 2, &underruns);
         assert_eq!(narrow[0], vec![1.0, 3.0]);
-        assert!(ring.next().is_none(), "the ring must stay frame-aligned");
+        assert!(ring.is_empty(), "the ring must stay frame-aligned");
+        assert_eq!(underruns.load(Ordering::Relaxed), 0);
     }
 
     #[test]
     fn a_partial_chunk_leaves_the_tail_of_the_period_alone() {
         let mut storage = vec![vec![7.0f32; 4]; 2];
-        let mut ring = [1.0f32, 2.0].into_iter();
-        deinterleave_frames(|| ring.next().unwrap(), &mut storage, 2, 1);
+        let mut ring = ring_of(&[1.0, 2.0]);
+        ring_into_storage(&mut ring, &mut storage, 2, 1, &AtomicU64::new(0));
         assert_eq!(storage[0], vec![1.0, 7.0, 7.0, 7.0]);
         assert_eq!(storage[1], vec![2.0, 7.0, 7.0, 7.0]);
     }
@@ -2827,8 +2865,9 @@ mod tests {
     #[test]
     fn integer_devices_convert_on_the_way_in() {
         let device: [i16; 4] = [i16::MAX, 0, 0, i16::MIN];
-        let mut ring = Vec::new();
-        fold_input_frames(&device, 2, 2, |sample| ring.push(sample));
+        let (mut producer, mut consumer) = rtrb::RingBuffer::<f32>::new(4);
+        capture_into_ring(&device, 2, 2, &mut producer, &AtomicU64::new(0));
+        let ring: Vec<f32> = std::iter::from_fn(|| consumer.pop().ok()).collect();
         assert!((ring[0] - 1.0).abs() < 1.0e-4);
         assert_eq!(ring[1], 0.0);
         assert_eq!(ring[2], 0.0);
@@ -2857,18 +2896,77 @@ mod tests {
     }
 
     #[test]
-    fn a_full_input_ring_drops_and_counts_instead_of_spinning() {
-        let (mut producer, mut consumer) = rtrb::RingBuffer::<f32>::new(2);
+    fn a_full_input_ring_drops_whole_frames_and_counts_instead_of_spinning() {
+        let (mut producer, mut consumer) = rtrb::RingBuffer::<f32>::new(3);
         let overflows = AtomicU64::new(0);
-        ring_push(&mut producer, 1.0, &overflows);
-        ring_push(&mut producer, 2.0, &overflows);
-        ring_push(&mut producer, 3.0, &overflows);
-        assert_eq!(overflows.load(Ordering::Relaxed), 1);
+        capture_into_ring(&[1.0f32, 2.0, 3.0, 4.0], 2, 2, &mut producer, &overflows);
+        assert_eq!(overflows.load(Ordering::Relaxed), 2);
+        assert_eq!(
+            consumer.slots(),
+            2,
+            "no half of the dropped frame is left behind"
+        );
+
         let underruns = AtomicU64::new(0);
-        assert_eq!(ring_pop(&mut consumer, &underruns), 1.0);
-        assert_eq!(ring_pop(&mut consumer, &underruns), 2.0);
-        assert_eq!(ring_pop(&mut consumer, &underruns), 0.0);
-        assert_eq!(underruns.load(Ordering::Relaxed), 1);
+        let mut storage = vec![vec![f32::NAN; 2]; 2];
+        ring_into_storage(&mut consumer, &mut storage, 2, 2, &underruns);
+        assert_eq!(storage, vec![vec![1.0, 0.0], vec![2.0, 0.0]]);
+        assert_eq!(underruns.load(Ordering::Relaxed), 2);
+    }
+
+    #[test]
+    fn half_a_frame_in_the_ring_is_silence_and_the_channels_stay_in_place() {
+        let (mut producer, mut consumer) = rtrb::RingBuffer::<f32>::new(8);
+        let underruns = AtomicU64::new(0);
+        let mut storage = vec![vec![f32::NAN; 1]; 2];
+
+        producer.push(1.0).unwrap();
+        ring_into_storage(&mut consumer, &mut storage, 2, 1, &underruns);
+        assert_eq!(storage, vec![vec![0.0], vec![0.0]]);
+        assert_eq!(underruns.load(Ordering::Relaxed), 2);
+
+        for sample in [-1.0, 1.0, -1.0] {
+            producer.push(sample).unwrap();
+        }
+        for _ in 0..2 {
+            ring_into_storage(&mut consumer, &mut storage, 2, 1, &underruns);
+            assert_eq!(storage, vec![vec![1.0], vec![-1.0]]);
+        }
+        assert_eq!(underruns.load(Ordering::Relaxed), 2);
+    }
+
+    #[test]
+    fn concurrent_capture_and_output_never_swap_the_channels() {
+        const PERIOD: usize = 64;
+        const PERIODS: usize = 2000;
+        let (mut producer, mut consumer) = rtrb::RingBuffer::<f32>::new(2 * PERIOD * 2);
+        let overflows = Arc::new(AtomicU64::new(0));
+        let capture = {
+            let overflows = overflows.clone();
+            std::thread::spawn(move || {
+                let period = [1.0f32, -1.0].repeat(PERIOD);
+                for _ in 0..PERIODS {
+                    capture_into_ring(&period, 2, 2, &mut producer, &overflows);
+                    std::thread::yield_now();
+                }
+            })
+        };
+
+        let underruns = AtomicU64::new(0);
+        let mut storage = vec![vec![0.0f32; PERIOD]; 2];
+        for _ in 0..PERIODS {
+            ring_into_storage(&mut consumer, &mut storage, 2, PERIOD, &underruns);
+            for (&left, &right) in storage[0].iter().zip(&storage[1]) {
+                assert!(
+                    (left, right) == (1.0, -1.0) || (left, right) == (0.0, 0.0),
+                    "frame ({left}, {right}) is misaligned"
+                );
+            }
+            std::thread::yield_now();
+        }
+        capture.join().unwrap();
+        assert_eq!(underruns.load(Ordering::Relaxed) % 2, 0);
+        assert_eq!(overflows.load(Ordering::Relaxed) % 2, 0);
     }
 
     /// Runs `f` on its own thread and fails, instead of hanging the suite, when it never returns.
@@ -2891,7 +2989,7 @@ mod tests {
         returns_within_a_second(move || {
             let underruns = AtomicU64::new(0);
             let mut storage = vec![vec![f32::NAN; 64]; 2];
-            deinterleave_frames(|| ring_pop(&mut consumer, &underruns), &mut storage, 2, 64);
+            ring_into_storage(&mut consumer, &mut storage, 2, 64, &underruns);
             assert!(storage.iter().flatten().all(|&sample| sample == 0.0));
             assert_eq!(underruns.load(Ordering::Relaxed), 128);
         });
@@ -2905,9 +3003,7 @@ mod tests {
             let overflows = AtomicU64::new(0);
             let period = vec![0.5f32; 2 * 64];
             for _ in 0..3 {
-                fold_input_frames(&period, 2, 2, |sample| {
-                    ring_push(&mut producer, sample, &overflows)
-                });
+                capture_into_ring(&period, 2, 2, &mut producer, &overflows);
             }
             assert_eq!(overflows.load(Ordering::Relaxed), 128);
         });
