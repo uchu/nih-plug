@@ -1299,10 +1299,10 @@ fn ring_into_storage(
     }
 }
 
-/// Discards all but the newest `keep` samples. The capture can run alone for a period between its
-/// start and the output's, so the output's first period would otherwise play that backlog and
-/// carry it as latency for the rest of the run.
-pub(crate) fn duplex_discard_backlog(consumer: &mut rtrb::Consumer<f32>, keep: usize) {
+/// Discards all but the newest `keep` samples, whole frames when `keep` is. The capture runs alone
+/// between its start and the output's, so the output's first period would otherwise play that
+/// backlog and carry it as latency for the rest of the run.
+pub(crate) fn discard_input_backlog(consumer: &mut rtrb::Consumer<f32>, keep: usize) {
     let stale = consumer.slots().saturating_sub(keep);
     if let Ok(chunk) = consumer.read_chunk(stale) {
         chunk.commit_all();
@@ -2459,20 +2459,22 @@ impl CpalMidir {
         // Can't borrow from `self` in the callback
         let config = self.config.clone();
         let mut num_processed_samples = 0usize;
-        let duplex = self.duplex;
         let overflows = self.overflows.clone();
         let underruns = self.underruns.clone();
         let mut backlog_discarded = false;
         move |data, _info| {
             liveness.stamp();
-            if duplex && !backlog_discarded {
+            if !backlog_discarded {
                 backlog_discarded = true;
-                // The capture callback runs first in every driver period, so from here on the
-                // ring holds exactly the period being processed. What it dropped before the
-                // output started is not an xrun.
+                // One period is kept. A duplex driver runs the capture callback first in every
+                // period, so from here on the ring holds exactly the period being processed. On a
+                // shared host the capture may have filled the ring while the output was being
+                // built; one period leaves a period of headroom either way for the jitter between
+                // the two devices' callbacks. What the capture dropped before the output started
+                // is not an xrun.
                 if let Some(input_rb_consumer) = &mut input_rb_consumer {
                     let frames = data.len() / device_output_channels.max(1);
-                    duplex_discard_backlog(input_rb_consumer, frames * num_input_channels);
+                    discard_input_backlog(input_rb_consumer, frames * num_input_channels);
                 }
                 overflows.store(0, Ordering::Relaxed);
             }
@@ -3094,14 +3096,40 @@ mod tests {
         for sample in 1..=6 {
             producer.push(sample as f32).unwrap();
         }
-        duplex_discard_backlog(&mut consumer, 2);
+        discard_input_backlog(&mut consumer, 2);
         assert_eq!(consumer.pop(), Ok(5.0));
         assert_eq!(consumer.pop(), Ok(6.0));
         assert!(consumer.pop().is_err());
 
         producer.push(7.0).unwrap();
-        duplex_discard_backlog(&mut consumer, 4);
+        discard_input_backlog(&mut consumer, 4);
         assert_eq!(consumer.pop(), Ok(7.0), "a short backlog is kept whole");
+    }
+
+    #[test]
+    fn a_shared_host_ring_filled_before_the_output_started_keeps_a_period_of_headroom() {
+        const PERIOD: usize = 4;
+        let (mut producer, mut consumer) = rtrb::RingBuffer::<f32>::new(2 * PERIOD * 2);
+        let overflows = AtomicU64::new(0);
+        let period: Vec<f32> = (0..PERIOD).flat_map(|i| [i as f32, -(i as f32)]).collect();
+        for _ in 0..3 {
+            capture_into_ring(&period, 2, 2, &mut producer, &overflows);
+        }
+        assert_eq!(overflows.load(Ordering::Relaxed), 2 * PERIOD as u64);
+
+        discard_input_backlog(&mut consumer, PERIOD * 2);
+        overflows.store(0, Ordering::Relaxed);
+        capture_into_ring(&period, 2, 2, &mut producer, &overflows);
+        assert_eq!(
+            overflows.load(Ordering::Relaxed),
+            0,
+            "an early capture period fits"
+        );
+
+        let mut storage = vec![vec![f32::NAN; PERIOD]; 2];
+        ring_into_storage(&mut consumer, &mut storage, 2, PERIOD, &AtomicU64::new(0));
+        assert_eq!(storage[0], vec![0.0, 1.0, 2.0, 3.0]);
+        assert_eq!(storage[1], vec![0.0, -1.0, -2.0, -3.0]);
     }
 
     #[test]
