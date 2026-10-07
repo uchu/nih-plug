@@ -154,6 +154,21 @@ impl OpenedDevicesSoFar {
     }
 }
 
+/// What to watch after an open: the requested devices it could not open, a quarantined one left
+/// alone for the quarantine first.
+fn watch_after_open(
+    absent: Vec<Wanted>,
+    refused: Vec<Wanted>,
+    quarantined: &[Wanted],
+    now: Instant,
+) -> DeviceWatch {
+    let mut watch = DeviceWatch::new(absent, refused, now);
+    for wanted in quarantined {
+        watch.quarantine(wanted, now);
+    }
+    watch
+}
+
 /// The devices a start or restart opened, and the requested ones it could not.
 struct OpenedDevices {
     output: CpalDevice,
@@ -1408,12 +1423,12 @@ impl CpalMidir {
         self.quarantined.clear();
         self.output = Some(opened.output);
         self.input = opened.input;
-        let now = Instant::now();
-        let mut watch = DeviceWatch::new(opened.absent, opened.refused, now);
-        for wanted in &opened.quarantined {
-            watch.quarantine(wanted, now);
-        }
-        *self.watch.lock() = watch;
+        *self.watch.lock() = watch_after_open(
+            opened.absent,
+            opened.refused,
+            &opened.quarantined,
+            Instant::now(),
+        );
         *self.in_use.lock() = opened.in_use;
         asio_driver::set_driver_open(self.duplex);
     }
@@ -2819,6 +2834,25 @@ mod tests {
             }
             assert_eq!(overflows.load(Ordering::Relaxed), 128);
         });
+    }
+
+    #[test]
+    fn a_device_the_stream_kept_dying_on_is_probed_after_the_quarantine() {
+        let t0 = Instant::now();
+        let apollo = Wanted {
+            name: "Apollo".to_string(),
+            kind: Kind::Output,
+        };
+        let mut opened = OpenedDevicesSoFar::default();
+        opened.refused(apollo.clone(), std::slice::from_ref(&apollo));
+        assert!(opened.refused.is_empty());
+        let mut watch = watch_after_open(opened.absent, opened.refused, &opened.quarantined, t0);
+        assert!(!watch.is_idle());
+        let here = vec!["Speakers".to_string(), "Apollo".to_string()];
+        assert!(watch
+            .due(&here, t0 + DeviceWatch::QUARANTINE - Duration::from_secs(1))
+            .is_empty());
+        assert_eq!(watch.due(&here, t0 + DeviceWatch::QUARANTINE), vec![apollo]);
     }
 
     #[test]

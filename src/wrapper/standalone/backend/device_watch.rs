@@ -106,31 +106,39 @@ impl DeviceWatch {
     /// A listed device that would not open, found out after the attempt (a capture that failed to
     /// start): watched from now on like any refused device.
     pub fn refuse(&mut self, wanted: Wanted, now: Instant) {
-        let entry = match self.entry(&wanted) {
-            Some(entry) => entry,
-            None => {
-                self.watched.push(Watched::new(wanted));
-                self.watched.last_mut().expect("just pushed")
-            }
-        };
+        let entry = self.entry_or_new(&wanted);
         entry.present = true;
         entry.probe_failed(now);
     }
 
     /// The stream on `wanted` kept dying: leave it alone for [`QUARANTINE`](Self::QUARANTINE),
-    /// then probe it at the slowest pace. A replug ends the quarantine early.
+    /// then probe it at the slowest pace. A replug ends the quarantine early. The device was open
+    /// until now, so it is usually not watched yet: it is from here on.
     pub fn quarantine(&mut self, wanted: &Wanted, now: Instant) {
-        if let Some(entry) = self.entry(wanted) {
-            entry.present = true;
-            entry.next_probe = Some(now + Self::QUARANTINE);
-            entry.retry = Self::MAX_RETRY;
-        }
+        let entry = self.entry_or_new(wanted);
+        entry.present = true;
+        entry.next_probe = Some(now + Self::QUARANTINE);
+        entry.retry = Self::MAX_RETRY;
     }
 
     fn entry(&mut self, wanted: &Wanted) -> Option<&mut Watched> {
         self.watched
             .iter_mut()
             .find(|entry| entry.wanted == *wanted)
+    }
+
+    fn entry_or_new(&mut self, wanted: &Wanted) -> &mut Watched {
+        match self
+            .watched
+            .iter()
+            .position(|entry| entry.wanted == *wanted)
+        {
+            Some(index) => &mut self.watched[index],
+            None => {
+                self.watched.push(Watched::new(wanted.clone()));
+                self.watched.last_mut().expect("just pushed")
+            }
+        }
     }
 }
 
@@ -324,6 +332,24 @@ mod tests {
             watch.due(&here, t0 + DeviceWatch::QUARANTINE + DeviceWatch::MAX_RETRY),
             vec![output("Apollo")]
         );
+    }
+
+    #[test]
+    fn a_device_quarantined_straight_from_the_stream_is_watched() {
+        let t0 = Instant::now();
+        let here = names(&["Speakers", "Apollo"]);
+        let mut watch = DeviceWatch::new(Vec::new(), Vec::new(), t0);
+        watch.quarantine(&output("Apollo"), t0);
+        assert!(!watch.is_idle());
+        assert!(watch
+            .due(&here, t0 + DeviceWatch::QUARANTINE - secs(1))
+            .is_empty());
+        assert_eq!(
+            watch.due(&here, t0 + DeviceWatch::QUARANTINE),
+            vec![output("Apollo")]
+        );
+        watch.quarantine(&output("Apollo"), t0);
+        assert_eq!(watch.watched.len(), 1);
     }
 
     #[test]
