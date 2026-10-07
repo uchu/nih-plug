@@ -12,7 +12,7 @@ use rtrb::RingBuffer;
 use std::borrow::Borrow;
 use std::num::NonZeroU32;
 use std::ptr::NonNull;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicU8, Ordering};
 use std::sync::Arc;
 use std::thread::ScopedJoinHandle;
 use std::time::{Duration, Instant};
@@ -86,6 +86,8 @@ pub struct CpalMidir {
     /// Requested devices the stream kept dying on: the next restart stands something else in
     /// for them and the watch leaves them alone for a while.
     quarantined: Vec<Wanted>,
+    /// Which sides the last run's error callbacks failed (`OUTPUT_FAILED`, `INPUT_FAILED`).
+    failed_sides: u8,
 }
 
 /// All data needed for a CPAL input or output stream.
@@ -152,6 +154,32 @@ impl OpenedDevicesSoFar {
             self.refused.push(wanted);
         }
     }
+}
+
+/// The side a capture error callback failed.
+const INPUT_FAILED: u8 = 1 << 0;
+/// The side a playback error callback failed.
+const OUTPUT_FAILED: u8 = 1 << 1;
+
+/// The requested devices to quarantine after the stream kept failing: the ones open on a side that
+/// failed. A failure no error callback named (a stream that did not build or start, a restart the
+/// output needed) is the output's.
+fn to_quarantine(in_use: &AudioDevicesInUse, failed_sides: u8) -> Vec<Wanted> {
+    let failed_sides = if failed_sides == 0 {
+        OUTPUT_FAILED
+    } else {
+        failed_sides
+    };
+    let side = |failed: u8, name: &Option<String>, kind: Kind| {
+        (failed_sides & failed != 0)
+            .then(|| name.clone())
+            .flatten()
+            .map(|name| Wanted { name, kind })
+    };
+    side(OUTPUT_FAILED, &in_use.output, Kind::Output)
+        .into_iter()
+        .chain(side(INPUT_FAILED, &in_use.input, Kind::Input))
+        .collect()
 }
 
 /// What to watch after an open: the requested devices it could not open, a quarantined one left
@@ -245,6 +273,7 @@ impl<P: Plugin> Backend<P> for CpalMidir {
         // process callback below when the caller's `cb` requests a stop. If neither is set the
         // wakeup came from `should_stop`.
         let stream_error = Arc::new(AtomicBool::new(false));
+        let failed_sides = Arc::new(AtomicU8::new(0));
         let callback_stopped = Arc::new(AtomicBool::new(false));
         // A duplex driver never reports a dead stream, so the output callback stamps this and the
         // wait below watches it (A6).
@@ -274,7 +303,7 @@ impl<P: Plugin> Backend<P> for CpalMidir {
         // realtime unsafe, and to be able to output MIDI with midir you need to transform between
         // `MidiOutputPort` and `MidiOutputPortConnection` types by taking values out of an
         // `Option`.
-        std::thread::scope(|s| {
+        let outcome = std::thread::scope(|s| {
             // This thread needs to be blocked until audio processing ends as CPAL processes the
             // streams on other threads. Created up front so the input stream's error callback can
             // also wake it (a dead capture stream mid-session should end the run, not leave the
@@ -310,8 +339,10 @@ impl<P: Plugin> Backend<P> for CpalMidir {
                     let input_unparker = input_unparker.clone();
                     let main_unparker = unparker.clone();
                     let stream_error = stream_error.clone();
+                    let failed_sides = failed_sides.clone();
                     move |err| {
                         nih_error!("Error during capture: {err:#}");
+                        failed_sides.fetch_or(INPUT_FAILED, Ordering::AcqRel);
                         stream_error.store(true, Ordering::Release);
                         input_unparker.clone().unpark();
                         main_unparker.clone().unpark();
@@ -389,6 +420,7 @@ impl<P: Plugin> Backend<P> for CpalMidir {
                     // The capture stream is gone and can no longer raise the flag, so a start
                     // failure it reported must not end the run
                     stream_error.store(false, Ordering::Release);
+                    failed_sides.fetch_and(!INPUT_FAILED, Ordering::AcqRel);
                     input_rb_consumer = None;
                 }
                 _input_stream = stream;
@@ -553,8 +585,10 @@ impl<P: Plugin> Backend<P> for CpalMidir {
             let error_cb = {
                 let unparker = unparker.clone();
                 let stream_error = stream_error.clone();
+                let failed_sides = failed_sides.clone();
                 move |err| {
                     nih_error!("Error during playback: {err:#}");
+                    failed_sides.fetch_or(OUTPUT_FAILED, Ordering::AcqRel);
                     stream_error.store(true, Ordering::Release);
                     unparker.clone().unpark();
                 }
@@ -744,7 +778,9 @@ impl<P: Plugin> Backend<P> for CpalMidir {
                 nih_log!("Restarting the audio stream: {reason}");
             }
             outcome
-        })
+        });
+        self.failed_sides = failed_sides.load(Ordering::Acquire);
+        outcome
     }
 
     fn reinit(&mut self) -> Result<()> {
@@ -862,19 +898,7 @@ impl<P: Plugin> Backend<P> for CpalMidir {
             // nothing to stand in for it: wait for the hardware instead.
             return false;
         }
-        let in_use = self.in_use.lock().clone();
-        let quarantined: Vec<Wanted> = in_use
-            .output
-            .map(|name| Wanted {
-                name,
-                kind: Kind::Output,
-            })
-            .into_iter()
-            .chain(in_use.input.map(|name| Wanted {
-                name,
-                kind: Kind::Input,
-            }))
-            .collect();
+        let quarantined = to_quarantine(&self.in_use.lock(), self.failed_sides);
         if quarantined.is_empty() {
             return false;
         }
@@ -1371,6 +1395,7 @@ impl CpalMidir {
             )),
             in_use: Mutex::new(opened.in_use),
             quarantined: Vec::new(),
+            failed_sides: 0,
         })
     }
 
@@ -2853,6 +2878,35 @@ mod tests {
             .due(&here, t0 + DeviceWatch::QUARANTINE - Duration::from_secs(1))
             .is_empty());
         assert_eq!(watch.due(&here, t0 + DeviceWatch::QUARANTINE), vec![apollo]);
+    }
+
+    #[test]
+    fn only_the_side_that_kept_failing_is_quarantined() {
+        let in_use = AudioDevicesInUse {
+            output: Some("Apollo".to_string()),
+            input: Some("Mic".to_string()),
+            ..Default::default()
+        };
+        let output = Wanted {
+            name: "Apollo".to_string(),
+            kind: Kind::Output,
+        };
+        let input = Wanted {
+            name: "Mic".to_string(),
+            kind: Kind::Input,
+        };
+        assert_eq!(to_quarantine(&in_use, INPUT_FAILED), vec![input.clone()]);
+        assert_eq!(to_quarantine(&in_use, OUTPUT_FAILED), vec![output.clone()]);
+        assert_eq!(to_quarantine(&in_use, 0), vec![output.clone()]);
+        assert_eq!(
+            to_quarantine(&in_use, OUTPUT_FAILED | INPUT_FAILED),
+            vec![output, input]
+        );
+        let stand_in = AudioDevicesInUse {
+            input: Some("Mic".to_string()),
+            ..Default::default()
+        };
+        assert!(to_quarantine(&stand_in, OUTPUT_FAILED).is_empty());
     }
 
     #[test]
