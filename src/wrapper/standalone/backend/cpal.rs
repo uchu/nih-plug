@@ -263,7 +263,7 @@ impl<P: Plugin> Backend<P> for CpalMidir {
             // This thread needs to be blocked until audio processing ends as CPAL processes the
             // streams on other threads. Created up front so the input stream's error callback can
             // also wake it (a dead capture stream mid-session should end the run, not leave the
-            // output spinning on an input ring buffer that will never fill up again).
+            // output playing silence from an input ring buffer that will never fill up again).
             let parker = Parker::new();
             let unparker = parker.unparker().clone();
             change::register_wake(unparker.clone());
@@ -281,14 +281,11 @@ impl<P: Plugin> Backend<P> for CpalMidir {
                 // The stream's period, not the plugin's block, which is DUPLEX_BLOCK on a duplex
                 // host (A14).
                 let period = stream_period(output).unwrap_or(self.config.period_size as usize);
-                // A duplex ring holds whole frames, so a full one drops whole frames, and two
-                // driver periods of them: the driver's period is fixed and both callbacks run once
-                // per period, input first (A5).
-                let capacity = if self.duplex {
-                    ring_channels * period * 2
-                } else {
-                    (output.config.channels as usize).max(ring_channels) * period
-                };
+                // Two periods of whole frames: neither side waits on the other, so a full ring
+                // drops whole frames and an empty one plays silence (A5). On a duplex driver both
+                // callbacks run once per period, input first; on a shared host the second period
+                // absorbs the jitter between two devices' callbacks.
+                let capacity = ring_channels * period * 2;
                 let (rb_producer, rb_consumer) = RingBuffer::new(capacity);
                 input_rb_consumer = Some(rb_consumer);
 
@@ -685,15 +682,13 @@ impl<P: Plugin> Backend<P> for CpalMidir {
             }
             drop(output_stream);
             watch_stop.store(true, Ordering::Release);
-            if self.duplex {
-                let overflows = self.overflows.swap(0, Ordering::Relaxed);
-                let underruns = self.underruns.swap(0, Ordering::Relaxed);
-                if overflows + underruns > 0 {
-                    nih_log!(
-                        "Duplex ring: {overflows} input samples dropped, {underruns} output \
-                         samples without input"
-                    );
-                }
+            let overflows = self.overflows.swap(0, Ordering::Relaxed);
+            let underruns = self.underruns.swap(0, Ordering::Relaxed);
+            if overflows + underruns > 0 {
+                nih_log!(
+                    "Input ring: {overflows} input samples dropped, {underruns} output samples \
+                     without input"
+                );
             }
 
             // The Midir API requires us to take things out of Options and transform between these
@@ -1158,16 +1153,20 @@ impl Liveness {
     }
 }
 
-/// Both duplex callbacks share the driver thread, so a full ring means the output has not drained
-/// yet: drop and count, never spin (A5).
-pub(crate) fn duplex_push(producer: &mut rtrb::Producer<f32>, sample: f32, overflows: &AtomicU64) {
+/// A full input ring drops the sample and counts it, never spins (A5): duplex callbacks share the
+/// driver thread, so a spin there never ends, and on a shared host the output may have stopped for
+/// good while the capture still runs, which a spin turns into a hang when the capture stream is
+/// dropped.
+pub(crate) fn ring_push(producer: &mut rtrb::Producer<f32>, sample: f32, overflows: &AtomicU64) {
     if producer.push(sample).is_err() {
         overflows.fetch_add(1, Ordering::Relaxed);
     }
 }
 
-/// An empty duplex ring on the output side is silence for this sample, counted (A5).
-pub(crate) fn duplex_pop(consumer: &mut rtrb::Consumer<f32>, underruns: &AtomicU64) -> f32 {
+/// An empty input ring on the output side is silence for this sample, counted (A5). The output
+/// never waits for the capture: a capture that died would hold the output callback, and with it
+/// the end of the run, forever.
+pub(crate) fn ring_pop(consumer: &mut rtrb::Consumer<f32>, underruns: &AtomicU64) -> f32 {
     consumer.pop().unwrap_or_else(|_| {
         underruns.fetch_add(1, Ordering::Relaxed);
         0.0
@@ -2177,9 +2176,8 @@ impl CpalMidir {
     {
         // This callback needs to copy input samples to a ring buffer that can be read from in the
         // output data callback
-        let duplex = self.duplex;
         #[cfg(target_os = "windows")]
-        let mut input_promotion_pending = !duplex;
+        let mut input_promotion_pending = !self.duplex;
         let overflows = self.overflows.clone();
         let device_channels = self
             .input
@@ -2191,12 +2189,9 @@ impl CpalMidir {
             .map(NonZeroU32::get)
             .unwrap_or(0) as usize;
         move |data, _info| {
-            // The promoted output callback busy-spins on this thread's ring
-            // (see the pop loop in the output callback) — leaving the capture
-            // thread at cpal's silently-broken NORMAL priority would be a
-            // priority inversion: a real-time spinner starved of the very
-            // samples it waits for.
-            // A duplex capture runs on the driver's own thread, which nothing spins on.
+            // The promoted output callback reads this thread's ring without waiting, so a capture
+            // thread left at cpal's NORMAL priority would starve it into counted silence. A duplex
+            // capture runs on the driver's own thread, which the driver schedules.
             #[cfg(target_os = "windows")]
             if input_promotion_pending {
                 input_promotion_pending = false;
@@ -2204,13 +2199,7 @@ impl CpalMidir {
             }
 
             fold_input_frames(data, device_channels, plugin_channels, |sample| {
-                if duplex {
-                    duplex_push(&mut input_rb_producer, sample, &overflows);
-                } else {
-                    // If for whatever reason the input callback is fired twice before an output
-                    // callback, then just spin on this until the push succeeds
-                    while input_rb_producer.push(sample).is_err() {}
-                }
+                ring_push(&mut input_rb_producer, sample, &overflows);
             });
 
             // The run function is blocked until a single period has been processed here. After this
@@ -2370,23 +2359,9 @@ impl CpalMidir {
                 // Because of that we'll never need to reinitialize these, and the output storage is
                 // write-only (with `BufferManager` always zeroing them out when creating the buffers).
                 match &mut input_rb_consumer {
-                    Some(input_rb_consumer) if duplex => {
-                        deinterleave_frames(
-                            || duplex_pop(input_rb_consumer, &underruns),
-                            &mut main_io_storage,
-                            num_input_channels,
-                            chunk_size,
-                        );
-                    }
                     Some(input_rb_consumer) => {
-                        // Keep spinning on this if the output callback somehow outpaces the input
-                        // callback
                         deinterleave_frames(
-                            || loop {
-                                if let Ok(input_sample) = input_rb_consumer.pop() {
-                                    break input_sample;
-                                }
-                            },
+                            || ring_pop(input_rb_consumer, &underruns),
                             &mut main_io_storage,
                             num_input_channels,
                             chunk_size,
@@ -2790,18 +2765,60 @@ mod tests {
     }
 
     #[test]
-    fn a_full_duplex_ring_drops_and_counts_instead_of_spinning() {
+    fn a_full_input_ring_drops_and_counts_instead_of_spinning() {
         let (mut producer, mut consumer) = rtrb::RingBuffer::<f32>::new(2);
         let overflows = AtomicU64::new(0);
-        duplex_push(&mut producer, 1.0, &overflows);
-        duplex_push(&mut producer, 2.0, &overflows);
-        duplex_push(&mut producer, 3.0, &overflows);
+        ring_push(&mut producer, 1.0, &overflows);
+        ring_push(&mut producer, 2.0, &overflows);
+        ring_push(&mut producer, 3.0, &overflows);
         assert_eq!(overflows.load(Ordering::Relaxed), 1);
         let underruns = AtomicU64::new(0);
-        assert_eq!(duplex_pop(&mut consumer, &underruns), 1.0);
-        assert_eq!(duplex_pop(&mut consumer, &underruns), 2.0);
-        assert_eq!(duplex_pop(&mut consumer, &underruns), 0.0);
+        assert_eq!(ring_pop(&mut consumer, &underruns), 1.0);
+        assert_eq!(ring_pop(&mut consumer, &underruns), 2.0);
+        assert_eq!(ring_pop(&mut consumer, &underruns), 0.0);
         assert_eq!(underruns.load(Ordering::Relaxed), 1);
+    }
+
+    /// Runs `f` on its own thread and fails, instead of hanging the suite, when it never returns.
+    fn returns_within_a_second(f: impl FnOnce() + Send + 'static) {
+        let (done, finished) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            f();
+            let _ = done.send(());
+        });
+        assert!(
+            finished.recv_timeout(Duration::from_secs(1)).is_ok(),
+            "the callback body never returned"
+        );
+    }
+
+    #[test]
+    fn a_shared_host_output_whose_capture_died_plays_silence_and_returns() {
+        let (producer, mut consumer) = rtrb::RingBuffer::<f32>::new(2 * 64 * 2);
+        drop(producer);
+        returns_within_a_second(move || {
+            let underruns = AtomicU64::new(0);
+            let mut storage = vec![vec![f32::NAN; 64]; 2];
+            deinterleave_frames(|| ring_pop(&mut consumer, &underruns), &mut storage, 2, 64);
+            assert!(storage.iter().flatten().all(|&sample| sample == 0.0));
+            assert_eq!(underruns.load(Ordering::Relaxed), 128);
+        });
+    }
+
+    #[test]
+    fn a_shared_host_capture_whose_output_stopped_drops_and_returns() {
+        let (mut producer, consumer) = rtrb::RingBuffer::<f32>::new(2 * 64 * 2);
+        drop(consumer);
+        returns_within_a_second(move || {
+            let overflows = AtomicU64::new(0);
+            let period = vec![0.5f32; 2 * 64];
+            for _ in 0..3 {
+                fold_input_frames(&period, 2, 2, |sample| {
+                    ring_push(&mut producer, sample, &overflows)
+                });
+            }
+            assert_eq!(overflows.load(Ordering::Relaxed), 128);
+        });
     }
 
     #[test]
