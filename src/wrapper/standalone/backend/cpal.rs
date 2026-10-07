@@ -167,16 +167,19 @@ impl OpenedDevicesSoFar {
 
 /// The device a run that ended as `outcome` relapsed on: the one its open moved onto after a
 /// passing probe, refused by that open (`refused_at_open`) or by the run's capture check
-/// (`capture_refused`), when the run then ended because a probe passed once more.
+/// (`capture_refused`), when the run then ended because that same device's probe passed once more
+/// (`returned`).
 fn relapsed_device(
     outcome: RunOutcome,
     adopted: Option<&Wanted>,
     refused_at_open: bool,
     capture_refused: Option<&Wanted>,
+    returned: Option<&Wanted>,
 ) -> Option<Wanted> {
     let adopted = adopted?;
     let refused = refused_at_open || capture_refused == Some(adopted);
-    (outcome == RunOutcome::DeviceReturned && refused).then(|| adopted.clone())
+    let same = returned == Some(adopted);
+    (outcome == RunOutcome::DeviceReturned && refused && same).then(|| adopted.clone())
 }
 
 /// The side a capture error callback failed.
@@ -810,6 +813,7 @@ impl<P: Plugin> Backend<P> for CpalMidir {
             self.adopted.as_ref(),
             self.adopted_refused,
             capture_refused.as_ref(),
+            self.returned.get_mut().as_ref(),
         );
         outcome
     }
@@ -3041,23 +3045,41 @@ mod tests {
             kind: Kind::Input,
         };
         let returned = RunOutcome::DeviceReturned;
+        let mic_back = Some(&mic);
         assert_eq!(
-            relapsed_device(returned, Some(&mic), false, Some(&mic)),
+            relapsed_device(returned, Some(&mic), false, Some(&mic), mic_back),
             Some(mic.clone())
         );
         assert_eq!(
-            relapsed_device(returned, Some(&mic), true, None),
+            relapsed_device(returned, Some(&mic), true, None, mic_back),
             Some(mic.clone())
         );
-        assert_eq!(relapsed_device(returned, Some(&mic), false, None), None);
         assert_eq!(
-            relapsed_device(returned, Some(&mic), false, Some(&other)),
+            relapsed_device(returned, Some(&mic), false, None, mic_back),
             None
         );
-        assert_eq!(relapsed_device(returned, None, false, Some(&mic)), None);
         assert_eq!(
-            relapsed_device(RunOutcome::StreamFailed, Some(&mic), true, Some(&mic)),
+            relapsed_device(returned, Some(&mic), false, Some(&other), mic_back),
             None
+        );
+        assert_eq!(
+            relapsed_device(returned, None, false, Some(&mic), mic_back),
+            None
+        );
+        assert_eq!(
+            relapsed_device(
+                RunOutcome::StreamFailed,
+                Some(&mic),
+                true,
+                Some(&mic),
+                mic_back
+            ),
+            None
+        );
+        assert_eq!(
+            relapsed_device(returned, Some(&mic), true, Some(&mic), Some(&other)),
+            None,
+            "another device returning is not the refused one relapsing"
         );
     }
 
