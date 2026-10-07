@@ -777,7 +777,7 @@ impl<P: Plugin, B: Backend<P>> Wrapper<P, B> {
                     } else {
                         nih_log!("A requested audio device is available again, switching to it");
                     }
-                    Some(recovery.device_returned(refused_again))
+                    Some(recovery.device_returned(run_started.elapsed(), refused_again))
                 }
                 // The backend logged why.
                 RunOutcome::Restart => {

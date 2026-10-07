@@ -6,7 +6,9 @@
 //! is not a failure at all, unless the device the previous return moved onto was refused again
 //! although its probe had passed; nor is a fresh stream the device needs (an ASIO reset request, a
 //! rate that moved): neither spends the budget, unless the device asks again right after the last
-//! restart, and a long healthy run before one gives a fresh budget too. A change the app asks for
+//! restart, and a long healthy run before one gives a fresh budget too. A long stand-in run before
+//! a device comes back forgives every failure but the ones a returned device caused: it says
+//! nothing about whether that device can hold a stream. A change the app asks for
 //! (A16) comes before all of this: it cuts every wait short and is opened instead of the
 //! configuration that failed.
 
@@ -43,6 +45,9 @@ pub enum Action {
 
 pub struct Recovery {
     failures: u32,
+    /// Of `failures`, the ones a device that had just come back caused: a quick death right after
+    /// the return, or a refusal of it.
+    relapses: u32,
     /// The run that ends next moved onto a requested device that had come back.
     returned: bool,
 }
@@ -68,39 +73,51 @@ impl Recovery {
     pub fn new() -> Self {
         Self {
             failures: 0,
+            relapses: 0,
             returned: false,
         }
     }
 
     /// The stream died after running for `ran_for`.
     pub fn stream_failed(&mut self, ran_for: Duration) -> Action {
-        self.returned = false;
+        let relapse = std::mem::take(&mut self.returned) && ran_for < Self::STABLE_RUN;
         if ran_for >= Self::STABLE_RUN {
-            self.failures = 0;
+            self.fresh_budget();
         }
-        self.count_failure()
+        self.count_failure(relapse)
     }
 
-    fn count_failure(&mut self) -> Action {
+    fn fresh_budget(&mut self) {
+        self.failures = 0;
+        self.relapses = 0;
+    }
+
+    fn count_failure(&mut self, relapse: bool) -> Action {
         if self.failures >= Self::MAX_RETRIES {
-            self.failures = 0;
+            self.fresh_budget();
             return Action::WaitForHardware;
         }
         let backoff = Self::BACKOFF[self.failures as usize];
         self.failures += 1;
+        self.relapses += u32::from(relapse);
         Action::Reinit { backoff }
     }
 
-    /// The backend reported that a requested device is back. `refused_again`: the device the
-    /// previous return moved onto was refused by the open or the run that followed although its
-    /// probe had passed, so moving onto it again is a failure, and repeats back off up to a wait
-    /// for the hardware instead of tearing the stream down every few seconds.
-    pub fn device_returned(&mut self, refused_again: bool) -> Action {
+    /// The backend reported that a requested device is back after a run of `ran_for`.
+    /// `refused_again`: the device the previous return moved onto was refused by the open or the
+    /// run that followed although its probe had passed, so moving onto it again is a failure, and
+    /// repeats back off up to a wait for the hardware instead of tearing the stream down every few
+    /// seconds. Otherwise a run of `STABLE_RUN` or longer forgives the failures before it, as it
+    /// does before a restart, except the ones a returned device caused: a device that comes back,
+    /// dies at once and stays away for a while each time still reaches the wait.
+    pub fn device_returned(&mut self, ran_for: Duration, refused_again: bool) -> Action {
         if std::mem::replace(&mut self.returned, true) && refused_again {
-            self.count_failure()
-        } else {
-            Action::ReinitNow
+            return self.count_failure(true);
         }
+        if ran_for >= Self::STABLE_RUN {
+            self.failures = self.relapses;
+        }
+        Action::ReinitNow
     }
 
     /// The device needs a fresh stream after a run of `ran_for`. A run of `STABLE_RUN` or longer
@@ -109,7 +126,7 @@ impl Recovery {
     /// the budget is left as it is; sooner, it is a failure.
     pub fn restart(&mut self, ran_for: Duration) -> Action {
         if ran_for >= Self::STABLE_RUN {
-            self.failures = 0;
+            self.fresh_budget();
         }
         if ran_for < Self::MIN_RESTART_RUN {
             self.stream_failed(ran_for)
@@ -256,7 +273,7 @@ mod tests {
         let mut recovery = Recovery::new();
         recovery.stream_failed(quick());
         recovery.stream_failed(quick());
-        assert_eq!(recovery.device_returned(false), Action::ReinitNow);
+        assert_eq!(recovery.device_returned(quick(), false), Action::ReinitNow);
         assert_eq!(
             recovery.stream_failed(quick()),
             Action::Reinit {
@@ -268,27 +285,33 @@ mod tests {
     #[test]
     fn a_returned_device_refused_again_backs_off_then_waits_for_hardware() {
         let mut recovery = Recovery::new();
-        assert_eq!(recovery.device_returned(true), Action::ReinitNow);
+        assert_eq!(recovery.device_returned(quick(), true), Action::ReinitNow);
         for backoff in Recovery::BACKOFF {
-            assert_eq!(recovery.device_returned(true), Action::Reinit { backoff });
+            assert_eq!(
+                recovery.device_returned(quick(), true),
+                Action::Reinit { backoff }
+            );
         }
-        assert_eq!(recovery.device_returned(true), Action::WaitForHardware);
+        assert_eq!(
+            recovery.device_returned(quick(), true),
+            Action::WaitForHardware
+        );
     }
 
     #[test]
     fn a_return_after_a_run_that_was_not_a_return_is_never_a_failure() {
         let mut recovery = Recovery::new();
-        recovery.device_returned(false);
+        recovery.device_returned(quick(), false);
         recovery.stream_failed(quick());
-        assert_eq!(recovery.device_returned(true), Action::ReinitNow);
+        assert_eq!(recovery.device_returned(quick(), true), Action::ReinitNow);
         recovery.restart(Recovery::MIN_RESTART_RUN);
-        assert_eq!(recovery.device_returned(true), Action::ReinitNow);
+        assert_eq!(recovery.device_returned(quick(), true), Action::ReinitNow);
     }
 
     #[test]
     fn a_returned_device_that_dies_quickly_spends_the_budget() {
         let mut recovery = Recovery::new();
-        recovery.device_returned(false);
+        recovery.device_returned(quick(), false);
         assert_eq!(
             recovery.stream_failed(quick()),
             Action::Reinit {
@@ -296,15 +319,44 @@ mod tests {
             }
         );
         assert_eq!(
-            recovery.device_returned(true),
+            recovery.device_returned(quick(), true),
             Action::ReinitNow,
             "the refusal belongs to a run that was not a return"
         );
         assert_eq!(
-            recovery.device_returned(true),
+            recovery.device_returned(quick(), true),
             Action::Reinit {
                 backoff: Recovery::BACKOFF[1]
             }
         );
+    }
+
+    #[test]
+    fn a_long_stand_in_run_before_a_return_starts_a_fresh_budget() {
+        let mut recovery = Recovery::new();
+        recovery.stream_failed(quick());
+        recovery.stream_failed(quick());
+        assert_eq!(
+            recovery.device_returned(Recovery::STABLE_RUN, false),
+            Action::ReinitNow
+        );
+        recovery.restart(Recovery::MIN_RESTART_RUN);
+        for backoff in Recovery::BACKOFF {
+            assert_eq!(recovery.stream_failed(quick()), Action::Reinit { backoff });
+        }
+    }
+
+    #[test]
+    fn a_device_that_returns_and_dies_at_once_is_never_forgiven_by_the_stand_in() {
+        let mut recovery = Recovery::new();
+        for backoff in Recovery::BACKOFF {
+            assert_eq!(
+                recovery.device_returned(Recovery::STABLE_RUN, false),
+                Action::ReinitNow
+            );
+            assert_eq!(recovery.stream_failed(quick()), Action::Reinit { backoff });
+        }
+        recovery.device_returned(Recovery::STABLE_RUN, false);
+        assert_eq!(recovery.stream_failed(quick()), Action::WaitForHardware);
     }
 }
