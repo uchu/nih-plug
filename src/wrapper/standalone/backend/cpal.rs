@@ -2089,12 +2089,14 @@ impl CpalMidir {
         if let Some(rate) = current {
             if (rate.0 as f32 - config.sample_rate).abs() > 0.1 {
                 anyhow::bail!(
-                    "the device runs at {} Hz while this session runs at {} Hz; a device is never \
-                     switched to another rate under other applications, so set it to {} Hz or \
-                     restart to adopt its rate",
+                    "the device runs at {} Hz while this session runs at the output's {} Hz; the \
+                     input must run at the output's rate and a device is never switched to \
+                     another rate under other applications, so set the input to {} Hz or the \
+                     output to {} Hz",
                     rate.0,
                     config.sample_rate,
-                    config.sample_rate
+                    config.sample_rate,
+                    rate.0
                 );
             }
         }
