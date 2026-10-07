@@ -136,6 +136,15 @@ pub trait Backend<P: Plugin>: 'static + Send + Sync {
         false
     }
 
+    /// After [`RunOutcome::DeviceReturned`]: the requested device the previous return moved the
+    /// stream onto was refused again, by the open or by the run that just ended, although the
+    /// probe that brought it back had passed. The caller counts that as a failure, so a device
+    /// whose probe and real use disagree backs off like a stream that keeps dying, and
+    /// [`quarantine_requested()`][Self::quarantine_requested()] then quarantines that device.
+    fn returned_device_refused(&self) -> bool {
+        false
+    }
+
     /// The process callback runs on a thread the audio driver owns and schedules itself (ASIO),
     /// so the wrapper must not register it with MMCSS or raise its priority: the driver manages
     /// that thread, and a registration would outlive the stream since it is never reverted.

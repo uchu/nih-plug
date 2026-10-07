@@ -768,8 +768,16 @@ impl<P: Plugin, B: Backend<P>> Wrapper<P, B> {
                 RunOutcome::Stopped => break,
                 RunOutcome::StreamFailed => Some(recovery.stream_failed(run_started.elapsed())),
                 RunOutcome::DeviceReturned => {
-                    nih_log!("A requested audio device is available again, switching to it");
-                    Some(recovery.device_returned())
+                    let refused_again = self.backend.borrow().returned_device_refused();
+                    if refused_again {
+                        nih_log!(
+                            "A requested audio device that came back was refused again; counting \
+                             it as a failure"
+                        );
+                    } else {
+                        nih_log!("A requested audio device is available again, switching to it");
+                    }
+                    Some(recovery.device_returned(refused_again))
                 }
                 // The backend logged why.
                 RunOutcome::Restart => {

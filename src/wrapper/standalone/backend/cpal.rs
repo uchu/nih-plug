@@ -88,6 +88,15 @@ pub struct CpalMidir {
     quarantined: Vec<Wanted>,
     /// Which sides the last run's error callbacks failed (`OUTPUT_FAILED`, `INPUT_FAILED`).
     failed_sides: u8,
+    /// The requested device whose probe last passed: the next restart moves onto it.
+    returned: Mutex<Option<Wanted>>,
+    /// The device the open that runs moved onto after its probe passed, and whether that open
+    /// refused it all the same.
+    adopted: Option<Wanted>,
+    adopted_refused: bool,
+    /// The run ended as `DeviceReturned` after refusing `adopted`: that device passes its probe
+    /// and is refused again, so the stream must not keep moving onto it.
+    relapsed: Option<Wanted>,
 }
 
 /// All data needed for a CPAL input or output stream.
@@ -154,6 +163,20 @@ impl OpenedDevicesSoFar {
             self.refused.push(wanted);
         }
     }
+}
+
+/// The device a run that ended as `outcome` relapsed on: the one its open moved onto after a
+/// passing probe, refused by that open (`refused_at_open`) or by the run's capture check
+/// (`capture_refused`), when the run then ended because a probe passed once more.
+fn relapsed_device(
+    outcome: RunOutcome,
+    adopted: Option<&Wanted>,
+    refused_at_open: bool,
+    capture_refused: Option<&Wanted>,
+) -> Option<Wanted> {
+    let adopted = adopted?;
+    let refused = refused_at_open || capture_refused == Some(adopted);
+    (outcome == RunOutcome::DeviceReturned && refused).then(|| adopted.clone())
 }
 
 /// The side a capture error callback failed.
@@ -303,6 +326,8 @@ impl<P: Plugin> Backend<P> for CpalMidir {
         // realtime unsafe, and to be able to output MIDI with midir you need to transform between
         // `MidiOutputPort` and `MidiOutputPortConnection` types by taking values out of an
         // `Option`.
+        // The requested input the run refused when its capture would not start.
+        let mut capture_refused: Option<Wanted> = None;
         let outcome = std::thread::scope(|s| {
             // This thread needs to be blocked until audio processing ends as CPAL processes the
             // streams on other threads. Created up front so the input stream's error callback can
@@ -431,13 +456,12 @@ impl<P: Plugin> Backend<P> for CpalMidir {
                 let refused = self.in_use.lock().input.take();
                 if let Some(name) = refused {
                     self.in_use.lock().refused_input = Some(name.clone());
-                    self.watch.lock().refuse(
-                        Wanted {
-                            name,
-                            kind: Kind::Input,
-                        },
-                        Instant::now(),
-                    );
+                    let wanted = Wanted {
+                        name,
+                        kind: Kind::Input,
+                    };
+                    self.watch.lock().refuse(wanted.clone(), Instant::now());
+                    capture_refused = Some(wanted);
                     publish_audio_devices_in_use(self.in_use.lock().clone());
                 }
             }
@@ -463,14 +487,15 @@ impl<P: Plugin> Backend<P> for CpalMidir {
                             .watch
                             .lock()
                             .due(&device_names(&host), Instant::now());
-                        let returned = due.iter().any(|wanted| {
+                        let returned = due.into_iter().find(|wanted| {
                             let opens = backend.opens(&host, wanted);
                             if !opens {
                                 backend.watch.lock().probe_failed(wanted, Instant::now());
                             }
                             opens
                         });
-                        if returned {
+                        if let Some(wanted) = returned {
+                            *backend.returned.lock() = Some(wanted);
                             device_returned.store(true, Ordering::Release);
                             unparker.unpark();
                             break;
@@ -780,6 +805,12 @@ impl<P: Plugin> Backend<P> for CpalMidir {
             outcome
         });
         self.failed_sides = failed_sides.load(Ordering::Acquire);
+        self.relapsed = relapsed_device(
+            outcome,
+            self.adopted.as_ref(),
+            self.adopted_refused,
+            capture_refused.as_ref(),
+        );
         outcome
     }
 
@@ -818,6 +849,7 @@ impl<P: Plugin> Backend<P> for CpalMidir {
         let next = target_of(&current, &change);
         // A pick is a fresh choice: the watch starts over and nothing is held against a device.
         self.quarantined.clear();
+        self.returned.get_mut().take();
         if next.driver != current.driver {
             return self.switch_host(&current, &next);
         }
@@ -898,12 +930,20 @@ impl<P: Plugin> Backend<P> for CpalMidir {
             // nothing to stand in for it: wait for the hardware instead.
             return false;
         }
+        if let Some(relapsed) = self.relapsed.take() {
+            self.quarantined = vec![relapsed];
+            return true;
+        }
         let quarantined = to_quarantine(&self.in_use.lock(), self.failed_sides);
         if quarantined.is_empty() {
             return false;
         }
         self.quarantined = quarantined;
         true
+    }
+
+    fn returned_device_refused(&self) -> bool {
+        self.relapsed.is_some()
     }
 
     fn stream_format(&self) -> Option<(f32, u32)> {
@@ -1396,6 +1436,10 @@ impl CpalMidir {
             in_use: Mutex::new(opened.in_use),
             quarantined: Vec::new(),
             failed_sides: 0,
+            returned: Mutex::new(None),
+            adopted: None,
+            adopted_refused: false,
+            relapsed: None,
         })
     }
 
@@ -1446,6 +1490,12 @@ impl CpalMidir {
     /// Keep what an open returned, and watch for the requested devices it could not open.
     fn hold(&mut self, opened: OpenedDevices) {
         self.quarantined.clear();
+        self.adopted = self.returned.get_mut().take();
+        self.adopted_refused = self
+            .adopted
+            .as_ref()
+            .is_some_and(|wanted| opened.refused.contains(wanted));
+        self.relapsed = None;
         self.output = Some(opened.output);
         self.input = opened.input;
         *self.watch.lock() = watch_after_open(
@@ -2878,6 +2928,37 @@ mod tests {
             .due(&here, t0 + DeviceWatch::QUARANTINE - Duration::from_secs(1))
             .is_empty());
         assert_eq!(watch.due(&here, t0 + DeviceWatch::QUARANTINE), vec![apollo]);
+    }
+
+    #[test]
+    fn a_device_moved_onto_and_refused_again_is_a_relapse_when_it_returns_once_more() {
+        let mic = Wanted {
+            name: "Mic".to_string(),
+            kind: Kind::Input,
+        };
+        let other = Wanted {
+            name: "Other".to_string(),
+            kind: Kind::Input,
+        };
+        let returned = RunOutcome::DeviceReturned;
+        assert_eq!(
+            relapsed_device(returned, Some(&mic), false, Some(&mic)),
+            Some(mic.clone())
+        );
+        assert_eq!(
+            relapsed_device(returned, Some(&mic), true, None),
+            Some(mic.clone())
+        );
+        assert_eq!(relapsed_device(returned, Some(&mic), false, None), None);
+        assert_eq!(
+            relapsed_device(returned, Some(&mic), false, Some(&other)),
+            None
+        );
+        assert_eq!(relapsed_device(returned, None, false, Some(&mic)), None);
+        assert_eq!(
+            relapsed_device(RunOutcome::StreamFailed, Some(&mic), true, Some(&mic)),
+            None
+        );
     }
 
     #[test]
