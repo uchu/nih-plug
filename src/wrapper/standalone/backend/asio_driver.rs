@@ -7,6 +7,7 @@ use cpal::{Device, Stream};
 use crossbeam::sync::Unparker;
 use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
+use std::time::Instant;
 
 /// Whether the backend holds an opened ASIO driver: raised once a duplex open succeeded, lowered
 /// before that driver is released.
@@ -171,9 +172,51 @@ fn asio() -> &'static asio_sys::Asio {
 
 /// The registered drivers, by name, as the registry lists them: nothing is loaded. The cpal
 /// host's device listing loads and releases every driver instead, including one another
-/// application streams on and one whose hardware is absent.
+/// application streams on and one whose hardware is absent. The listing is logged as read, with a
+/// warning for every name that does not load the driver it names.
 pub(crate) fn names() -> Vec<String> {
-    super::cpal::dedupe_names(registered())
+    let registered = registered();
+    nih_log!("ASIO drivers registered: {registered:?}");
+    for warning in listing_warnings(&registered) {
+        nih_warn!("{warning}");
+    }
+    super::cpal::dedupe_names(registered)
+}
+
+/// The bytes a listed driver name fits in (asio-sys's name buffers and the length the SDK's
+/// listing passes). A longer name is listed as its first `LISTED_NAME_BYTES - 4` bytes and "...".
+const LISTED_NAME_BYTES: usize = 32;
+
+/// Names in a driver listing that do not load the driver they name. A load by name opens the first
+/// driver listed under it, so of several listed alike (names cut short to the same text, or
+/// registered alike) only the first loads. A name with U+FFFD came from bytes that are not UTF-8
+/// (the listing is in the system's ANSI code page), and a load by it matches no driver.
+fn listing_warnings(registered: &[String]) -> Vec<String> {
+    let mut warnings = Vec::new();
+    for (index, name) in registered.iter().enumerate() {
+        let count = registered.iter().filter(|other| *other == name).count();
+        if count > 1 && !registered.iter().take(index).any(|other| other == name) {
+            let cut = name.len() == LISTED_NAME_BYTES - 1 && name.ends_with("...");
+            let how = if cut {
+                format!(
+                    "listed as '{name}', their names cut to {} bytes",
+                    LISTED_NAME_BYTES - 4
+                )
+            } else {
+                format!("registered as '{name}'")
+            };
+            warnings.push(format!(
+                "{count} ASIO drivers are {how}: only the first of them loads"
+            ));
+        }
+        if name.contains(char::REPLACEMENT_CHARACTER) {
+            warnings.push(format!(
+                "The ASIO driver listed as '{name}' has a name that is not valid UTF-8: it does \
+                 not load by that name"
+            ));
+        }
+    }
+    warnings
 }
 
 #[cfg(all(target_os = "windows", feature = "asio"))]
@@ -270,10 +313,16 @@ pub(crate) fn load(name: &str) -> Option<Device> {
     use std::sync::atomic::AtomicI32;
     use std::sync::Mutex;
 
-    let driver = match asio().load_driver(name) {
-        Ok(driver) => driver,
+    let started = Instant::now();
+    let loaded = asio().load_driver(name);
+    let ms = millis_since(started);
+    let driver = match loaded {
+        Ok(driver) => {
+            nih_log!("ASIO driver '{name}' loaded in {ms:.1} ms");
+            driver
+        }
         Err(err) => {
-            nih_log!("The ASIO driver '{name}' does not load: {err}");
+            nih_log!("The ASIO driver '{name}' does not load ({ms:.1} ms): {err}");
             return None;
         }
     };
@@ -291,6 +340,37 @@ pub(crate) fn load(name: &str) -> Option<Device> {
 #[cfg(not(all(target_os = "windows", feature = "asio")))]
 pub(crate) fn load(_name: &str) -> Option<Device> {
     None
+}
+
+/// Drop `handles`. When the loaded driver goes with them (its last handle runs
+/// ASIODisposeBuffers and ASIOExit), log how long that took.
+pub(crate) fn release<T>(handles: T) {
+    let Some(name) = loaded_name() else {
+        drop(handles);
+        return;
+    };
+    let started = Instant::now();
+    drop(handles);
+    if loaded_name().is_none() {
+        let ms = millis_since(started);
+        nih_log!("ASIO driver '{name}' released in {ms:.1} ms");
+    }
+}
+
+#[cfg(all(target_os = "windows", feature = "asio"))]
+fn loaded_name() -> Option<String> {
+    asio()
+        .loaded_driver()
+        .map(|driver| driver.name().to_string())
+}
+
+#[cfg(not(all(target_os = "windows", feature = "asio")))]
+fn loaded_name() -> Option<String> {
+    None
+}
+
+fn millis_since(started: Instant) -> f64 {
+    started.elapsed().as_secs_f64() * 1e3
 }
 
 #[cfg(test)]
@@ -373,6 +453,46 @@ mod tests {
             no_output_configuration(Some(sample_type)),
             "its sample type is unreadable: gone"
         );
+    }
+
+    #[test]
+    fn names_cut_to_the_same_listing_are_warned_once_by_name() {
+        let cut = format!("{}...", "Focusrite USB ASIO Driver Mu");
+        assert_eq!(cut.len(), LISTED_NAME_BYTES - 1);
+        let warnings = listing_warnings(&[
+            cut.clone(),
+            "ASIO4ALL v2".to_string(),
+            cut.clone(),
+            cut.clone(),
+        ]);
+        assert_eq!(warnings.len(), 1);
+        assert!(warnings[0].contains(&format!("'{cut}'")));
+        assert!(warnings[0].contains("3 ASIO drivers"));
+        assert!(warnings[0].contains("28 bytes"));
+    }
+
+    #[test]
+    fn a_name_registered_twice_uncut_is_warned_without_truncation() {
+        let warnings = listing_warnings(&["Same".to_string(), "Same".to_string()]);
+        assert_eq!(warnings.len(), 1);
+        assert!(warnings[0].contains("'Same'"));
+        assert!(!warnings[0].contains("28 bytes"));
+    }
+
+    #[test]
+    fn an_undecodable_name_is_warned() {
+        let warnings =
+            listing_warnings(&["Lyd\u{FFFD}kort".to_string(), "ASIO4ALL v2".to_string()]);
+        assert_eq!(warnings.len(), 1);
+        assert!(warnings[0].contains("'Lyd\u{FFFD}kort'"));
+    }
+
+    #[test]
+    fn a_clean_listing_warns_nothing() {
+        assert!(
+            listing_warnings(&["ASIO4ALL v2".to_string(), "Realtek ASIO".to_string()]).is_empty()
+        );
+        assert!(listing_warnings(&[]).is_empty());
     }
 
     #[test]

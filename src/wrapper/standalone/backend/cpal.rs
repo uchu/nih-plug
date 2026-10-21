@@ -1155,6 +1155,7 @@ impl<P: Plugin> Backend<P> for CpalMidir {
 impl Drop for CpalMidir {
     fn drop(&mut self) {
         asio_driver::set_driver_open(false);
+        asio_driver::release((self.input.take(), self.output.take()));
     }
 }
 
@@ -1496,9 +1497,7 @@ type DriverRun = (
 /// last period it plays is one the callback rendered.
 fn end_driver_run((device, output, reset_listener, input): DriverRun) {
     asio_driver::stop(&device);
-    drop(output);
-    drop(reset_listener);
-    drop(input);
+    asio_driver::release((output, reset_listener, input, device));
 }
 
 /// A driver read the rate watch acts on: one a reopen could run at. A driver that lost lock and
@@ -1913,8 +1912,7 @@ impl CpalMidir {
     fn release_driver(&mut self) {
         asio_driver::set_driver_open(false);
         if self.duplex {
-            self.input = None;
-            self.output = None;
+            asio_driver::release((self.input.take(), self.output.take()));
         }
     }
 
@@ -1980,8 +1978,7 @@ impl CpalMidir {
     fn switch_host(&mut self, current: &Target, next: &Target) -> Result<()> {
         let previous = self.in_use.lock().clone();
         asio_driver::set_driver_open(false);
-        self.input = None;
-        self.output = None;
+        asio_driver::release((self.input.take(), self.output.take()));
 
         let Err(err) = self.open_host(next) else {
             return Ok(());
@@ -2127,7 +2124,9 @@ impl CpalMidir {
         };
         let resolved =
             Self::resolve_output_among(vec![device.clone()], config, output_channels, device_use);
-        opened_driver(name, resolved, || asio_driver::output_report(&device))
+        let opened = opened_driver(name, resolved, || asio_driver::output_report(&device));
+        asio_driver::release(device);
+        opened
     }
 
     /// Whether a wanted device could run the session's stream right now: the restart's own
