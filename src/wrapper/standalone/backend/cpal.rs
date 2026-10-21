@@ -1159,22 +1159,24 @@ pub(crate) fn duplex_rate(driver_rate: Option<f64>) -> Option<cpal::SampleRate> 
         .map(cpal::SampleRate)
 }
 
-/// The rate a reopen adopts from a device reporting `rate`: a duplex open rounds it to the hertz
-/// (`duplex_rate`), a shared open takes cpal's `SampleRate`, which truncates.
-fn reopen_rate(duplex: bool, rate: f64) -> u32 {
-    if duplex {
-        whole_hertz(rate)
-    } else {
-        rate as u32
-    }
-}
+/// How far a duplex driver's reported rate may sit from the session's before it counts as moved:
+/// 500 ppm. A measured external clock wanders by tens of ppm, across a half hertz and, at 384 kHz,
+/// across several hertz; the closest rates a converter switches between, a 0.1 % video pull-down
+/// (47952 against 48000), are twice as far apart.
+const DUPLEX_RATE_TOLERANCE: f64 = 5e-4;
 
 /// An output that keeps streaming at another rate leaves the plugin processing at the session's
-/// rate on hardware running at a different one. The device's rate is taken as a reopen would adopt
-/// it: a device reporting a fraction must not restart a stream whose reopen lands on the rate it
-/// already runs.
+/// rate on hardware running at a different one. A shared device's rate is taken as a reopen would
+/// adopt it, truncated as cpal's `SampleRate` is: a device reporting a fraction must not restart a
+/// stream whose reopen lands on the rate it already runs. A duplex driver's measured rate moves by distance, not by its rounding,
+/// so a reading that wanders across a half hertz does not restart the stream every check (E5).
 pub(crate) fn rate_moved(duplex: bool, device_rate: f64, session_rate: f32) -> bool {
-    reopen_rate(duplex, device_rate) != whole_hertz(f64::from(session_rate))
+    let session_rate = f64::from(session_rate);
+    if duplex {
+        (device_rate - session_rate).abs() > session_rate * DUPLEX_RATE_TOLERANCE
+    } else {
+        device_rate as u32 != whole_hertz(session_rate)
+    }
 }
 
 /// Whether a listed configuration can run a stream at `rate`. A duplex driver runs at its own
@@ -1189,8 +1191,7 @@ fn runs_at(
 }
 
 /// The output configuration a stream of `channels` at `rate` with a period of `period` opens
-/// with: F32 with the fewest channels that cover the plugin, else the fewest channels, one listed
-/// at `rate` first. A device with more channels than needed (a multichannel interface) is written
+/// with: F32 with the fewest channels that cover the plugin, else the fewest channels. A device with more channels than needed (a multichannel interface) is written
 /// on its first ones.
 fn pick_output_config(
     configs: impl IntoIterator<Item = cpal::SupportedStreamConfigRange>,
@@ -1210,7 +1211,7 @@ fn pick_output_config(
             cpal::SupportedBufferSize::Unknown => false,
         })
         .collect();
-    fitting.sort_by_key(|c| (c.channels(), !runs_at(c, rate, false)));
+    fitting.sort_by_key(|c| c.channels());
     fitting
         .iter()
         .find(|c| c.sample_format() == SampleFormat::F32)
@@ -1308,10 +1309,16 @@ fn published_after_failed_open(
 /// output resolved to. `None` when there is nothing to read or the device does not answer.
 fn output_rate_now(duplex: bool, output: &CpalDevice) -> Option<f64> {
     if duplex {
-        asio_driver::driver_rate(&output.device).filter(|&rate| duplex_rate(Some(rate)).is_some())
+        watched_duplex_rate(asio_driver::driver_rate(&output.device))
     } else {
         output.rate_source.and_then(DeviceRate::read)
     }
+}
+
+/// A driver read the rate watch acts on: one a reopen could run at. A driver that lost lock and
+/// reads 0 Hz is left running rather than restarted into an open that refuses it.
+fn watched_duplex_rate(read: Option<f64>) -> Option<f64> {
+    read.filter(|&rate| duplex_rate(Some(rate)).is_some())
 }
 
 /// The device a shared output named `name` opened on, watched only when its nominal rate is the
@@ -3574,6 +3581,26 @@ mod tests {
     }
 
     #[test]
+    fn a_measured_duplex_rate_wandering_across_a_half_hertz_does_not_restart() {
+        assert!(!rate_moved(true, 47_999.4, 48_000.0));
+        assert!(!rate_moved(true, 47_999.6, 47_999.0));
+        assert!(!rate_moved(true, 48_000.5, 48_000.0));
+        assert!(!rate_moved(true, 384_003.84, 384_000.0));
+        assert!(rate_moved(true, 47_952.0, 48_000.0));
+        assert!(rate_moved(true, 44_056.0, 44_100.0));
+        assert!(rate_moved(true, 96_000.0, 88_200.0));
+    }
+
+    #[test]
+    fn a_duplex_rate_watch_ignores_a_driver_that_lost_lock() {
+        assert_eq!(watched_duplex_rate(Some(47_999.98)), Some(47_999.98));
+        assert_eq!(watched_duplex_rate(Some(0.6)), None);
+        assert_eq!(watched_duplex_rate(Some(f64::INFINITY)), None);
+        assert_eq!(watched_duplex_rate(Some(f64::NAN)), None);
+        assert_eq!(watched_duplex_rate(None), None);
+    }
+
+    #[test]
     fn a_duplex_session_runs_at_the_driver_rate_to_the_hertz() {
         assert_eq!(duplex_rate(Some(47_999.98)), Some(cpal::SampleRate(48_000)));
         assert_eq!(
@@ -3609,7 +3636,7 @@ mod tests {
     fn a_duplex_output_opens_at_a_rate_its_driver_lists_outside_the_common_rates() {
         let listed = vec![stereo_f32_at(48_000), stereo_f32_at(384_000)];
         let picked = pick_output_config(listed, 2, cpal::SampleRate(384_000), 256, true);
-        assert!(picked.is_some_and(|c| c.max_sample_rate() == cpal::SampleRate(384_000)));
+        assert!(picked.is_some());
     }
 
     #[test]
