@@ -113,8 +113,7 @@ impl Recovery {
     /// next listed driver, the stand-in. The backend makes each of those a bounded number of
     /// times per launch or change, so none spends the budget: a launch walking over many drivers
     /// that open and never stream, or start and never call back, reaches the stand-in without a
-    /// wait for the hardware, and the
-    /// driver that runs starts with the whole budget.
+    /// wait for the hardware, and the driver that runs starts with the whole budget.
     pub fn follow_up(&self) -> Action {
         Action::FollowUp
     }

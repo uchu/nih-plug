@@ -1,11 +1,12 @@
 //! A buffer size the ASIO driver listed and then refused at CreateBuffers or Start fails only
 //! inside a run: what the reopen after that run does (E3), and at launch the walk on to the next
 //! listed driver (§ 6 f). At launch a driver that starts its stream and never calls back fails
-//! the same way (`stream_not_started`).
+//! the same way (`run_ended`).
 
 use anyhow::Result;
 
 pub(super) use super::target::LaunchWalk;
+use super::{run_outcome_after, Lapse, RunEnd, RunOutcome};
 
 /// The open a run is the first one after, as far as a stream that does not start in it goes.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -115,12 +116,43 @@ impl SetupFailure {
 /// on, the stand-in. After a pick or a change a driver that never calls back is a failed stream,
 /// left not running with its control panel at hand, as the user who picked it may need to set
 /// its clock source there; one that called back once is a stream that died, wherever it ran.
-pub(super) fn stream_not_started(
-    first_run: FirstRun,
-    setup_failed: bool,
-    never_called_back: bool,
-) -> bool {
+fn stream_not_started(first_run: FirstRun, setup_failed: bool, never_called_back: bool) -> bool {
     setup_failed || (never_called_back && matches!(first_run, FirstRun::Launch { .. }))
+}
+
+/// How a run ended, decided by `run_ended` for `run()` and the launch tests alike.
+#[derive(Clone, Copy, Debug)]
+pub(super) struct Ended {
+    /// What the run saw, `setup_failed` counting a launch's driver that never called back.
+    pub end: RunEnd,
+    /// The open the run belonged to goes on with its stream that did not start.
+    pub follows_up: bool,
+    pub outcome: RunOutcome,
+    /// The output called back at least once in the run.
+    pub called_back: bool,
+}
+
+/// How the run that started as `first_run` ended: `end` as its streams left it, `lapse` how the
+/// duplex liveness check gave up on it, if it did, and `called_back` whether its output called
+/// back.
+pub(super) fn run_ended(
+    first_run: FirstRun,
+    end: RunEnd,
+    lapse: Option<Lapse>,
+    called_back: bool,
+) -> Ended {
+    let never_called_back = lapse == Some(Lapse::NeverCalledBack);
+    let end = RunEnd {
+        setup_failed: stream_not_started(first_run, end.setup_failed, never_called_back),
+        ..end
+    };
+    let follows_up = end.setup_failed && setup_failure_action(first_run).follows_up();
+    Ended {
+        end,
+        follows_up,
+        outcome: run_outcome_after(end, follows_up),
+        called_back,
+    }
 }
 
 /// The refused size an open publishes: none once the stream runs at it.
@@ -171,6 +203,21 @@ impl SetupRecovery {
     /// The run that started as `first_run` ended because its stream did not start.
     pub(super) fn on_setup_failed(&mut self, first_run: FirstRun) {
         self.pending = setup_failure_action(first_run);
+    }
+
+    /// The run that started as `first_run` ended as `ended`. A stream that did not start leaves
+    /// `reinit()` its follow-up. A launch's run that the driver restarted (a reset request, a rate
+    /// that moved) before its first callback leaves the launch pending for the restart's run, so
+    /// a driver that then stays silent is still followed up as one that did not start.
+    pub(super) fn on_run_end(&mut self, first_run: FirstRun, ended: &Ended) {
+        if ended.end.setup_failed {
+            self.on_setup_failed(first_run);
+        } else if ended.outcome == RunOutcome::Restart
+            && !ended.called_back
+            && matches!(first_run, FirstRun::Launch { .. })
+        {
+            self.first_run = first_run;
+        }
     }
 
     /// `reinit()` starts: what it does, the run after its reopen counted from here on. A stand-in
@@ -270,9 +317,10 @@ pub(super) fn first_run_after_pick(duplex: bool, requested: Option<u32>) -> Firs
 #[cfg(test)]
 mod tests {
     use super::super::target::launch_duplex;
-    use super::super::{run_outcome_after, RunEnd, RunOutcome};
+    use super::super::{published_after_run_end, Liveness, DUPLEX_LIVENESS_TIMEOUT_MS};
     use super::*;
     use crate::wrapper::standalone::recovery::{Action, Recovery};
+    use crate::wrapper::standalone::AudioDevicesInUse;
     use std::time::Duration;
 
     fn names(names: &[&str]) -> Vec<String> {
@@ -292,7 +340,7 @@ mod tests {
         Died(String),
     }
 
-    /// How a driver's stream fares in each run of it.
+    /// How a driver's stream fares in a run of it.
     #[derive(Clone, Copy, Debug, PartialEq, Eq)]
     enum Stream {
         Plays,
@@ -302,11 +350,14 @@ mod tests {
         Silent,
         /// Called back, then fell silent.
         Dies,
+        /// Asked for a reset (kAsioResetRequest) before its first callback.
+        Resets,
     }
 
     /// Where a duplex launch ended, every load in order, the driver published as refused, and
-    /// what the wrapper's stream-death budget made of the runs that ended: the pauses before each
-    /// reopen, whether it waited for the hardware, and how many stream deaths it was charged.
+    /// what the wrapper made of the runs that ended: the pauses before each reopen, whether it
+    /// waited for the hardware, how many stream deaths it was charged and how many runs left the
+    /// driver published as not running.
     struct Launched {
         ends: Ends,
         loads: Vec<String>,
@@ -314,6 +365,7 @@ mod tests {
         paused: Duration,
         waited_for_hardware: bool,
         charged: u32,
+        not_running: u32,
     }
 
     fn launch(
@@ -334,7 +386,7 @@ mod tests {
         streams: &[&str],
         reload_opens: bool,
     ) -> Launched {
-        let stream = |name: &str| {
+        let stream = |name: &str, _| {
             if streams.contains(&name) {
                 Stream::Plays
             } else {
@@ -345,15 +397,16 @@ mod tests {
     }
 
     /// A duplex launch driven through the sequence the backend runs: the launch's own walk to the
-    /// first driver that opens, then each run, `reinit()` and the walk on, every run that did not
-    /// play ending as `run()` reports it to the wrapper's `Recovery`. A driver in `opens` loads
-    /// and opens (its launch retry's reload only when `reload_opens`); `stream` says how its
-    /// stream fares once open.
+    /// first driver that opens, then each run, `reinit()` and the walk on. Every run that did not
+    /// play ends through `run_ended`, from a `Liveness` its callbacks stamped, and is reported to
+    /// the wrapper's `Recovery` as `run()` reports it. A driver in `opens` loads and opens (its
+    /// launch retry's reload only when `reload_opens`); `stream` says how its stream fares in its
+    /// nth run.
     fn launch_runs(
         requested: Option<&str>,
         listed: &[&str],
         opens: &[&str],
-        stream: impl Fn(&str) -> Stream,
+        stream: impl Fn(&str, usize) -> Stream,
         reload_opens: bool,
     ) -> Launched {
         let listed = names(listed);
@@ -373,6 +426,7 @@ mod tests {
             paused: Duration::ZERO,
             waited_for_hardware: false,
             charged: 0,
+            not_running: 0,
         };
         let (_, opened) = launch_duplex(requested, &listed, &mut open);
         let Ok((mut running, ())) = opened else {
@@ -382,9 +436,11 @@ mod tests {
         let mut recovery =
             SetupRecovery::at_launch(true, LaunchWalk::after(requested, &listed, &running));
         let mut budget = Recovery::new();
-        for _ in 0..=2 * listed.len() {
+        let mut runs: Vec<String> = Vec::new();
+        for _ in 0..=3 * listed.len() {
             let first_run = recovery.on_run_start();
-            let fares = stream(&running);
+            let fares = stream(&running, runs.iter().filter(|&run| *run == running).count());
+            runs.push(running.clone());
             if fares == Stream::Plays {
                 launched.refused = recovery.walk_refused().map(str::to_string);
                 let later = recovery.on_run_start();
@@ -395,25 +451,46 @@ mod tests {
                 launched.loads = loads.into_inner();
                 return launched;
             }
+            let liveness = Liveness::new();
+            liveness.stamp();
+            if fares == Stream::Dies {
+                liveness.callback();
+            }
+            let lapse = match fares {
+                Stream::Silent | Stream::Dies => {
+                    let lapse =
+                        liveness.lapse_at(liveness.now_ms() + DUPLEX_LIVENESS_TIMEOUT_MS + 1);
+                    assert!(lapse.is_some(), "the liveness check gives up after 2 s");
+                    lapse
+                }
+                _ => None,
+            };
             let end = RunEnd {
-                setup_failed: stream_not_started(
-                    first_run,
-                    fares == Stream::Refused,
-                    fares == Stream::Silent,
-                ),
-                stream_error: fares != Stream::Refused,
+                setup_failed: fares == Stream::Refused,
+                stream_error: lapse.is_some(),
+                restart: fares == Stream::Resets,
                 ..RunEnd::default()
             };
-            if end.setup_failed {
-                recovery.on_setup_failed(first_run);
+            let ended = run_ended(first_run, end, lapse, liveness.called_back());
+            recovery.on_run_end(first_run, &ended);
+            let published = published_after_run_end(
+                AudioDevicesInUse {
+                    running: true,
+                    ..AudioDevicesInUse::default()
+                },
+                ended.end,
+                ended.follows_up,
+            );
+            if !published.running {
+                launched.not_running += 1;
             }
-            let follows_up = end.setup_failed && setup_failure_action(first_run).follows_up();
-            let action = match run_outcome_after(end, follows_up) {
+            let action = match ended.outcome {
                 RunOutcome::FollowUp => budget.follow_up(),
                 RunOutcome::StreamFailed => {
                     launched.charged += 1;
                     budget.stream_failed(Duration::ZERO)
                 }
+                RunOutcome::Restart => budget.restart(Duration::ZERO),
                 other => panic!("a stream that did not play ends as {other:?}"),
             };
             match action {
@@ -423,6 +500,15 @@ mod tests {
                 Action::WaitForHardware => launched.waited_for_hardware = true,
             }
             let mut action = recovery.on_reinit();
+            if ended.outcome == RunOutcome::Restart {
+                assert_eq!(
+                    action,
+                    SetupFailure::Fail,
+                    "a restart reloads the same driver"
+                );
+                loads.borrow_mut().push(running.clone());
+                continue;
+            }
             if action == SetupFailure::RetryFollowingDriver {
                 loads.borrow_mut().push(running.clone());
                 if !reload_opens {
@@ -470,10 +556,20 @@ mod tests {
         );
     }
 
-    /// A launch where each driver in `listed` opens and fares as `fares` says.
-    fn launch_fares(requested: Option<&str>, listed: &[&str], fares: &[Stream]) -> Launched {
-        let stream = |name: &str| fares[listed.iter().position(|&l| l == name).unwrap()];
+    /// A launch where each driver in `listed` opens and fares in its nth run as the nth entry of
+    /// its `runs` says, the last entry for every run after.
+    fn launch_sequences(requested: Option<&str>, listed: &[&str], runs: &[&[Stream]]) -> Launched {
+        let stream = |name: &str, nth: usize| {
+            let fares = runs[listed.iter().position(|&l| l == name).unwrap()];
+            fares[nth.min(fares.len() - 1)]
+        };
         launch_runs(requested, listed, listed, stream, true)
+    }
+
+    /// A launch where each driver in `listed` opens and fares as `fares` says in every run.
+    fn launch_fares(requested: Option<&str>, listed: &[&str], fares: &[Stream]) -> Launched {
+        let runs: Vec<&[Stream]> = fares.iter().map(std::slice::from_ref).collect();
+        launch_sequences(requested, listed, &runs)
     }
 
     #[test]
@@ -483,6 +579,7 @@ mod tests {
         assert_eq!(launched.loads, ["A", "A", "B"], "A is retried once");
         assert_eq!(launched.refused.as_deref(), Some("A"));
         assert_eq!(launched.charged, 0, "no stream death is charged");
+        assert_eq!(launched.not_running, 0, "no 'not running' meanwhile");
         assert_eq!(launched.paused, Recovery::FOLLOW_UP * 2);
         let launched = launch_fares(
             Some("A"),
@@ -504,6 +601,7 @@ mod tests {
         assert_eq!(launched.ends, Ends::StandIn);
         assert_eq!(launched.loads, ["A", "A", "B", "C"]);
         assert_eq!(launched.charged, 0);
+        assert_eq!(launched.not_running, 0);
         assert!(!launched.waited_for_hardware);
         let launched = launch_fares(None, &["A"], &[Stream::Silent]);
         assert_eq!(launched.ends, Ends::StandIn, "a lone silent driver");
@@ -516,6 +614,7 @@ mod tests {
         assert_eq!(launched.ends, Ends::Died("A".into()));
         assert_eq!(launched.loads, ["A"], "no retry, no walk");
         assert_eq!(launched.charged, 1);
+        assert_eq!(launched.not_running, 1);
         let launched = launch_fares(
             Some("A"),
             &["A", "B", "C"],
@@ -527,44 +626,108 @@ mod tests {
     }
 
     #[test]
+    fn a_launch_driver_that_resets_before_its_first_callback_is_still_walked_on_when_silent() {
+        let launched = launch_sequences(
+            Some("A"),
+            &["A", "B"],
+            &[&[Stream::Resets, Stream::Silent], &[Stream::Plays]],
+        );
+        assert_eq!(launched.ends, Ends::Runs("B".into()));
+        assert_eq!(
+            launched.loads,
+            ["A", "A", "A", "B"],
+            "the reset's reload, the retry, then the walk"
+        );
+        assert_eq!(launched.refused.as_deref(), Some("A"));
+        assert_eq!(launched.charged, 0);
+        assert_eq!(launched.not_running, 0);
+    }
+
+    #[test]
+    fn a_reset_after_a_callback_uses_the_launch_up() {
+        let mut recovery = at_launch(true);
+        let first_run = recovery.on_run_start();
+        let reset = RunEnd {
+            restart: true,
+            ..RunEnd::default()
+        };
+        let ended = run_ended(first_run, reset, None, true);
+        assert_eq!(ended.outcome, RunOutcome::Restart);
+        recovery.on_run_end(first_run, &ended);
+        assert_eq!(recovery.on_reinit(), SetupFailure::Fail);
+        assert_eq!(recovery.on_run_start(), FirstRun::Other);
+        let mut recovery = at_launch(true);
+        recovery.on_run_start();
+        recovery.on_change();
+        recovery.on_change_opened(FirstRun::Pick);
+        let first_run = recovery.on_run_start();
+        recovery.on_run_end(first_run, &run_ended(first_run, reset, None, false));
+        assert_eq!(recovery.on_reinit(), SetupFailure::Fail);
+        assert_eq!(
+            recovery.on_run_start(),
+            FirstRun::Other,
+            "only a launch's run is kept"
+        );
+    }
+
+    #[test]
     fn a_driver_that_never_calls_back_after_a_pick_or_a_change_is_a_failed_stream() {
+        let silent = RunEnd {
+            stream_error: true,
+            ..RunEnd::default()
+        };
         for retried in [false, true] {
-            assert!(stream_not_started(
+            let ended = run_ended(
                 FirstRun::Launch { retried },
+                silent,
+                Some(Lapse::NeverCalledBack),
                 false,
-                true
-            ));
+            );
+            assert_eq!(ended.outcome, RunOutcome::FollowUp);
         }
         let mut recovery = at_launch(true);
         recovery.on_run_start();
         recovery.on_change();
         recovery.on_change_opened(first_run_after_pick(true, Some(64)));
+        let pick = recovery.on_run_start();
+        assert_eq!(pick, FirstRun::Pick);
         for first_run in [
-            recovery.on_run_start(),
+            pick,
             FirstRun::PeriodChange {
                 previous: Some(256),
             },
             FirstRun::Other,
         ] {
-            assert!(!stream_not_started(first_run, false, true), "{first_run:?}");
-            assert!(stream_not_started(first_run, true, false), "{first_run:?}");
-            let end = RunEnd {
-                setup_failed: stream_not_started(first_run, false, true),
-                stream_error: true,
+            let ended = run_ended(first_run, silent, Some(Lapse::NeverCalledBack), false);
+            assert!(!ended.end.setup_failed, "{first_run:?}");
+            assert!(!ended.follows_up, "{first_run:?}");
+            assert_eq!(ended.outcome, RunOutcome::StreamFailed, "{first_run:?}");
+            let refused = RunEnd {
+                setup_failed: true,
                 ..RunEnd::default()
             };
-            assert_eq!(run_outcome_after(end, false), RunOutcome::StreamFailed);
+            assert!(run_ended(first_run, refused, None, false).end.setup_failed);
         }
+        recovery.on_run_end(
+            pick,
+            &run_ended(pick, silent, Some(Lapse::NeverCalledBack), false),
+        );
         assert_eq!(
             recovery.on_reinit(),
             SetupFailure::Fail,
             "a pick is not walked on"
         );
-        assert!(!stream_not_started(
+        let ended = run_ended(
             FirstRun::Launch { retried: false },
-            false,
-            false
-        ));
+            silent,
+            Some(Lapse::FellSilent),
+            true,
+        );
+        assert_eq!(
+            ended.outcome,
+            RunOutcome::StreamFailed,
+            "it called back once"
+        );
     }
 
     #[test]

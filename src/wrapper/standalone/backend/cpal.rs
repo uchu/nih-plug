@@ -18,8 +18,8 @@ use std::thread::ScopedJoinHandle;
 use std::time::{Duration, Instant};
 
 use self::setup_failure::{
-    first_run_after_change, first_run_after_pick, setup_failure_action, still_refused,
-    stream_not_started, LaunchWalk, SetupFailure, SetupRecovery, Walked,
+    first_run_after_change, first_run_after_pick, run_ended, still_refused, LaunchWalk,
+    SetupFailure, SetupRecovery, Walked,
 };
 use self::target::{
     duplex_refused_output, first_that_opens, host_id_for, keep_refusals, launch_duplex,
@@ -436,7 +436,7 @@ impl<P: Plugin> Backend<P> for CpalMidir {
         let mut capture_refused: Option<Wanted> = None;
         // A duplex driver's stream is driven from the GUI thread; a shared host's from here.
         let gui = self.duplex.then(|| self.gui.clone()).flatten();
-        let outcome = std::thread::scope(|s| {
+        let ended = std::thread::scope(|s| {
             // This thread needs to be blocked until audio processing ends as CPAL processes the
             // streams on other threads. Created up front so the input stream's error callback can
             // also wake it (a dead capture stream mid-session should end the run, not leave the
@@ -848,8 +848,8 @@ impl<P: Plugin> Backend<P> for CpalMidir {
 
             // Why the device needs a fresh stream, when it does: not a failure.
             let mut restart: Option<String> = None;
-            // The duplex driver started its stream and fell silent before its first callback.
-            let mut never_called_back = false;
+            // How the duplex liveness check gave up on the run, if it did.
+            let mut lapse: Option<Lapse> = None;
             // Wait for the audio thread to exit. The timeout also lets this thread notice a stop
             // request when the device is already dead and no further callbacks or stream errors
             // will arrive (previously that combination made the application hang on exit).
@@ -879,19 +879,18 @@ impl<P: Plugin> Backend<P> for CpalMidir {
                     }
                     // A driver that keeps calling back with silence after an unplug, and sends no
                     // reset request, is not told apart here: only the audio itself would show it.
-                    if self.duplex && liveness.expired() {
-                        never_called_back = !liveness.called_back();
-                        if never_called_back {
-                            nih_error!(
+                    if let Some(lapsed) = self.duplex.then(|| liveness.lapse()).flatten() {
+                        match lapsed {
+                            Lapse::NeverCalledBack => nih_error!(
                                 "No callback from the ASIO driver in {DUPLEX_LIVENESS_TIMEOUT_MS} \
                                  ms since its stream started"
-                            );
-                        } else {
-                            nih_error!(
+                            ),
+                            Lapse::FellSilent => nih_error!(
                                 "No callback from the ASIO driver for \
                                  {DUPLEX_LIVENESS_TIMEOUT_MS} ms, restarting the stream"
-                            );
+                            ),
                         }
+                        lapse = Some(lapsed);
                         stream_error.store(true, Ordering::Release);
                         break;
                     }
@@ -982,7 +981,6 @@ impl<P: Plugin> Backend<P> for CpalMidir {
                     }
                 });
 
-            let setup_failed = stream_not_started(first_run, setup_failed, never_called_back);
             let end = RunEnd {
                 callback_stopped: callback_stopped.load(Ordering::Acquire),
                 stop_requested: should_stop.load(Ordering::SeqCst),
@@ -992,18 +990,17 @@ impl<P: Plugin> Backend<P> for CpalMidir {
                 device_returned: device_returned.load(Ordering::Acquire),
                 restart: restart.is_some(),
             };
-            let follows_up = setup_failed && setup_failure_action(first_run).follows_up();
-            let outcome = run_outcome_after(end, follows_up);
-            self.publish_in_use(|before| published_after_run_end(before, end, follows_up));
-            if let (RunOutcome::Restart, Some(reason)) = (outcome, restart) {
+            let ended = run_ended(first_run, end, lapse, liveness.called_back());
+            self.publish_in_use(|before| {
+                published_after_run_end(before, ended.end, ended.follows_up)
+            });
+            if let (RunOutcome::Restart, Some(reason)) = (ended.outcome, restart) {
                 nih_log!("Restarting the audio stream: {reason}");
             }
-            (outcome, setup_failed)
+            ended
         });
-        let (outcome, setup_failed) = outcome;
-        if setup_failed {
-            self.recovery.on_setup_failed(first_run);
-        }
+        self.recovery.on_run_end(first_run, &ended);
+        let outcome = ended.outcome;
         self.failed_sides = failed_sides.load(Ordering::Acquire);
         self.relapsed = relapsed_device(
             outcome,
@@ -1441,8 +1438,8 @@ struct RunEnd {
     callback_stopped: bool,
     stop_requested: bool,
     change_pending: bool,
-    /// The output stream was not built or did not start, or in a launch's run the duplex driver
-    /// never called back (`stream_not_started`).
+    /// The output stream was not built or did not start; once through `run_ended`, also a launch's
+    /// run whose duplex driver never called back.
     setup_failed: bool,
     /// A stream's error callback fired, or the duplex driver fell silent.
     stream_error: bool,
@@ -1689,8 +1686,8 @@ pub(crate) fn duplex_input_channels(wanted: u16, available: &[u16]) -> Option<u1
 }
 
 /// No error callback ever fires on ASIO (cpal ignores it), so silence is the signal (A6). In a
-/// launch's run silence before the first callback is a stream that did not start
-/// (`stream_not_started`); otherwise, and after any callback, a failed stream.
+/// launch's run silence before the first callback is a stream that did not start (`run_ended`);
+/// otherwise, and after any callback, a failed stream.
 const DUPLEX_LIVENESS_TIMEOUT_MS: u64 = 2000;
 
 /// How often a running stream reads its output's rate, where `rate_check_applies`.
@@ -1723,22 +1720,45 @@ impl Liveness {
     }
 
     fn stamp(&self) {
-        self.last_callback.store(self.now_ms(), Ordering::Relaxed);
+        self.last_callback.store(self.now_ms(), Ordering::Release);
     }
 
     /// The output callback's stamp; the run thread's own `stamp` does not count as a callback.
+    /// The stamp is stored before the flag, so a check that sees the flag sees the stamp.
     fn callback(&self) {
         self.stamp();
-        self.called_back.store(true, Ordering::Relaxed);
+        self.called_back.store(true, Ordering::Release);
     }
 
     fn called_back(&self) -> bool {
-        self.called_back.load(Ordering::Relaxed)
+        self.called_back.load(Ordering::Acquire)
     }
 
-    fn expired(&self) -> bool {
-        liveness_expired(self.now_ms(), self.last_callback.load(Ordering::Relaxed))
+    fn lapse(&self) -> Option<Lapse> {
+        self.lapse_at(self.now_ms())
     }
+
+    /// Whether, and how, the check gives up at `now_ms`. The flag is read before the stamp: a
+    /// first callback landing between the two reads has stamped, so the check does not give up
+    /// on it, where the other order would take the late first callback for a stream that died.
+    fn lapse_at(&self, now_ms: u64) -> Option<Lapse> {
+        let called_back = self.called_back();
+        let last_callback = self.last_callback.load(Ordering::Acquire);
+        liveness_expired(now_ms, last_callback).then_some(if called_back {
+            Lapse::FellSilent
+        } else {
+            Lapse::NeverCalledBack
+        })
+    }
+}
+
+/// How the duplex liveness check gave up on a run.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Lapse {
+    /// The driver started its stream and never called back in the run.
+    NeverCalledBack,
+    /// The driver called back, then fell silent.
+    FellSilent,
 }
 
 /// The capture callback's body: folds the device's interleaved frames into frames of the plugin's
@@ -4389,6 +4409,26 @@ mod tests {
         assert!(!liveness.called_back());
         liveness.clone().callback();
         assert!(liveness.called_back());
+    }
+
+    #[test]
+    fn the_liveness_check_tells_a_driver_that_never_called_back_from_one_that_fell_silent() {
+        let liveness = Liveness::new();
+        let stamped = || liveness.last_callback.load(Ordering::Acquire);
+        liveness.stamp();
+        let last = stamped();
+        assert_eq!(liveness.lapse_at(last + DUPLEX_LIVENESS_TIMEOUT_MS), None);
+        assert_eq!(
+            liveness.lapse_at(last + DUPLEX_LIVENESS_TIMEOUT_MS + 1),
+            Some(Lapse::NeverCalledBack)
+        );
+        liveness.clone().callback();
+        let last = stamped();
+        assert_eq!(liveness.lapse_at(last + DUPLEX_LIVENESS_TIMEOUT_MS), None);
+        assert_eq!(
+            liveness.lapse_at(last + DUPLEX_LIVENESS_TIMEOUT_MS + 1),
+            Some(Lapse::FellSilent)
+        );
     }
 
     #[test]

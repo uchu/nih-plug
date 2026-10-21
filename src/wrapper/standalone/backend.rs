@@ -32,8 +32,9 @@ pub enum RunOutcome {
     StreamFailed,
     /// The stream did not start, or in a launch's run the ASIO driver started it and never called
     /// back, and the open it belonged to goes on with another attempt in the next
-    /// [`Backend::reinit()`]: a reload at another size, a walk on to another driver, a stand-in. Not a stream death: the caller reinitialises after a short pause without spending
-    /// its failure budget.
+    /// [`Backend::reinit()`]: a reload at another size, a walk on to another driver, a stand-in.
+    /// Not a stream death: the caller reinitialises after a short pause without spending its
+    /// failure budget.
     FollowUp,
     /// A requested device that another device was standing in for is available again. Not a
     /// failure: the caller should [`Backend::reinit()`] and [`Backend::run()`] again to move onto it.

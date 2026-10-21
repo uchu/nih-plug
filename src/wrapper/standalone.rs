@@ -77,10 +77,10 @@ pub struct AudioDevicesInUse {
     /// `true` while the same open goes on with it: the driver reloaded at another size, the
     /// launch walking on to the next listed driver, or the shared host standing in. At launch a
     /// driver that starts its stream and never calls back counts as one that did not start; after
-    /// a pick or a change it is a stream that fell silent. A recovery
-    /// reopen keeps the value the run before it ended with, and a recovery reopen that fails is
-    /// `false` and keeps naming `opened`, so a driver that loads and then never calls back is
-    /// named, and not running, while it is down.
+    /// a pick or a change it is a stream that fell silent. A recovery reopen keeps the value the
+    /// run before it ended with, and a recovery reopen that fails is `false` and keeps naming
+    /// `opened`, so a driver that loads and then never calls back is named, and not running,
+    /// while it is down.
     pub running: bool,
     /// A buffer size the ASIO driver listed and then refused to run: after a change of the size
     /// alone the previous size runs instead, after a launch, a driver pick or a switch to ASIO
