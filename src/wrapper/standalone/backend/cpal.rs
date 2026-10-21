@@ -306,6 +306,11 @@ impl<P: Plugin> Backend<P> for CpalMidir {
         let liveness = Liveness::new();
         let Some(output) = self.output.as_ref() else {
             nih_error!("No audio output is open");
+            let end = RunEnd {
+                setup_failed: true,
+                ..RunEnd::default()
+            };
+            self.publish_in_use(|before| published_after_run_end(before, end));
             return RunOutcome::StreamFailed;
         };
         // So this is a lot of fun. There are up to four separate streams here, all using their own
@@ -712,8 +717,16 @@ impl<P: Plugin> Backend<P> for CpalMidir {
                 liveness.stamp();
                 let check_rate = rate_check_applies(self.duplex, self.host_id);
                 let mut rate_checked = Instant::now();
+                let mut called_back = false;
                 loop {
                     parker.park_timeout(Duration::from_millis(100));
+                    if !called_back && liveness.called_back() {
+                        called_back = true;
+                        self.publish_in_use(|before| AudioDevicesInUse {
+                            running: true,
+                            ..before
+                        });
+                    }
                     if stream_error.load(Ordering::Acquire)
                         || callback_stopped.load(Ordering::Acquire)
                         || should_stop.load(Ordering::SeqCst)
@@ -803,14 +816,7 @@ impl<P: Plugin> Backend<P> for CpalMidir {
                 restart: restart.is_some(),
             };
             let outcome = run_outcome(end);
-            {
-                let mut in_use = self.in_use.lock();
-                let after = published_after_run_end(in_use.clone(), end);
-                if after != *in_use {
-                    *in_use = after.clone();
-                    publish_audio_devices_in_use(after);
-                }
-            }
+            self.publish_in_use(|before| published_after_run_end(before, end));
             if let (RunOutcome::Restart, Some(reason)) = (outcome, restart) {
                 nih_log!("Restarting the audio stream: {reason}");
             }
@@ -1152,12 +1158,37 @@ fn run_outcome(end: RunEnd) -> RunOutcome {
 }
 
 /// What the stream is open on once a run ended with `end`. A run whose stream did not start,
-/// failed or fell silent leaves nothing running until an open succeeds again; every other end is
-/// followed by a reopen or a shutdown, and a reopen publishes for itself.
+/// failed or fell silent leaves nothing running until a stream calls back again; every other end
+/// is followed by a reopen or a shutdown, and a reopen publishes for itself.
 fn published_after_run_end(before: AudioDevicesInUse, end: RunEnd) -> AudioDevicesInUse {
     AudioDevicesInUse {
         running: before.running && run_outcome(end) != RunOutcome::StreamFailed,
         ..before
+    }
+}
+
+/// Whether a stream that just opened is published as running before it calls back. A launch or
+/// a pick is taken as running; a restart keeps what the run before it ended with, so a driver
+/// that loads and then never calls back is not reported running on every recovery attempt.
+fn running_after_open(start: Start, previous_running: bool) -> bool {
+    start != Start::Restart || previous_running
+}
+
+/// What an open that opened no output publishes. A restart keeps naming what last opened, as
+/// not running; a launch or a pick that fails names nothing, as a failed pick is followed by the
+/// previous device's reopen.
+fn published_after_failed_open(
+    start: Start,
+    previous: &AudioDevicesInUse,
+    failed: AudioDevicesInUse,
+) -> AudioDevicesInUse {
+    let opened = (start == Start::Restart)
+        .then(|| previous.opened.clone())
+        .flatten();
+    AudioDevicesInUse {
+        opened,
+        running: false,
+        ..failed
     }
 }
 
@@ -1227,11 +1258,13 @@ pub(crate) fn liveness_expired(now_ms: u64, last_ms: u64) -> bool {
     now_ms.saturating_sub(last_ms) > DUPLEX_LIVENESS_TIMEOUT_MS
 }
 
-/// When the output callback last ran, in milliseconds since the run started.
+/// When the output callback last ran, in milliseconds since the run started, and whether it ran
+/// at all in this run.
 #[derive(Clone)]
 struct Liveness {
     run_started: Instant,
     last_callback: Arc<AtomicU64>,
+    called_back: Arc<AtomicBool>,
 }
 
 impl Liveness {
@@ -1239,6 +1272,7 @@ impl Liveness {
         Self {
             run_started: Instant::now(),
             last_callback: Arc::new(AtomicU64::new(0)),
+            called_back: Arc::new(AtomicBool::new(false)),
         }
     }
 
@@ -1248,6 +1282,16 @@ impl Liveness {
 
     fn stamp(&self) {
         self.last_callback.store(self.now_ms(), Ordering::Relaxed);
+    }
+
+    /// The output callback's stamp; the run thread's own `stamp` does not count as a callback.
+    fn callback(&self) {
+        self.stamp();
+        self.called_back.store(true, Ordering::Relaxed);
+    }
+
+    fn called_back(&self) -> bool {
+        self.called_back.load(Ordering::Relaxed)
     }
 
     fn expired(&self) -> bool {
@@ -1543,6 +1587,16 @@ impl CpalMidir {
             output: self.config.output_device.clone(),
             input: self.config.input_device.clone(),
             period: self.period_request,
+        }
+    }
+
+    /// Applies `update` to what the stream is open on and publishes the result when it changed.
+    fn publish_in_use(&self, update: impl FnOnce(AudioDevicesInUse) -> AudioDevicesInUse) {
+        let mut in_use = self.in_use.lock();
+        let after = update(in_use.clone());
+        if after != *in_use {
+            *in_use = after.clone();
+            publish_audio_devices_in_use(after);
         }
     }
 
@@ -1937,13 +1991,15 @@ impl CpalMidir {
                 match result {
                     Ok(output) => output,
                     Err(err) => {
-                        publish_audio_devices_in_use(in_use);
+                        publish_audio_devices_in_use(published_after_failed_open(
+                            start, previous, in_use,
+                        ));
                         return Err(err);
                     }
                 }
             }
             None => {
-                publish_audio_devices_in_use(in_use);
+                publish_audio_devices_in_use(published_after_failed_open(start, previous, in_use));
                 return Err(failure.unwrap_or_else(|| anyhow::anyhow!("No audio output opened")));
             }
         };
@@ -1959,13 +2015,15 @@ impl CpalMidir {
                     in_use.preferred_buffer_size = Some(preferred);
                 }
                 Err(err) => {
-                    publish_audio_devices_in_use(in_use);
+                    publish_audio_devices_in_use(published_after_failed_open(
+                        start, previous, in_use,
+                    ));
                     return Err(err);
                 }
             }
         }
         in_use.opened = output.device.name().ok();
-        in_use.running = true;
+        in_use.running = running_after_open(start, previous.running);
         in_use.sample_rate = Some(output.config.sample_rate.0);
         in_use.buffer_size = stream_period(&output).map(|period| period as u32);
         let rate = output.config.sample_rate.0 as f32;
@@ -2487,7 +2545,7 @@ impl CpalMidir {
         let underruns = self.underruns.clone();
         let mut backlog_discarded = false;
         move |data, _info| {
-            liveness.stamp();
+            liveness.callback();
             if !backlog_discarded {
                 backlog_discarded = true;
                 // One period is kept. A duplex driver runs the capture callback first in every
@@ -3354,6 +3412,58 @@ mod tests {
         };
         let before = running_duplex("RME");
         assert_eq!(published_after_run_end(before.clone(), end), before);
+    }
+
+    #[test]
+    fn a_recovery_reopen_after_a_failed_run_stays_not_running() {
+        assert!(!running_after_open(Start::Restart, false));
+    }
+
+    #[test]
+    fn a_launch_or_pick_opens_as_running() {
+        for previous_running in [false, true] {
+            assert!(running_after_open(Start::Launch, previous_running));
+            assert!(running_after_open(Start::Reconfigure, previous_running));
+        }
+    }
+
+    #[test]
+    fn a_restart_after_a_healthy_run_stays_running() {
+        assert!(running_after_open(Start::Restart, true));
+    }
+
+    #[test]
+    fn a_failed_recovery_reopen_keeps_naming_the_driver_that_last_opened() {
+        let previous = AudioDevicesInUse {
+            running: false,
+            ..running_duplex("Realtek ASIO")
+        };
+        let failed = AudioDevicesInUse {
+            duplex: true,
+            ..Default::default()
+        };
+        let after = published_after_failed_open(Start::Restart, &previous, failed);
+        assert_eq!(after.opened.as_deref(), Some("Realtek ASIO"));
+        assert!(!after.running);
+    }
+
+    #[test]
+    fn a_failed_pick_or_launch_names_nothing_opened() {
+        let previous = running_duplex("Realtek ASIO");
+        for start in [Start::Launch, Start::Reconfigure] {
+            let after = published_after_failed_open(start, &previous, AudioDevicesInUse::default());
+            assert_eq!(after.opened, None);
+            assert!(!after.running);
+        }
+    }
+
+    #[test]
+    fn only_the_output_callback_marks_a_run_as_called_back() {
+        let liveness = Liveness::new();
+        liveness.stamp();
+        assert!(!liveness.called_back());
+        liveness.clone().callback();
+        assert!(liveness.called_back());
     }
 
     #[test]

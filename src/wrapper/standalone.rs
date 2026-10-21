@@ -68,10 +68,12 @@ pub struct AudioDevicesInUse {
     pub buffer_sizes: Vec<u32>,
     /// The ASIO driver's preferred buffer size; `None` on other hosts.
     pub preferred_buffer_size: Option<u32>,
-    /// Whether the stream on `opened` runs: `true` from an open that succeeded until a run ends
-    /// because its stream did not start, failed or (on a duplex host) fell silent, and `false`
-    /// from then until the next open succeeds. `opened` keeps naming the device that last opened,
-    /// so a driver that loads and then never calls back can be named while it is down.
+    /// Whether the stream on `opened` runs: `true` from a launch or a pick that opened until a run
+    /// ends because its stream did not start, failed or (on a duplex host) fell silent, and
+    /// `false` from then until a stream calls back again. A recovery reopen keeps the value the
+    /// run before it ended with, and a recovery reopen that fails keeps naming `opened` as well,
+    /// so a driver that loads and then never calls back is named, and not running, while it is
+    /// down.
     pub running: bool,
     /// A buffer size the ASIO driver listed and then refused to run; the previous size runs
     /// instead. `None` once any size opens, and on other hosts.
