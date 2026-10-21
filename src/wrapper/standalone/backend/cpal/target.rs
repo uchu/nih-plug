@@ -147,8 +147,8 @@ pub(super) fn first_that_opens<T>(
 /// What a duplex launch did with the driver it was asked for.
 #[derive(Debug)]
 pub(super) enum Requested {
-    /// "First available": none was asked for.
-    None,
+    /// None was asked for.
+    FirstAvailable,
     Opened,
     /// Not among the registered drivers, so never loaded.
     Absent,
@@ -165,7 +165,7 @@ pub(super) fn launch_duplex<T>(
     mut open: impl FnMut(&str) -> Result<T>,
 ) -> (Requested, Result<(String, T)>) {
     let outcome = match requested {
-        None => Requested::None,
+        None => Requested::FirstAvailable,
         Some(name) if !names.iter().any(|listed| listed == name) => Requested::Absent,
         Some(name) => match open(name) {
             Ok(opened) => return (Requested::Opened, Ok((name.to_string(), opened))),
@@ -388,7 +388,7 @@ mod tests {
         let mut tried = Vec::new();
         let (requested, opened) =
             launch_duplex(None, &names(&["A", "B", "C"]), opens_only("B", &mut tried));
-        assert!(matches!(requested, Requested::None));
+        assert!(matches!(requested, Requested::FirstAvailable));
         assert_eq!(opened.unwrap(), ("B".to_string(), "b".to_string()));
         assert_eq!(tried, ["A", "B"]);
     }

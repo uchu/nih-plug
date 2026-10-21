@@ -57,9 +57,9 @@ pub struct CpalMidir {
     /// `duplex` belong to the configuration that runs: a switch to another host replaces all three
     /// (A18).
     host_id: cpal::HostId,
-    /// The host the devices were opened through, kept for `reinit()`. An ASIO host enumerates only
-    /// when it opens, at launch or on a switch to it: its enumeration loads every driver in turn,
-    /// so a duplex restart loads its one driver by name instead (A7).
+    /// The host the devices were opened through, kept for `reinit()`. An ASIO host is never
+    /// enumerated through cpal, whose listing loads every driver: its drivers are listed by
+    /// registry name, and each start loads its one driver by name (A7, E4).
     host: cpal::Host,
     /// A single-device duplex host, see `single_device_duplex`.
     duplex: bool,
@@ -148,22 +148,54 @@ enum Resolved {
 }
 
 /// What opening the loaded ASIO driver `name` came to. A driver that offers no output
-/// configuration loaded fine and is refused with the sample type it reports (`output_type`): cpal
-/// lists no configuration for a type it cannot convert (E4, E7).
+/// configuration loaded fine and is refused with what rules one out (`report`), the sample type
+/// when cpal cannot convert it (E4, E7).
 fn opened_driver(
     name: &str,
     resolved: Resolved,
-    output_type: Option<String>,
+    report: impl FnOnce() -> Option<asio_driver::OutputReport>,
 ) -> Result<CpalDevice> {
     let refusal = match resolved {
         Resolved::Open(device) => return Ok(device),
         Resolved::Refused(err) => err,
-        Resolved::Absent => anyhow::anyhow!(
-            "no supported sample format ({})",
-            output_type.as_deref().unwrap_or("not reported")
-        ),
+        Resolved::Absent => anyhow::anyhow!(asio_driver::no_output_configuration(report())),
     };
     Err(refusal.context(format!("The ASIO driver '{name}' does not open")))
+}
+
+/// Publish what a duplex launch did with the driver it was asked for (`requested`): the output it
+/// plays through, or a refusal kept and watched while the first driver that opens stands in.
+fn launch_published(
+    requested: Option<String>,
+    outcome: Requested,
+    in_use: &mut AudioDevicesInUse,
+    opened: &mut OpenedDevicesSoFar,
+    quarantined: &[Wanted],
+) {
+    let Some(name) = requested else {
+        return;
+    };
+    let wanted = Wanted {
+        name: name.clone(),
+        kind: Kind::Output,
+    };
+    match outcome {
+        Requested::Opened => in_use.output = Some(name),
+        Requested::Refused(err) => {
+            nih_error!("{err:#}; the first available ASIO driver stands in");
+            in_use.refused_output = Some(name);
+            opened.refused(wanted, quarantined);
+        }
+        Requested::Absent => {
+            nih_log!(
+                "The ASIO driver '{name}' is not installed, the first available one stands in. \
+                 Installed drivers are: {}",
+                in_use.outputs.join(", ")
+            );
+            opened.absent.push(wanted);
+        }
+        Requested::FirstAvailable => {}
+    }
 }
 
 /// The requested devices a start or restart could not open, by what happens to them next.
@@ -1801,10 +1833,9 @@ impl CpalMidir {
         let Some(device) = asio_driver::load(name) else {
             anyhow::bail!("The ASIO driver '{name}' does not load");
         };
-        let output_type = asio_driver::output_type(&device);
         let resolved =
-            Self::resolve_output_among(vec![device], config, output_channels, device_use);
-        opened_driver(name, resolved, output_type)
+            Self::resolve_output_among(vec![device.clone()], config, output_channels, device_use);
+        opened_driver(name, resolved, || asio_driver::output_report(&device))
     }
 
     /// Whether a wanted device could run the session's stream right now: the restart's own
@@ -1955,29 +1986,7 @@ impl CpalMidir {
             let (outcome, result) = launch_duplex(requested.as_deref(), &in_use.outputs, |name| {
                 Self::open_asio(name, config, output_channels, device_use)
             });
-            if let Some(name) = requested {
-                let wanted = Wanted {
-                    name: name.clone(),
-                    kind: Kind::Output,
-                };
-                match outcome {
-                    Requested::Opened => in_use.output = Some(name),
-                    Requested::Refused(err) => {
-                        nih_error!("{err:#}; the first available ASIO driver stands in");
-                        in_use.refused_output = Some(name);
-                        opened.refused(wanted, quarantined);
-                    }
-                    Requested::Absent => {
-                        nih_log!(
-                            "The ASIO driver '{name}' is not installed, the first available one \
-                             stands in. Installed drivers are: {}",
-                            in_use.outputs.join(", ")
-                        );
-                        opened.absent.push(wanted);
-                    }
-                    Requested::None => {}
-                }
-            }
+            launch_published(requested, outcome, &mut in_use, &mut opened, quarantined);
             match result {
                 Ok((_, device)) => output = Some(device),
                 Err(err) => failure = Some(err),
@@ -2878,7 +2887,7 @@ mod tests {
     }
 
     #[test]
-    fn names_of_drops_blank_and_duplicate_names() {
+    fn dedupe_names_drops_blank_and_duplicate_names() {
         let names = dedupe_names(vec![
             "A".to_string(),
             "".to_string(),
@@ -2905,22 +2914,118 @@ mod tests {
     }
 
     #[test]
-    fn a_driver_with_no_supported_format_is_refused_not_absent() {
-        let refusal = |resolved, output_type: Option<&str>| {
-            let Err(err) = opened_driver("RME", resolved, output_type.map(Into::into)) else {
+    fn a_driver_offering_no_configuration_is_refused_with_its_report() {
+        let refusal = |resolved, report: Option<asio_driver::OutputReport>| {
+            let Err(err) = opened_driver("RME", resolved, || report) else {
                 panic!("nothing opened");
             };
             format!("{err:#}")
         };
+        let report = asio_driver::OutputReport {
+            outputs: Ok(2),
+            rate: Ok(48000.0),
+            buffer_sizes: Ok(()),
+            sample_type: Ok("ASIOSTFloat64LSB".to_string()),
+            converts: false,
+        };
         assert_eq!(
-            refusal(Resolved::Absent, Some("Float64LSB")),
-            "The ASIO driver 'RME' does not open: no supported sample format (Float64LSB)"
+            refusal(Resolved::Absent, Some(report)),
+            "The ASIO driver 'RME' does not open: no supported sample format (ASIOSTFloat64LSB)"
         );
-        assert!(refusal(Resolved::Absent, None).contains("no supported sample format"));
+        assert_eq!(
+            refusal(Resolved::Absent, None),
+            "The ASIO driver 'RME' does not open: it offers no output configuration"
+        );
         assert_eq!(
             refusal(Resolved::Refused(anyhow::anyhow!("busy")), None),
             "The ASIO driver 'RME' does not open: busy"
         );
+    }
+
+    #[test]
+    fn a_refused_driver_is_not_asked_for_a_report() {
+        let mut asked = false;
+        let _ = opened_driver("RME", Resolved::Refused(anyhow::anyhow!("busy")), || {
+            asked = true;
+            None
+        });
+        assert!(
+            !asked,
+            "only a driver offering no configuration is diagnosed"
+        );
+    }
+
+    fn launch_published_for(
+        requested: Option<&str>,
+        outcome: Requested,
+        quarantined: &[Wanted],
+    ) -> (AudioDevicesInUse, OpenedDevicesSoFar) {
+        let mut in_use = AudioDevicesInUse {
+            outputs: vec!["A".to_string(), "B".to_string()],
+            ..Default::default()
+        };
+        let mut opened = OpenedDevicesSoFar::default();
+        launch_published(
+            requested.map(Into::into),
+            outcome,
+            &mut in_use,
+            &mut opened,
+            quarantined,
+        );
+        (in_use, opened)
+    }
+
+    fn output(name: &str) -> Wanted {
+        Wanted {
+            name: name.to_string(),
+            kind: Kind::Output,
+        }
+    }
+
+    #[test]
+    fn a_saved_driver_refused_at_launch_is_published_refused() {
+        let (in_use, opened) =
+            launch_published_for(Some("B"), Requested::Refused(anyhow::anyhow!("busy")), &[]);
+        assert_eq!(in_use.refused_output.as_deref(), Some("B"));
+        assert_eq!(
+            in_use.output, None,
+            "a stand-in plays, not the saved driver"
+        );
+        assert_eq!(opened.refused, [output("B")]);
+        assert!(opened.absent.is_empty() && opened.quarantined.is_empty());
+
+        let (_, opened) = launch_published_for(
+            Some("B"),
+            Requested::Refused(anyhow::anyhow!("busy")),
+            &[output("B")],
+        );
+        assert_eq!(opened.quarantined, [output("B")]);
+        assert!(opened.refused.is_empty());
+    }
+
+    #[test]
+    fn an_uninstalled_saved_driver_at_launch_is_published_absent() {
+        let (in_use, opened) = launch_published_for(Some("Gone"), Requested::Absent, &[]);
+        assert_eq!(in_use.refused_output, None);
+        assert_eq!(in_use.output, None);
+        assert_eq!(opened.absent, [output("Gone")]);
+        assert!(opened.refused.is_empty() && opened.quarantined.is_empty());
+    }
+
+    #[test]
+    fn a_saved_driver_that_opens_at_launch_is_published_as_the_output() {
+        let (in_use, opened) = launch_published_for(Some("B"), Requested::Opened, &[]);
+        assert_eq!(in_use.output.as_deref(), Some("B"));
+        assert_eq!(in_use.refused_output, None);
+        assert!(opened.absent.is_empty() && opened.refused.is_empty());
+    }
+
+    #[test]
+    fn a_first_available_launch_publishes_no_requested_driver() {
+        let (in_use, opened) = launch_published_for(None, Requested::FirstAvailable, &[]);
+        assert_eq!(in_use.output, None);
+        assert_eq!(in_use.refused_output, None);
+        assert!(opened.absent.is_empty() && opened.refused.is_empty());
     }
 
     #[test]

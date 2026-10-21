@@ -153,20 +153,79 @@ fn registered() -> Vec<String> {
     Vec::new()
 }
 
-/// The sample type the loaded driver reports for its outputs, as asio-sys names it.
-#[cfg(all(target_os = "windows", feature = "asio"))]
-pub(crate) fn output_type(device: &Device) -> Option<String> {
-    match device.as_inner() {
-        cpal::platform::DeviceInner::Asio(asio) => match asio.driver.output_data_type() {
-            Ok(ty) => Some(format!("{ty:?}")),
-            Err(err) => Some(format!("unreadable: {err}")),
-        },
-        _ => None,
+/// What a loaded driver reports about its outputs, read in the order cpal reads it for an output
+/// configuration. Errors are the driver's, as text.
+pub(crate) struct OutputReport {
+    pub(crate) outputs: Result<i64, String>,
+    pub(crate) rate: Result<f64, String>,
+    pub(crate) buffer_sizes: Result<(), String>,
+    /// As asio-sys names it.
+    pub(crate) sample_type: Result<String, String>,
+    /// Whether cpal converts samples of `sample_type` (E7).
+    pub(crate) converts: bool,
+}
+
+/// Why a loaded driver offers cpal no output configuration: the first report that rules one out.
+/// Every report reading fine leaves the rates, none of which the driver accepts.
+pub(crate) fn no_output_configuration(report: Option<OutputReport>) -> String {
+    let Some(report) = report else {
+        return "it offers no output configuration".to_string();
+    };
+    match report.outputs {
+        Err(err) => return format!("its channel count is unreadable: {err}"),
+        Ok(outputs) if outputs < 1 => return "it reports no output channels".to_string(),
+        Ok(_) => {}
+    }
+    let rate = match report.rate {
+        Ok(rate) => rate,
+        Err(err) => return format!("its sample rate is unreadable: {err}"),
+    };
+    if let Err(err) = report.buffer_sizes {
+        return format!("its buffer sizes are unreadable: {err}");
+    }
+    let sample_type = match report.sample_type {
+        Ok(sample_type) => sample_type,
+        Err(err) => return format!("its sample type is unreadable: {err}"),
+    };
+    if report.converts {
+        format!("no usable output configuration at {rate} Hz (sample type {sample_type})")
+    } else {
+        format!("no supported sample format ({sample_type})")
     }
 }
 
+#[cfg(all(target_os = "windows", feature = "asio"))]
+pub(crate) fn output_report(device: &Device) -> Option<OutputReport> {
+    use cpal::traits::DeviceTrait;
+
+    let cpal::platform::DeviceInner::Asio(asio) = device.as_inner() else {
+        return None;
+    };
+    let driver = &asio.driver;
+    Some(OutputReport {
+        outputs: driver
+            .channels()
+            .map(|channels| i64::from(channels.outs))
+            .map_err(|err| err.to_string()),
+        rate: driver.sample_rate().map_err(|err| err.to_string()),
+        buffer_sizes: driver
+            .buffersize_range()
+            .map(drop)
+            .map_err(|err| err.to_string()),
+        sample_type: driver
+            .output_data_type()
+            .map(|sample_type| format!("{sample_type:?}"))
+            .map_err(|err| err.to_string()),
+        // cpal also answers this for an unreadable rate, which the report names first.
+        converts: !matches!(
+            device.default_output_config(),
+            Err(cpal::DefaultStreamConfigError::StreamTypeNotSupported)
+        ),
+    })
+}
+
 #[cfg(not(all(target_os = "windows", feature = "asio")))]
-pub(crate) fn output_type(_device: &Device) -> Option<String> {
+pub(crate) fn output_report(_device: &Device) -> Option<OutputReport> {
     None
 }
 
@@ -199,4 +258,95 @@ pub(crate) fn load(name: &str) -> Option<Device> {
 #[cfg(not(all(target_os = "windows", feature = "asio")))]
 pub(crate) fn load(_name: &str) -> Option<Device> {
     None
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn report() -> OutputReport {
+        OutputReport {
+            outputs: Ok(2),
+            rate: Ok(48000.0),
+            buffer_sizes: Ok(()),
+            sample_type: Ok("ASIOSTInt32LSB".to_string()),
+            converts: true,
+        }
+    }
+
+    #[test]
+    fn a_supported_sample_type_is_not_blamed() {
+        assert_eq!(
+            no_output_configuration(Some(report())),
+            "no usable output configuration at 48000 Hz (sample type ASIOSTInt32LSB)"
+        );
+    }
+
+    #[test]
+    fn an_unsupported_sample_type_is_named() {
+        let report = OutputReport {
+            sample_type: Ok("ASIOSTFloat64LSB".to_string()),
+            converts: false,
+            ..report()
+        };
+        assert_eq!(
+            no_output_configuration(Some(report)),
+            "no supported sample format (ASIOSTFloat64LSB)"
+        );
+    }
+
+    #[test]
+    fn the_first_report_that_rules_a_configuration_out_is_the_reason() {
+        let no_clock = OutputReport {
+            rate: Err("no clock".to_string()),
+            converts: false,
+            ..report()
+        };
+        assert_eq!(
+            no_output_configuration(Some(no_clock)),
+            "its sample rate is unreadable: no clock"
+        );
+        let no_outputs = OutputReport {
+            outputs: Ok(0),
+            converts: false,
+            ..report()
+        };
+        assert_eq!(
+            no_output_configuration(Some(no_outputs)),
+            "it reports no output channels"
+        );
+        let channels = OutputReport {
+            outputs: Err("gone".to_string()),
+            ..report()
+        };
+        assert_eq!(
+            no_output_configuration(Some(channels)),
+            "its channel count is unreadable: gone"
+        );
+        let buffers = OutputReport {
+            buffer_sizes: Err("gone".to_string()),
+            ..report()
+        };
+        assert_eq!(
+            no_output_configuration(Some(buffers)),
+            "its buffer sizes are unreadable: gone"
+        );
+        let sample_type = OutputReport {
+            sample_type: Err("gone".to_string()),
+            converts: false,
+            ..report()
+        };
+        assert_eq!(
+            no_output_configuration(Some(sample_type)),
+            "its sample type is unreadable: gone"
+        );
+    }
+
+    #[test]
+    fn a_device_with_no_report_offers_no_configuration() {
+        assert_eq!(
+            no_output_configuration(None),
+            "it offers no output configuration"
+        );
+    }
 }
