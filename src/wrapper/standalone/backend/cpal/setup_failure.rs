@@ -20,7 +20,7 @@ pub(super) enum FirstRun {
 pub(super) enum SetupFailure {
     /// Reload the driver at its own size.
     RetryFollowingDriver,
-    /// Reload the picked driver at its own size; a stream that does not start then either is a
+    /// Reload the picked driver at its own size; a stream that then does not start either is a
     /// failed stream.
     PickFollowingDriver,
     /// Reopen at the size that ran before the change (`None`: the driver's own).
