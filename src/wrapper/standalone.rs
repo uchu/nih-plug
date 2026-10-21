@@ -75,7 +75,9 @@ pub struct AudioDevicesInUse {
     /// ends because its stream did not start, failed or (on a duplex host) fell silent, and
     /// `false` from then until a stream calls back again. A stream that did not start stays
     /// `true` while the same open goes on with it: the driver reloaded at another size, the
-    /// launch walking on to the next listed driver, or the shared host standing in. A recovery
+    /// launch walking on to the next listed driver, or the shared host standing in. At launch a
+    /// driver that starts its stream and never calls back counts as one that did not start; after
+    /// a pick or a change it is a stream that fell silent. A recovery
     /// reopen keeps the value the run before it ended with, and a recovery reopen that fails is
     /// `false` and keeps naming `opened`, so a driver that loads and then never calls back is
     /// named, and not running, while it is down.

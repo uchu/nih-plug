@@ -18,8 +18,8 @@ use std::thread::ScopedJoinHandle;
 use std::time::{Duration, Instant};
 
 use self::setup_failure::{
-    first_run_after_change, first_run_after_pick, setup_failure_action, still_refused, LaunchWalk,
-    SetupFailure, SetupRecovery, Walked,
+    first_run_after_change, first_run_after_pick, setup_failure_action, still_refused,
+    stream_not_started, LaunchWalk, SetupFailure, SetupRecovery, Walked,
 };
 use self::target::{
     duplex_refused_output, first_that_opens, host_id_for, keep_refusals, launch_duplex,
@@ -848,6 +848,8 @@ impl<P: Plugin> Backend<P> for CpalMidir {
 
             // Why the device needs a fresh stream, when it does: not a failure.
             let mut restart: Option<String> = None;
+            // The duplex driver started its stream and fell silent before its first callback.
+            let mut never_called_back = false;
             // Wait for the audio thread to exit. The timeout also lets this thread notice a stop
             // request when the device is already dead and no further callbacks or stream errors
             // will arrive (previously that combination made the application hang on exit).
@@ -878,10 +880,18 @@ impl<P: Plugin> Backend<P> for CpalMidir {
                     // A driver that keeps calling back with silence after an unplug, and sends no
                     // reset request, is not told apart here: only the audio itself would show it.
                     if self.duplex && liveness.expired() {
-                        nih_error!(
-                            "No callback from the ASIO driver for {DUPLEX_LIVENESS_TIMEOUT_MS} \
-                             ms, restarting the stream"
-                        );
+                        never_called_back = !liveness.called_back();
+                        if never_called_back {
+                            nih_error!(
+                                "No callback from the ASIO driver in {DUPLEX_LIVENESS_TIMEOUT_MS} \
+                                 ms since its stream started"
+                            );
+                        } else {
+                            nih_error!(
+                                "No callback from the ASIO driver for \
+                                 {DUPLEX_LIVENESS_TIMEOUT_MS} ms, restarting the stream"
+                            );
+                        }
                         stream_error.store(true, Ordering::Release);
                         break;
                     }
@@ -972,6 +982,7 @@ impl<P: Plugin> Backend<P> for CpalMidir {
                     }
                 });
 
+            let setup_failed = stream_not_started(first_run, setup_failed, never_called_back);
             let end = RunEnd {
                 callback_stopped: callback_stopped.load(Ordering::Acquire),
                 stop_requested: should_stop.load(Ordering::SeqCst),
@@ -1430,7 +1441,8 @@ struct RunEnd {
     callback_stopped: bool,
     stop_requested: bool,
     change_pending: bool,
-    /// The output stream was not built or did not start.
+    /// The output stream was not built or did not start, or in a launch's run the duplex driver
+    /// never called back (`stream_not_started`).
     setup_failed: bool,
     /// A stream's error callback fired, or the duplex driver fell silent.
     stream_error: bool,
@@ -1523,7 +1535,8 @@ fn walked_stand_in(
 
 /// Whether a stream that just opened is published as running before it calls back. A launch or
 /// a pick is taken as running; a restart keeps what the run before it ended with, so a driver
-/// that loads and then never calls back is not reported running on every recovery attempt.
+/// that loads and then never calls back after a pick is not reported running on every recovery
+/// attempt (at launch such a driver is followed up instead: the retry, the walk, the stand-in).
 fn running_after_open(start: Start, previous_running: bool) -> bool {
     start != Start::Restart || previous_running
 }
@@ -1675,7 +1688,9 @@ pub(crate) fn duplex_input_channels(wanted: u16, available: &[u16]) -> Option<u1
     covering.or_else(|| available.iter().copied().max())
 }
 
-/// No error callback ever fires on ASIO (cpal ignores it), so silence is the signal (A6).
+/// No error callback ever fires on ASIO (cpal ignores it), so silence is the signal (A6). In a
+/// launch's run silence before the first callback is a stream that did not start
+/// (`stream_not_started`); otherwise, and after any callback, a failed stream.
 const DUPLEX_LIVENESS_TIMEOUT_MS: u64 = 2000;
 
 /// How often a running stream reads its output's rate, where `rate_check_applies`.
