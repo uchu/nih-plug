@@ -2355,6 +2355,7 @@ impl CpalMidir {
                     publish_audio_devices_in_use(published_after_failed_open(
                         start, previous, in_use,
                     ));
+                    asio_driver::release(output);
                     return Err(err);
                 }
             }

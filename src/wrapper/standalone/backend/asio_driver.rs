@@ -190,13 +190,31 @@ const LISTED_NAME_BYTES: usize = 32;
 /// Names in a driver listing that do not load the driver they name. A load by name opens the first
 /// driver listed under it, so of several listed alike (names cut short to the same text, or
 /// registered alike) only the first loads. A name with U+FFFD came from bytes that are not UTF-8
-/// (the listing is in the system's ANSI code page), and a load by it matches no driver.
+/// (the listing is in the system's ANSI code page), and a load by it matches no driver. A blank
+/// name is not listed at all.
 fn listing_warnings(registered: &[String]) -> Vec<String> {
     let mut warnings = Vec::new();
+    match registered
+        .iter()
+        .filter(|name| name.trim().is_empty())
+        .count()
+    {
+        0 => {}
+        1 => warnings
+            .push("An ASIO driver is registered with a blank name: it is not listed".to_string()),
+        blank => warnings.push(format!(
+            "{blank} ASIO drivers are registered with blank names: none of them is listed"
+        )),
+    }
     for (index, name) in registered.iter().enumerate() {
+        if name.trim().is_empty() || registered.iter().take(index).any(|other| other == name) {
+            continue;
+        }
         let count = registered.iter().filter(|other| *other == name).count();
-        if count > 1 && !registered.iter().take(index).any(|other| other == name) {
-            let cut = name.len() == LISTED_NAME_BYTES - 1 && name.ends_with("...");
+        if count > 1 {
+            // Decoding grows each byte that is not UTF-8 into three, so a cut name can decode
+            // longer than it was listed.
+            let cut = name.len() >= LISTED_NAME_BYTES - 1 && name.ends_with("...");
             let how = if cut {
                 format!(
                     "listed as '{name}', their names cut to {} bytes",
@@ -485,6 +503,31 @@ mod tests {
             listing_warnings(&["Lyd\u{FFFD}kort".to_string(), "ASIO4ALL v2".to_string()]);
         assert_eq!(warnings.len(), 1);
         assert!(warnings[0].contains("'Lyd\u{FFFD}kort'"));
+    }
+
+    #[test]
+    fn undecodable_names_cut_alike_are_warned_as_cut_once() {
+        let cut = format!("Lydkort \u{FFFD} Studio Interface 2{}", "...");
+        assert!(cut.len() > LISTED_NAME_BYTES - 1);
+        let warnings = listing_warnings(&[cut.clone(), cut.clone()]);
+        assert_eq!(warnings.len(), 2);
+        assert!(warnings[0].contains("2 ASIO drivers"));
+        assert!(warnings[0].contains("28 bytes"));
+        assert!(warnings[1].contains("not valid UTF-8"));
+    }
+
+    #[test]
+    fn blank_names_are_warned_as_unlisted_not_as_duplicates() {
+        let warnings = listing_warnings(&[
+            String::new(),
+            "ASIO4ALL v2".to_string(),
+            " ".to_string(),
+            String::new(),
+        ]);
+        assert_eq!(warnings.len(), 1);
+        assert!(warnings[0].contains("blank"));
+        assert!(warnings[0].contains("3 ASIO drivers"));
+        assert!(!warnings[0].contains("''"));
     }
 
     #[test]
