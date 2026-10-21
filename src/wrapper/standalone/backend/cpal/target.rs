@@ -81,9 +81,10 @@ pub(super) fn refused_name(picked: &Option<String>) -> String {
         .unwrap_or_else(|| FIRST_AVAILABLE_REFUSED.to_string())
 }
 
-/// The refusals a failed change left that an open publishes again. A restart stays where that
-/// change left the stream, on either host, so it keeps them; a launch or a change that opens
-/// starts clean (A16, A18). A host's own device refusals are found afresh by every open.
+/// The refusals a failed change or a refused buffer size left that an open publishes again. A
+/// restart stays where that change left the stream, on either host, so it keeps them; a launch or
+/// a change that opens starts clean (A16, A18, E3). A host's own device refusals are found afresh
+/// by every open.
 pub(super) fn keep_refusals(
     start: Start,
     previous: &AudioDevicesInUse,
@@ -92,6 +93,7 @@ pub(super) fn keep_refusals(
     if start == Start::Restart {
         in_use.refused_driver = previous.refused_driver.clone();
         in_use.refused_asio = previous.refused_asio.clone();
+        in_use.refused_period = previous.refused_period;
     }
 }
 
@@ -297,11 +299,13 @@ mod tests {
             refused_driver: Some("asio".into()),
             refused_asio: Some("Focusrite USB ASIO".into()),
             refused_output: Some("Speakers".into()),
+            refused_period: Some(32),
             ..Default::default()
         };
         let mut restarted = AudioDevicesInUse::default();
         keep_refusals(Start::Restart, &previous, &mut restarted);
         assert_eq!(restarted.refused_driver.as_deref(), Some("asio"));
+        assert_eq!(restarted.refused_period, Some(32));
         assert_eq!(
             restarted.refused_asio.as_deref(),
             Some("Focusrite USB ASIO")

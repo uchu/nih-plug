@@ -75,8 +75,9 @@ pub struct AudioDevicesInUse {
     /// so a driver that loads and then never calls back is named, and not running, while it is
     /// down.
     pub running: bool,
-    /// A buffer size the ASIO driver listed and then refused to run; the previous size runs
-    /// instead. `None` once any size opens, and on other hosts.
+    /// A buffer size the ASIO driver listed and then refused to run: after a change of the size
+    /// alone the previous size runs instead, after the launch the driver's own. Restarts keep it;
+    /// `None` once a change opens, and on other hosts.
     pub refused_period: Option<u32>,
 }
 

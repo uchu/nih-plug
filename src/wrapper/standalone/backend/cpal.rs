@@ -17,6 +17,7 @@ use std::sync::Arc;
 use std::thread::ScopedJoinHandle;
 use std::time::{Duration, Instant};
 
+use self::setup_failure::{first_run_after_change, setup_failure_action, FirstRun, SetupFailure};
 use self::target::{
     duplex_refused_output, first_that_opens, host_id_for, keep_refusals, launch_duplex,
     reconfigure_start, refused_name, refused_pick, switch_plan, target_of, touches_asio, Requested,
@@ -37,6 +38,7 @@ use crate::prelude::{
 };
 use crate::wrapper::util::buffer_management::{BufferManager, ChannelPointers};
 
+mod setup_failure;
 mod target;
 
 const MIDI_EVENT_QUEUE_CAPACITY: usize = 2048;
@@ -48,6 +50,10 @@ const DEVICE_POLL_INTERVAL: Duration = Duration::from_secs(2);
 
 /// How long a probe waits for the first callback of the stream it started on a wanted device.
 const PROBE_FIRST_CALLBACK: Duration = Duration::from_secs(1);
+
+/// The host that stands in on the system default for a launch's ASIO driver that starts no
+/// stream, as `standalone.rs` stands it in for one that does not open.
+const STAND_IN_DRIVER: &str = "wasapi";
 
 /// Uses CPAL for audio and midir for MIDI.
 pub struct CpalMidir {
@@ -97,6 +103,10 @@ pub struct CpalMidir {
     /// The run ended as `DeviceReturned` after refusing `adopted`: that device passes its probe
     /// and is refused again, so the stream must not keep moving onto it.
     relapsed: Option<Wanted>,
+    /// What the next run is the first one after, and what the last run whose stream did not start
+    /// left `reinit()` to do (E3).
+    first_run: FirstRun,
+    setup_failure: SetupFailure,
 }
 
 /// All data needed for a CPAL input or output stream.
@@ -355,6 +365,8 @@ impl<P: Plugin> Backend<P> for CpalMidir {
         // A duplex driver never reports a dead stream, so the output callback stamps this and the
         // wait below watches it (A6).
         let liveness = Liveness::new();
+        let first_run = std::mem::replace(&mut self.first_run, FirstRun::Other);
+        self.setup_failure = SetupFailure::Fail;
         let Some(output) = self.output.as_ref() else {
             nih_error!("No audio output is open");
             let end = RunEnd {
@@ -871,8 +883,12 @@ impl<P: Plugin> Backend<P> for CpalMidir {
             if let (RunOutcome::Restart, Some(reason)) = (outcome, restart) {
                 nih_log!("Restarting the audio stream: {reason}");
             }
-            outcome
+            (outcome, setup_failed)
         });
+        let (outcome, setup_failed) = outcome;
+        if setup_failed {
+            self.setup_failure = setup_failure_action(first_run, self.period_request);
+        }
         self.failed_sides = failed_sides.load(Ordering::Acquire);
         self.relapsed = relapsed_device(
             outcome,
@@ -885,6 +901,10 @@ impl<P: Plugin> Backend<P> for CpalMidir {
     }
 
     fn reinit(&mut self) -> Result<()> {
+        let after = std::mem::replace(&mut self.setup_failure, SetupFailure::Fail);
+        if after == SetupFailure::StandIn {
+            return self.stand_in_shared();
+        }
         // On ASIO a real driver reset (asio.h kAsioResetRequest): every handle to the driver is
         // released, so it runs ASIODisposeBuffers and ASIOExit, and the resolution below loads the
         // same driver afresh, by name, with ASIOInit. A replugged interface or a new control-panel
@@ -893,7 +913,20 @@ impl<P: Plugin> Backend<P> for CpalMidir {
 
         // The session takes the reopened output's rate, which the wrapper follows (A17). For a
         // default-device selection this picks up whatever the *current* system default is.
-        let previous = self.in_use.lock().clone();
+        let mut previous = self.in_use.lock().clone();
+        if let Some(period) = after.reopen_period() {
+            let refused = previous.buffer_size;
+            let at = refused.map_or_else(String::new, |size| format!(" at {size} samples"));
+            let to = period.map_or_else(
+                || "its own size".to_string(),
+                |size| format!("{size} samples"),
+            );
+            nih_error!("The ASIO driver started no stream{at}, reopening it at {to}");
+            self.period_request = period;
+            previous.refused_period = refused;
+            self.in_use.lock().refused_period = refused;
+        }
+        self.first_run = after.first_run_after(self.first_run);
         let device_use = self.device_use();
         self.config.period_size = open_period(self.duplex, self.shared_period);
         let opened = Self::open_devices(
@@ -917,9 +950,12 @@ impl<P: Plugin> Backend<P> for CpalMidir {
     fn reconfigure(&mut self, change: AudioChange) -> Result<()> {
         let current = self.current_target();
         let next = target_of(&current, &change);
-        // A pick is a fresh choice: the watch starts over and nothing is held against a device.
+        // A pick is a fresh choice: the watch starts over and nothing is held against a device,
+        // and it replaces whatever a stream that did not start left to do.
         self.quarantined.clear();
         self.returned.get_mut().take();
+        self.setup_failure = SetupFailure::Fail;
+        self.first_run = FirstRun::Other;
         if next.driver != current.driver {
             return self.switch_host(&current, &next);
         }
@@ -932,17 +968,29 @@ impl<P: Plugin> Backend<P> for CpalMidir {
         config.input_device = next.input;
         config.period_size = open_period(self.duplex, self.shared_period);
         self.period_request = next.period;
+        let start = reconfigure_start(self.duplex, &change);
+        // A size that opens replaces one the driver refused before.
+        let unrefused = AudioDevicesInUse {
+            refused_period: None,
+            ..previous.clone()
+        };
         let opened = Self::open_devices(
             &self.host,
             &mut config,
             &self.audio_io_layout,
-            reconfigure_start(self.duplex, &change),
+            start,
             &[],
             self.device_use(),
-            &previous,
+            &unrefused,
         );
         match opened {
             Ok(opened) => {
+                self.first_run = first_run_after_change(
+                    self.duplex && start == Start::Restart,
+                    previous_period,
+                    previous.buffer_size,
+                    opened.in_use.buffer_size,
+                );
                 self.config = config;
                 self.hold(opened);
                 Ok(())
@@ -1673,6 +1721,12 @@ impl CpalMidir {
             adopted: None,
             adopted_refused: false,
             relapsed: None,
+            first_run: if duplex {
+                FirstRun::Launch { retried: false }
+            } else {
+                FirstRun::Other
+            },
+            setup_failure: SetupFailure::Fail,
         })
     }
 
@@ -1809,6 +1863,29 @@ impl CpalMidir {
             .is_some_and(single_device_duplex)
             .then(|| refused_name(&next.output));
         self.reopen_previous(previous, refused_asio, Some(next.driver.clone()))
+    }
+
+    /// The launch's ASIO driver started no stream, at the saved size or its own: the shared host
+    /// stands in on the system default as it does for a launch where no driver opens, published
+    /// the same way (`duplex: false`). A stand-in that opens nothing is tried again by the next
+    /// `reinit()`.
+    fn stand_in_shared(&mut self) -> Result<()> {
+        let driver = self.in_use.lock().opened.clone().unwrap_or_default();
+        nih_error!(
+            "The ASIO driver '{driver}' started no stream, WASAPI stands in on the system default"
+        );
+        self.release_driver();
+        let stand_in = Target {
+            driver: STAND_IN_DRIVER.to_string(),
+            output: None,
+            input: None,
+            period: None,
+        };
+        let opened = self.open_host(&stand_in);
+        if opened.is_err() {
+            self.setup_failure = SetupFailure::StandIn;
+        }
+        opened
     }
 
     /// Open `next` on its own host and move the backend onto it. Nothing about the backend
