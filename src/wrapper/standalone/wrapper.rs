@@ -1,6 +1,6 @@
 use atomic_refcell::AtomicRefCell;
 use baseview::{EventStatus, Window, WindowHandler, WindowOpenOptions};
-use crossbeam::channel::{self, RecvTimeoutError, Sender};
+use crossbeam::channel::{self, RecvTimeoutError, SendTimeoutError, Sender};
 use crossbeam::queue::ArrayQueue;
 use parking_lot::Mutex;
 use raw_window_handle::HasRawWindowHandle;
@@ -11,7 +11,7 @@ use std::sync::Arc;
 use std::thread;
 use std::time::{Duration, Instant};
 
-use super::backend::{wait_unless, Backend, RunOutcome, Wake};
+use super::backend::{wait_unless, Backend, GuiExecutor, RunOutcome, Wake};
 use super::change::{audio_change_pending, register_gui_runner, take_audio_change, GuiRunner};
 use super::config::WrapperConfig;
 use super::context::{WrapperGuiContext, WrapperInitContext, WrapperProcessContext};
@@ -392,6 +392,10 @@ impl<P: Plugin, B: Backend<P>> Wrapper<P, B> {
         // We'll spawn a separate thread to handle IO and to process audio. This audio thread should
         // terminate together with this function.
         let terminate_audio_thread = Arc::new(AtomicBool::new(false));
+        self.backend.borrow_mut().set_gui_executor(gui_executor(
+            gui_task_sender.clone(),
+            terminate_audio_thread.clone(),
+        ));
         let audio_thread = {
             let this = self.clone();
             let terminate_audio_thread = terminate_audio_thread.clone();
@@ -1101,6 +1105,30 @@ fn gui_runner(sender: Sender<GuiTask>) -> GuiRunner {
     Box::new(move |job| sender.try_send(GuiTask::Run(job)).is_ok())
 }
 
+/// The backend's way to the GUI thread (E1), made on the GUI thread. A full queue is waited out
+/// rather than refusing the job, the job is refused once the application quits, and a job posted
+/// from the GUI thread itself runs right there instead of waiting on the thread meant to run it.
+fn gui_executor(sender: Sender<GuiTask>, quitting: Arc<AtomicBool>) -> GuiExecutor {
+    let gui_thread = thread::current().id();
+    Arc::new(move |job| {
+        if thread::current().id() == gui_thread {
+            job();
+            return true;
+        }
+        let mut task = GuiTask::Run(job);
+        loop {
+            if quitting.load(Ordering::SeqCst) {
+                return false;
+            }
+            match sender.send_timeout(task, Duration::from_millis(50)) {
+                Ok(()) => return true,
+                Err(SendTimeoutError::Timeout(unsent)) => task = unsent,
+                Err(SendTimeoutError::Disconnected(_)) => return false,
+            }
+        }
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1122,5 +1150,47 @@ mod tests {
         assert!(matches!(tasks.try_recv(), Ok(GuiTask::Run(_))));
         drop(tasks);
         assert!(!run(Box::new(|| ())));
+    }
+
+    #[test]
+    fn the_gui_executor_runs_a_gui_thread_job_in_place_and_posts_every_other_one() {
+        let (sender, tasks) = channel::bounded(1);
+        let quitting = Arc::new(AtomicBool::new(false));
+        let exec = gui_executor(sender, quitting.clone());
+
+        let ran = Arc::new(AtomicBool::new(false));
+        let flag = ran.clone();
+        assert!(exec(Box::new(move || flag.store(true, Ordering::SeqCst))));
+        assert!(ran.load(Ordering::SeqCst));
+        assert!(tasks.is_empty());
+
+        let posted = {
+            let exec = exec.clone();
+            thread::spawn(move || (exec(Box::new(|| ())), exec(Box::new(|| ()))))
+        };
+        thread::sleep(Duration::from_millis(120));
+        assert!(
+            matches!(tasks.try_recv(), Ok(GuiTask::Run(_))),
+            "the first job is queued"
+        );
+        assert_eq!(
+            posted.join().ok(),
+            Some((true, true)),
+            "a full queue is waited out"
+        );
+        assert!(matches!(tasks.try_recv(), Ok(GuiTask::Run(_))));
+
+        quitting.store(true, Ordering::SeqCst);
+        let refused = {
+            let exec = exec.clone();
+            thread::spawn(move || exec(Box::new(|| ())))
+        };
+        assert_eq!(refused.join().ok(), Some(false));
+        assert!(tasks.is_empty());
+
+        quitting.store(false, Ordering::SeqCst);
+        drop(tasks);
+        let closed = thread::spawn(move || exec(Box::new(|| ())));
+        assert_eq!(closed.join().ok(), Some(false));
     }
 }

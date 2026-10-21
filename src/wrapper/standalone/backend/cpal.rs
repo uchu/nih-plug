@@ -26,11 +26,11 @@ use self::target::{
 use super::super::change::{self, audio_change_pending, AudioChange};
 use super::super::config::{WrapperConfig, DEFAULT_PERIOD_SIZE};
 use super::super::{publish_audio_devices_in_use, AudioDevicesInUse};
-use super::asio_driver;
+use super::asio_driver::{self, DriverStream, ResetListener};
 use super::buffer_sizes::{legal_sizes, snap, BufferFacts, DUPLEX_BLOCK};
 use super::coreaudio_rate::DeviceRate;
 use super::device_watch::{DeviceWatch, Kind, Wanted};
-use super::{sleep_unless, wait_unless, Backend, RunOutcome, Wake};
+use super::{run_on_gui_owning, sleep_unless, wait_unless, Backend, GuiExecutor, RunOutcome, Wake};
 use crate::midi::MidiResult;
 use crate::prelude::{
     AudioIOLayout, AuxiliaryBuffers, Buffer, MidiConfig, NoteEvent, Plugin, PluginNoteEvent,
@@ -106,6 +106,18 @@ pub struct CpalMidir {
     /// What the next run is the first one after, and what the last run whose stream did not start
     /// left `reinit()` to do (E3).
     recovery: SetupRecovery,
+    /// The way to the GUI thread, where a duplex driver's stream is built, started, polled,
+    /// stopped and dropped (E1).
+    gui: Option<GuiExecutor>,
+}
+
+/// Builds one direction's stream on the device it is given.
+type StreamBuilder =
+    Box<dyn FnOnce(&Device, &StreamConfig) -> Result<Stream, cpal::BuildStreamError> + Send>;
+
+fn unsupported_format(format: SampleFormat) -> StreamBuilder {
+    nih_error!("Unsupported sample format {format}");
+    Box::new(|_: &Device, _: &StreamConfig| Err(cpal::BuildStreamError::StreamConfigNotSupported))
 }
 
 /// All data needed for a CPAL input or output stream.
@@ -397,6 +409,8 @@ impl<P: Plugin> Backend<P> for CpalMidir {
         // `Option`.
         // The requested input the run refused when its capture would not start.
         let mut capture_refused: Option<Wanted> = None;
+        // A duplex driver's stream is driven from the GUI thread; a shared host's from here.
+        let gui = self.duplex.then(|| self.gui.clone()).flatten();
         let outcome = std::thread::scope(|s| {
             // This thread needs to be blocked until audio processing ends as CPAL processes the
             // streams on other threads. Created up front so the input stream's error callback can
@@ -406,7 +420,10 @@ impl<P: Plugin> Backend<P> for CpalMidir {
             let unparker = parker.unparker().clone();
             change::register_wake(unparker.clone());
 
-            let mut _input_stream: Option<Stream> = None;
+            let mut shared_input: Option<Stream> = None;
+            let mut driver_input: Option<DriverStream> = None;
+            // The GUI thread stopped taking jobs: the application quits.
+            let mut gui_gone = false;
             let mut input_rb_consumer: Option<rtrb::Consumer<f32>> = None;
             if let Some(input) = &self.input {
                 // Data is sent to the output data callback using a wait-free ring buffer, one
@@ -443,26 +460,26 @@ impl<P: Plugin> Backend<P> for CpalMidir {
                     }
                 };
 
-                macro_rules! build_input_streams {
+                macro_rules! input_stream_builder {
                     ($sample_format:expr, $(($format:path, $primitive_type:ty)),*) => {
                         match $sample_format {
-                            $($format => input.device.build_input_stream(
-                                &input.config,
-                                self.build_input_data_callback::<$primitive_type>(input_unparker, rb_producer),
-                                error_cb,
-                                None,
-                            ),)*
-                            format => {
-                                nih_error!("Unsupported sample format {format}");
-                                Err(cpal::BuildStreamError::StreamConfigNotSupported)
-                            }
+                            $($format => {
+                                let data_callback = self.build_input_data_callback::<$primitive_type>(
+                                    input_unparker,
+                                    rb_producer,
+                                );
+                                Box::new(move |device: &Device, config: &StreamConfig| {
+                                    device.build_input_stream(config, data_callback, error_cb, None)
+                                }) as StreamBuilder
+                            },)*
+                            format => unsupported_format(format),
                         }
                     }
                 }
                 // A capture stream that cannot be built or started must not take the output down
                 // with it: the run goes on without audio input and the output callback hands the
                 // plugin silence. A capture error mid-session still ends the run via `error_cb`.
-                let built = build_input_streams!(
+                let build = input_stream_builder!(
                     input.sample_format,
                     (SampleFormat::I8, i8),
                     (SampleFormat::I16, i16),
@@ -479,15 +496,26 @@ impl<P: Plugin> Backend<P> for CpalMidir {
                 // running driver and recreates its buffers, and a playing capture callback takes
                 // that lock on the driver thread every period. The capture is therefore played
                 // only once the output exists, right before the output itself.
-                let stream = if self.duplex {
-                    started_capture(
-                        built,
-                        |_: &Stream| Ok::<(), cpal::PlayStreamError>(()),
-                        || false,
-                    )
+                let started = if self.duplex {
+                    let built = run_on_gui_owning(
+                        gui.as_ref(),
+                        &should_stop,
+                        (input.device.clone(), input.config.clone(), build),
+                        |(device, config, build)| {
+                            started_capture(
+                                build(&device, &config),
+                                |_: &Stream| Ok::<(), cpal::PlayStreamError>(()),
+                                || false,
+                            )
+                            .map(DriverStream)
+                        },
+                    );
+                    gui_gone = built.is_err();
+                    driver_input = built.ok().flatten();
+                    driver_input.is_some()
                 } else {
-                    started_capture(
-                        built,
+                    shared_input = started_capture(
+                        build(&input.device, &input.config),
                         |stream: &Stream| stream.play(),
                         // Playback is delayed one period if we're capturing audio so it has
                         // something to process, and the timeout keeps a wedged capture device from
@@ -508,20 +536,21 @@ impl<P: Plugin> Backend<P> for CpalMidir {
                             }
                             stream_error.load(Ordering::Acquire) || silent()
                         },
-                    )
+                    );
+                    shared_input.is_some()
                 };
-                if stream.is_none() {
+                if !started {
                     // The capture stream is gone and can no longer raise the flag, so a start
                     // failure it reported must not end the run
                     stream_error.store(false, Ordering::Release);
                     failed_sides.fetch_and(!INPUT_FAILED, Ordering::AcqRel);
                     input_rb_consumer = None;
                 }
-                _input_stream = stream;
             }
 
             // The requested input opened its configuration but not a stream: refused, watched.
-            if self.input.is_some() && _input_stream.is_none() {
+            if self.input.is_some() && shared_input.is_none() && driver_input.is_none() && !gui_gone
+            {
                 let refused = self.in_use.lock().input.take();
                 if let Some(name) = refused {
                     self.in_use.lock().refused_input = Some(name.clone());
@@ -668,7 +697,7 @@ impl<P: Plugin> Backend<P> for CpalMidir {
                 });
 
             let reset_requested = Arc::new(AtomicBool::new(false));
-            let _reset_listener = self.duplex.then(|| {
+            let mut reset_listener = self.duplex.then(|| {
                 asio_driver::listen_for_reset(
                     &output.device,
                     reset_requested.clone(),
@@ -705,12 +734,11 @@ impl<P: Plugin> Backend<P> for CpalMidir {
                 }
             };
 
-            macro_rules! build_output_streams {
+            macro_rules! output_stream_builder {
                 ($sample_format:expr, $(($format:path, $primitive_type:ty)),*) => {
                     match $sample_format {
-                        $($format => output.device.build_output_stream(
-                            &output.config,
-                            self.build_output_data_callback::<P, $primitive_type>(
+                        $($format => {
+                            let data_callback = self.build_output_data_callback::<P, $primitive_type>(
                                 unparker,
                                 input_rb_consumer,
                                 midi_input_rb_consumer,
@@ -719,14 +747,12 @@ impl<P: Plugin> Backend<P> for CpalMidir {
                                 midi_output_rb_producer.clone(),
                                 cb,
                                 liveness.clone(),
-                            ),
-                            error_cb,
-                            None,
-                        ),)*
-                        format => {
-                            nih_error!("Unsupported sample format {format}");
-                            Err(cpal::BuildStreamError::StreamConfigNotSupported)
-                        }
+                            );
+                            Box::new(move |device: &Device, config: &StreamConfig| {
+                                device.build_output_stream(config, data_callback, error_cb, None)
+                            }) as StreamBuilder
+                        },)*
+                        format => unsupported_format(format),
                     }
                 }
             }
@@ -735,7 +761,9 @@ impl<P: Plugin> Backend<P> for CpalMidir {
             // would also deadlock the scoped MIDI output thread, which blocks on its channel until
             // it receives a `Terminate` task).
             let mut setup_failed = false;
-            let output_stream = match build_output_streams!(
+            let mut shared_output: Option<Stream> = None;
+            let mut driver_output: Option<DriverStream> = None;
+            let build = output_stream_builder!(
                 output.sample_format,
                 (SampleFormat::I8, i8),
                 (SampleFormat::I16, i16),
@@ -747,33 +775,57 @@ impl<P: Plugin> Backend<P> for CpalMidir {
                 (SampleFormat::U64, u64),
                 (SampleFormat::F32, f32),
                 (SampleFormat::F64, f64)
-            ) {
-                Ok(stream) => {
-                    if self.duplex {
-                        if let Some(Err(err)) = _input_stream.as_ref().map(Stream::play) {
-                            nih_error!("Could not start the capture stream: {err:#}");
+            );
+            if self.duplex {
+                if !gui_gone {
+                    let started = run_on_gui_owning(
+                        gui.as_ref(),
+                        &should_stop,
+                        (
+                            output.device.clone(),
+                            output.config.clone(),
+                            build,
+                            driver_input.take(),
+                        ),
+                        |(device, config, build, input)| {
+                            start_driver_streams(&device, &config, build, input)
+                        },
+                    );
+                    match started {
+                        Ok((started_input, started_output, failed)) => {
+                            driver_input = started_input;
+                            driver_output = started_output;
+                            setup_failed = failed;
+                        }
+                        Err(held) => {
+                            gui_gone = true;
+                            driver_input = held.and_then(|(_, _, _, input)| input);
                         }
                     }
-                    // TODO: Wait a period before doing this when also reading the input
-                    if let Err(err) = stream.play() {
-                        nih_error!("Error trying to start the output stream: {err:#}");
+                }
+            } else {
+                match build(&output.device, &output.config) {
+                    Ok(stream) => {
+                        // TODO: Wait a period before doing this when also reading the input
+                        if let Err(err) = stream.play() {
+                            nih_error!("Error trying to start the output stream: {err:#}");
+                            setup_failed = true;
+                        }
+                        shared_output = Some(stream);
+                    }
+                    Err(err) => {
+                        nih_error!("Error creating the output stream: {err:#}");
                         setup_failed = true;
                     }
-                    Some(stream)
                 }
-                Err(err) => {
-                    nih_error!("Error creating the output stream: {err:#}");
-                    setup_failed = true;
-                    None
-                }
-            };
+            }
 
             // Why the device needs a fresh stream, when it does: not a failure.
             let mut restart: Option<String> = None;
             // Wait for the audio thread to exit. The timeout also lets this thread notice a stop
             // request when the device is already dead and no further callbacks or stream errors
             // will arrive (previously that combination made the application hang on exit).
-            if !setup_failed {
+            if !setup_failed && !gui_gone {
                 // The first callback gets the whole timeout
                 liveness.stamp();
                 let check_rate = rate_check_applies(self.duplex, self.host_id);
@@ -812,8 +864,10 @@ impl<P: Plugin> Backend<P> for CpalMidir {
                     // Setup) may keep calling back; the restart adopts the new rate (A17).
                     if check_rate && rate_checked.elapsed() >= RATE_CHECK_INTERVAL {
                         rate_checked = Instant::now();
-                        if let Some(rate) = output_rate_now(self.duplex, output)
-                            .filter(|&rate| rate_moved(self.duplex, rate, self.config.sample_rate))
+                        if let Some(rate) =
+                            output_rate_now(self.duplex, output, gui.as_ref(), &should_stop).filter(
+                                |&rate| rate_moved(self.duplex, rate, self.config.sample_rate),
+                            )
                         {
                             let device = if self.duplex {
                                 "the ASIO driver"
@@ -826,12 +880,22 @@ impl<P: Plugin> Backend<P> for CpalMidir {
                     }
                 }
             }
-            // Stopped before the callback goes, so the last period the driver plays is one the
-            // callback rendered.
             if self.duplex {
-                asio_driver::stop(&output.device);
+                let held = (
+                    output.device.clone(),
+                    driver_output.take(),
+                    reset_listener.take(),
+                    driver_input.take(),
+                );
+                // A quitting application's GUI thread no longer takes jobs and waits for this
+                // thread to end; the driver is stopped here then, before its handle is released.
+                if let Err(Some(held)) =
+                    run_on_gui_owning(gui.as_ref(), &should_stop, held, end_driver_run)
+                {
+                    end_driver_run(held);
+                }
             }
-            drop(output_stream);
+            drop(shared_output);
             watch_stop.store(true, Ordering::Release);
             let overflows = self.overflows.swap(0, Ordering::Relaxed);
             let underruns = self.underruns.swap(0, Ordering::Relaxed);
@@ -1038,6 +1102,10 @@ impl<P: Plugin> Backend<P> for CpalMidir {
 
     fn reinit_on_gui_thread(&self) -> bool {
         self.duplex
+    }
+
+    fn set_gui_executor(&mut self, exec: GuiExecutor) {
+        self.gui = Some(exec);
     }
 
     fn quarantine_requested(&mut self) -> bool {
@@ -1361,14 +1429,71 @@ fn published_after_failed_open(
     }
 }
 
-/// The output's rate right now: the ASIO driver's, or the nominal rate of the device a shared
-/// output resolved to. `None` when there is nothing to read or the device does not answer.
-fn output_rate_now(duplex: bool, output: &CpalDevice) -> Option<f64> {
-    if duplex {
-        watched_duplex_rate(asio_driver::driver_rate(&output.device))
-    } else {
-        output.rate_source.and_then(DeviceRate::read)
+/// The output's rate right now: the ASIO driver's, read on the GUI thread (E1) and not at all while
+/// a modal control panel may hold that thread, or the nominal rate of the device a shared output
+/// resolved to. `None` when there is nothing to read or the device does not answer.
+fn output_rate_now(
+    duplex: bool,
+    output: &CpalDevice,
+    gui: Option<&GuiExecutor>,
+    should_stop: &AtomicBool,
+) -> Option<f64> {
+    if !duplex {
+        return output.rate_source.and_then(DeviceRate::read);
     }
+    if change::panel_pending() {
+        return None;
+    }
+    run_on_gui_owning(gui, should_stop, output.device.clone(), |device| {
+        asio_driver::driver_rate(&device)
+    })
+    .ok()
+    .and_then(watched_duplex_rate)
+}
+
+/// Build a duplex driver's output stream, then start the capture built before it and the output,
+/// on the GUI thread (E1). The streams come back with whether the setup failed.
+fn start_driver_streams(
+    device: &Device,
+    config: &StreamConfig,
+    build: StreamBuilder,
+    input: Option<DriverStream>,
+) -> (Option<DriverStream>, Option<DriverStream>, bool) {
+    let stream = match build(device, config) {
+        Ok(stream) => stream,
+        Err(err) => {
+            nih_error!("Error creating the output stream: {err:#}");
+            return (input, None, true);
+        }
+    };
+    if let Some(Err(err)) = input.as_ref().map(|input| input.0.play()) {
+        nih_error!("Could not start the capture stream: {err:#}");
+    }
+    let failed = match stream.play() {
+        Ok(()) => false,
+        Err(err) => {
+            nih_error!("Error trying to start the output stream: {err:#}");
+            true
+        }
+    };
+    (input, Some(DriverStream(stream)), failed)
+}
+
+/// What a duplex run ends: the driver, its streams and its reset listener.
+type DriverRun = (
+    Device,
+    Option<DriverStream>,
+    Option<ResetListener>,
+    Option<DriverStream>,
+);
+
+/// End a duplex run, on the GUI thread (E1). The driver stops before the callback goes, so the
+/// last period it plays is one the callback rendered.
+fn end_driver_run((device, output, reset_listener, input): DriverRun) {
+    asio_driver::stop(&device);
+    drop(output);
+    drop(reset_listener);
+    drop(input);
 }
 
 /// A driver read the rate watch acts on: one a reopen could run at. A driver that lost lock and
@@ -1730,6 +1855,7 @@ impl CpalMidir {
             adopted_refused: false,
             relapsed: None,
             recovery: SetupRecovery::at_launch(duplex),
+            gui: None,
         })
     }
 

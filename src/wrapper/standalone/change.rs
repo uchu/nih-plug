@@ -139,6 +139,12 @@ pub fn open_asio_control_panel() -> bool {
     }))
 }
 
+/// Whether a control panel job is queued on the GUI thread or holds it there: a modal panel
+/// blocks that thread until it closes.
+pub(crate) fn panel_pending() -> bool {
+    PANEL_PENDING.load(Ordering::Acquire)
+}
+
 /// Lowers [`PANEL_PENDING`] when the panel job is done with: run, refused or dropped unrun.
 struct PanelPending;
 

@@ -2,7 +2,7 @@
 //! of a run (spec A6), and reloading it by name (A7). Off ASIO every function here is inert.
 
 use super::buffer_sizes::BufferFacts;
-use cpal::Device;
+use cpal::{Device, Stream};
 use crossbeam::sync::Unparker;
 use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
@@ -18,6 +18,20 @@ pub(crate) fn set_driver_open(open: bool) {
 pub(crate) fn driver_open() -> bool {
     DRIVER_OPEN.load(std::sync::atomic::Ordering::Acquire)
 }
+
+/// A duplex driver's stream, which a run hands to the GUI thread to start, stop and drop (E1).
+pub(crate) struct DriverStream(pub(crate) Stream);
+
+// SAFETY: cpal marks every `Stream` as not `Send` for Android's AAudio. Only a duplex (ASIO) run
+// makes a `DriverStream`, and cpal's ASIO stream is a play flag, the driver and its buffers behind
+// `Arc`s and a callback id, all `Send`, which the assertion below checks where ASIO builds.
+unsafe impl Send for DriverStream {}
+
+#[cfg(all(target_os = "windows", feature = "asio"))]
+fn assert_send<T: Send>() {}
+
+#[cfg(all(target_os = "windows", feature = "asio"))]
+const _: fn() = assert_send::<cpal::platform::AsioStream>;
 
 /// Stops listening for the driver's reset requests when dropped.
 pub(crate) struct ResetListener(Option<Box<dyn FnOnce() + Send>>);

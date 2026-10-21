@@ -1,3 +1,5 @@
+use crossbeam::channel::{self, RecvTimeoutError};
+use parking_lot::Mutex;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -73,6 +75,60 @@ pub(crate) fn wait_unless(should_stop: &AtomicBool, max: Duration) -> Wake {
             return Wake::Elapsed;
         }
         std::thread::sleep(Duration::from_millis(50));
+    }
+}
+
+/// Posts a job to the GUI thread, which loads and releases an ASIO driver and so makes every
+/// other call to it (A7, E1). `false` when the job was not taken: the application is quitting.
+pub type GuiExecutor = Arc<dyn Fn(Box<dyn FnOnce() + Send>) -> bool + Send + Sync>;
+
+/// Run `job` on the GUI thread through `exec` and wait for its value, or right here without one.
+/// `None` when the application quits first: the executor refused the job or `should_stop` was
+/// raised while waiting.
+pub(crate) fn run_on_gui<T: Send + 'static>(
+    exec: Option<&GuiExecutor>,
+    should_stop: &AtomicBool,
+    job: impl FnOnce() -> T + Send + 'static,
+) -> Option<T> {
+    let Some(exec) = exec else {
+        return Some(job());
+    };
+    if should_stop.load(Ordering::SeqCst) {
+        return None;
+    }
+    let (reply_sender, reply) = channel::bounded(1);
+    if !exec(Box::new(move || {
+        let _ = reply_sender.send(job());
+    })) {
+        return None;
+    }
+    loop {
+        match reply.recv_timeout(Duration::from_millis(50)) {
+            Ok(value) => return Some(value),
+            Err(RecvTimeoutError::Timeout) if !should_stop.load(Ordering::SeqCst) => {}
+            Err(_) => return None,
+        }
+    }
+}
+
+/// [`run_on_gui()`] for a job that consumes `input`: when the application quits before the job
+/// runs, `input` comes back instead of staying with a job the GUI thread never runs, so whatever
+/// it holds (a driver handle, a stream) is let go of here.
+pub(crate) fn run_on_gui_owning<I: Send + 'static, T: Send + 'static>(
+    exec: Option<&GuiExecutor>,
+    should_stop: &AtomicBool,
+    input: I,
+    job: impl FnOnce(I) -> T + Send + 'static,
+) -> Result<T, Option<I>> {
+    let slot = Arc::new(Mutex::new(Some(input)));
+    let job_slot = slot.clone();
+    let ran = run_on_gui(exec, should_stop, move || {
+        let input = job_slot.lock().take();
+        input.map(job)
+    });
+    match ran {
+        Some(Some(value)) => Ok(value),
+        _ => Err(slot.lock().take()),
     }
 }
 
@@ -156,10 +212,20 @@ pub trait Backend<P: Plugin>: 'static + Send + Sync {
     /// object (ASIO), so it must run on the thread that loaded it at launch: the GUI thread, which
     /// pumps the messages such a driver relies on. The audio thread never pumps any.
     ///
+    /// Every driver call outside the driver's own callbacks runs on the GUI thread: `run()` builds,
+    /// starts, polls, stops and drops such a driver's stream through the [`GuiExecutor`] given to
+    /// [`set_gui_executor()`][Self::set_gui_executor()], and waits for each job.
+    ///
     /// While such a stream is down, nothing on the GUI thread may block on the audio thread:
     /// `GuiContext::set_state()` waits for an audio callback, which would then never come.
     fn reinit_on_gui_thread(&self) -> bool {
         false
+    }
+
+    /// The way to the GUI thread, given once before the first [`run()`][Self::run()]. Without
+    /// one, everything runs on the calling thread.
+    fn set_gui_executor(&mut self, exec: GuiExecutor) {
+        let _ = exec;
     }
 
     /// The (sample rate, plugin block) the stream that is open runs with, which the wrapper
@@ -174,6 +240,128 @@ pub trait Backend<P: Plugin>: 'static + Send + Sync {
 mod tests {
     use super::*;
     use crate::wrapper::standalone::change::{request_audio_change, take_audio_change};
+    use std::thread;
+
+    /// An executor that runs every job it takes on one spawned thread, in order.
+    fn forwarding_executor() -> GuiExecutor {
+        let (jobs, received) = channel::unbounded::<Box<dyn FnOnce() + Send>>();
+        thread::spawn(move || {
+            while let Ok(job) = received.recv() {
+                job();
+            }
+        });
+        Arc::new(move |job| jobs.send(job).is_ok())
+    }
+
+    #[test]
+    fn run_on_gui_runs_the_job_on_the_executor_thread_and_returns_its_value() {
+        let exec = forwarding_executor();
+        let stop = AtomicBool::new(false);
+        let caller = thread::current().id();
+        let ran_on = run_on_gui(Some(&exec), &stop, || thread::current().id());
+        assert!(ran_on.is_some_and(|id| id != caller));
+        assert_eq!(run_on_gui(Some(&exec), &stop, || 42), Some(42));
+    }
+
+    #[test]
+    fn run_on_gui_without_an_executor_runs_inline() {
+        let stop = AtomicBool::new(false);
+        let caller = thread::current().id();
+        assert_eq!(
+            run_on_gui(None, &stop, || thread::current().id()),
+            Some(caller)
+        );
+    }
+
+    #[test]
+    fn run_on_gui_returns_none_when_the_executor_refuses() {
+        let exec: GuiExecutor = Arc::new(|_| false);
+        let stop = AtomicBool::new(false);
+        assert_eq!(run_on_gui(Some(&exec), &stop, || 1), None);
+    }
+
+    #[test]
+    fn a_stop_ends_the_wait_for_a_job_the_gui_never_runs() {
+        let parked = Arc::new(Mutex::new(Vec::new()));
+        let exec: GuiExecutor = {
+            let parked = parked.clone();
+            Arc::new(move |job| {
+                parked.lock().push(job);
+                true
+            })
+        };
+        let stop = Arc::new(AtomicBool::new(false));
+        {
+            let stop = stop.clone();
+            thread::spawn(move || {
+                thread::sleep(Duration::from_millis(120));
+                stop.store(true, Ordering::SeqCst);
+            });
+        }
+        let started = Instant::now();
+        assert_eq!(run_on_gui(Some(&exec), &stop, || 1), None);
+        assert!(started.elapsed() < Duration::from_secs(1));
+        assert_eq!(parked.lock().len(), 1);
+        assert_eq!(run_on_gui(Some(&exec), &stop, || 1), None);
+        assert_eq!(
+            parked.lock().len(),
+            1,
+            "nothing is posted once the application quits"
+        );
+    }
+
+    #[test]
+    fn an_owning_job_consumes_its_input_on_the_executor_thread() {
+        let exec = forwarding_executor();
+        let stop = AtomicBool::new(false);
+        let caller = thread::current().id();
+        let ran = run_on_gui_owning(Some(&exec), &stop, vec![1, 2], |input| {
+            (input.len(), thread::current().id())
+        });
+        assert!(matches!(ran, Ok((2, id)) if id != caller));
+    }
+
+    #[test]
+    fn an_owning_job_that_never_runs_hands_its_input_back() {
+        let refused: GuiExecutor = Arc::new(|_| false);
+        let stop = AtomicBool::new(false);
+        let held = Arc::new(());
+        let back = run_on_gui_owning(Some(&refused), &stop, held.clone(), |_| ());
+        assert!(matches!(back, Err(Some(_))));
+        drop(back);
+        assert_eq!(Arc::strong_count(&held), 1);
+
+        let parked = Arc::new(Mutex::new(Vec::new()));
+        let queued: GuiExecutor = {
+            let parked = parked.clone();
+            Arc::new(move |job| {
+                parked.lock().push(job);
+                true
+            })
+        };
+        let stop = AtomicBool::new(true);
+        assert!(matches!(
+            run_on_gui_owning(Some(&queued), &stop, held.clone(), |_| ()),
+            Err(Some(_))
+        ));
+        let stop = Arc::new(AtomicBool::new(false));
+        {
+            let stop = stop.clone();
+            thread::spawn(move || {
+                thread::sleep(Duration::from_millis(120));
+                stop.store(true, Ordering::SeqCst);
+            });
+        }
+        let back = run_on_gui_owning(Some(&queued), &stop, held.clone(), |_| ());
+        assert!(matches!(back, Err(Some(_))));
+        drop(back);
+        assert_eq!(parked.lock().len(), 1);
+        assert_eq!(
+            Arc::strong_count(&held),
+            1,
+            "the job left queued holds nothing of the input"
+        );
+    }
 
     #[test]
     fn a_pending_change_cuts_every_recovery_wait_short() {
