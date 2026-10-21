@@ -56,13 +56,6 @@ pub(crate) fn touches_asio(current: &str, target: &str) -> bool {
     current == "asio" || target == "asio"
 }
 
-/// Whether the host's default output stands in for a requested one that does not open. Never on a
-/// duplex start that is not the launch: a restart reloads only the driver that was open, and a
-/// picked driver that does not open brings the previous one back (A7, A16).
-pub(super) fn stands_in_default(start: Start, duplex: bool) -> bool {
-    !duplex || start == Start::Launch
-}
-
 /// How a reconfigure opens. A duplex change that picks no driver (a buffer size) reloads the
 /// driver the stream runs on, as a restart does, so only a pick moves the stream (A7); every other
 /// change opens as a launch does.
@@ -151,6 +144,42 @@ pub(super) fn first_that_opens<T>(
     anyhow::bail!("No ASIO driver opens")
 }
 
+/// What a duplex launch did with the driver it was asked for.
+#[derive(Debug)]
+pub(super) enum Requested {
+    /// "First available": none was asked for.
+    None,
+    Opened,
+    /// Not among the registered drivers, so never loaded.
+    Absent,
+    /// Registered, but it did not load or did not open.
+    Refused(anyhow::Error),
+}
+
+/// A duplex launch (A2, E4): the requested driver when it is listed and opens; otherwise, and for
+/// "First available", the listed drivers in order until one opens, a refused request not loaded
+/// a second time. `open` loads one driver by name and releases it again when it does not open.
+pub(super) fn launch_duplex<T>(
+    requested: Option<&str>,
+    names: &[String],
+    mut open: impl FnMut(&str) -> Result<T>,
+) -> (Requested, Result<(String, T)>) {
+    let outcome = match requested {
+        None => Requested::None,
+        Some(name) if !names.iter().any(|listed| listed == name) => Requested::Absent,
+        Some(name) => match open(name) {
+            Ok(opened) => return (Requested::Opened, Ok((name.to_string(), opened))),
+            Err(err) => Requested::Refused(err),
+        },
+    };
+    let others: Vec<String> = names
+        .iter()
+        .filter(|listed| Some(listed.as_str()) != requested)
+        .cloned()
+        .collect();
+    (outcome, first_that_opens(&others, open))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -219,16 +248,6 @@ mod tests {
         assert!(touches_asio("wasapi", "asio"));
         assert!(!touches_asio("wasapi", "wasapi"));
         assert!(!touches_asio("core-audio", "core-audio"));
-    }
-
-    #[test]
-    fn a_duplex_reconfigure_never_stands_a_default_in() {
-        assert!(!stands_in_default(Start::Reconfigure, true));
-        assert!(!stands_in_default(Start::Restart, true));
-        assert!(stands_in_default(Start::Launch, true));
-        for start in [Start::Launch, Start::Restart, Start::Reconfigure] {
-            assert!(stands_in_default(start, false));
-        }
     }
 
     #[test]
@@ -344,5 +363,87 @@ mod tests {
         assert_eq!(tried, ["A", "B"]);
         assert!(first_that_opens(&names, |_| Err::<(), _>(anyhow::anyhow!("no"))).is_err());
         assert!(first_that_opens(&[], |_| Ok(())).is_err());
+    }
+
+    fn names(names: &[&str]) -> Vec<String> {
+        names.iter().map(|name| name.to_string()).collect()
+    }
+
+    fn opens_only<'a>(
+        opens: &'static str,
+        tried: &'a mut Vec<String>,
+    ) -> impl FnMut(&str) -> Result<String> + 'a {
+        move |name| {
+            tried.push(name.to_string());
+            if name == opens {
+                Ok(name.to_lowercase())
+            } else {
+                Err(anyhow::anyhow!("'{name}' does not open"))
+            }
+        }
+    }
+
+    #[test]
+    fn a_launch_first_available_opens_the_first_driver_that_opens() {
+        let mut tried = Vec::new();
+        let (requested, opened) =
+            launch_duplex(None, &names(&["A", "B", "C"]), opens_only("B", &mut tried));
+        assert!(matches!(requested, Requested::None));
+        assert_eq!(opened.unwrap(), ("B".to_string(), "b".to_string()));
+        assert_eq!(tried, ["A", "B"]);
+    }
+
+    #[test]
+    fn a_saved_driver_that_opens_at_launch_tries_no_other() {
+        let mut tried = Vec::new();
+        let (requested, opened) =
+            launch_duplex(Some("B"), &names(&["A", "B"]), opens_only("B", &mut tried));
+        assert!(matches!(requested, Requested::Opened));
+        assert_eq!(opened.unwrap().0, "B");
+        assert_eq!(tried, ["B"]);
+    }
+
+    #[test]
+    fn a_saved_driver_refused_at_launch_stands_in_the_first_other_that_opens() {
+        let mut tried = Vec::new();
+        let (requested, opened) = launch_duplex(
+            Some("B"),
+            &names(&["A", "B", "C"]),
+            opens_only("C", &mut tried),
+        );
+        let Requested::Refused(err) = requested else {
+            panic!("the saved driver is refused, not {requested:?}");
+        };
+        assert!(format!("{err:#}").contains("'B' does not open"));
+        assert_eq!(opened.unwrap().0, "C");
+        assert_eq!(tried, ["B", "A", "C"], "the refused driver loads once");
+    }
+
+    #[test]
+    fn an_unlisted_saved_driver_at_launch_is_never_loaded() {
+        let mut tried = Vec::new();
+        let (requested, opened) = launch_duplex(
+            Some("Gone"),
+            &names(&["A", "B"]),
+            opens_only("A", &mut tried),
+        );
+        assert!(matches!(requested, Requested::Absent));
+        assert_eq!(opened.unwrap().0, "A");
+        assert_eq!(tried, ["A"]);
+    }
+
+    #[test]
+    fn a_launch_where_no_driver_opens_fails() {
+        let mut tried = Vec::new();
+        let (requested, opened) = launch_duplex(
+            Some("A"),
+            &names(&["A", "B"]),
+            opens_only("none", &mut tried),
+        );
+        assert!(matches!(requested, Requested::Refused(_)));
+        assert!(opened.is_err());
+        assert_eq!(tried, ["A", "B"]);
+        let (_, opened) = launch_duplex(None, &[], opens_only("A", &mut tried));
+        assert!(opened.is_err());
     }
 }

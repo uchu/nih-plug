@@ -129,17 +129,56 @@ pub(crate) fn stop(device: &Device) {
 #[cfg(not(all(target_os = "windows", feature = "asio")))]
 pub(crate) fn stop(_device: &Device) {}
 
+/// The SDK holds one driver per process; this instance tracks the one `load` loaded.
+#[cfg(all(target_os = "windows", feature = "asio"))]
+fn asio() -> &'static asio_sys::Asio {
+    static ASIO: std::sync::OnceLock<asio_sys::Asio> = std::sync::OnceLock::new();
+    ASIO.get_or_init(asio_sys::Asio::new)
+}
+
+/// The registered drivers, by name, as the registry lists them: nothing is loaded. The cpal
+/// host's device listing loads and releases every driver instead, including one another
+/// application streams on and one whose hardware is absent.
+pub(crate) fn names() -> Vec<String> {
+    super::cpal::dedupe_names(registered())
+}
+
+#[cfg(all(target_os = "windows", feature = "asio"))]
+fn registered() -> Vec<String> {
+    asio().driver_names()
+}
+
+#[cfg(not(all(target_os = "windows", feature = "asio")))]
+fn registered() -> Vec<String> {
+    Vec::new()
+}
+
+/// The sample type the loaded driver reports for its outputs, as asio-sys names it.
+#[cfg(all(target_os = "windows", feature = "asio"))]
+pub(crate) fn output_type(device: &Device) -> Option<String> {
+    match device.as_inner() {
+        cpal::platform::DeviceInner::Asio(asio) => match asio.driver.output_data_type() {
+            Ok(ty) => Some(format!("{ty:?}")),
+            Err(err) => Some(format!("unreadable: {err}")),
+        },
+        _ => None,
+    }
+}
+
+#[cfg(not(all(target_os = "windows", feature = "asio")))]
+pub(crate) fn output_type(_device: &Device) -> Option<String> {
+    None
+}
+
 /// The driver `name`, loaded by name. Enumerating through the cpal host instead loads and
 /// releases every driver registered ahead of it, and all of them while it does not load. Called
 /// only with every handle to the previous driver released, so no driver is loaded.
 #[cfg(all(target_os = "windows", feature = "asio"))]
 pub(crate) fn load(name: &str) -> Option<Device> {
     use std::sync::atomic::AtomicI32;
-    use std::sync::{Mutex, OnceLock};
+    use std::sync::Mutex;
 
-    // The SDK holds one driver per process; this instance tracks the one it loaded.
-    static ASIO: OnceLock<asio_sys::Asio> = OnceLock::new();
-    let driver = match ASIO.get_or_init(asio_sys::Asio::new).load_driver(name) {
+    let driver = match asio().load_driver(name) {
         Ok(driver) => driver,
         Err(err) => {
             nih_log!("The ASIO driver '{name}' does not load: {err}");
