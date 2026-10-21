@@ -17,7 +17,7 @@ use std::sync::Arc;
 use std::thread::ScopedJoinHandle;
 use std::time::{Duration, Instant};
 
-use self::setup_failure::{first_run_after_change, setup_failure_action, FirstRun, SetupFailure};
+use self::setup_failure::{first_run_after_change, still_refused, SetupFailure, SetupRecovery};
 use self::target::{
     duplex_refused_output, first_that_opens, host_id_for, keep_refusals, launch_duplex,
     reconfigure_start, refused_name, refused_pick, switch_plan, target_of, touches_asio, Requested,
@@ -105,8 +105,7 @@ pub struct CpalMidir {
     relapsed: Option<Wanted>,
     /// What the next run is the first one after, and what the last run whose stream did not start
     /// left `reinit()` to do (E3).
-    first_run: FirstRun,
-    setup_failure: SetupFailure,
+    recovery: SetupRecovery,
 }
 
 /// All data needed for a CPAL input or output stream.
@@ -365,8 +364,7 @@ impl<P: Plugin> Backend<P> for CpalMidir {
         // A duplex driver never reports a dead stream, so the output callback stamps this and the
         // wait below watches it (A6).
         let liveness = Liveness::new();
-        let first_run = std::mem::replace(&mut self.first_run, FirstRun::Other);
-        self.setup_failure = SetupFailure::Fail;
+        let first_run = self.recovery.on_run_start();
         let Some(output) = self.output.as_ref() else {
             nih_error!("No audio output is open");
             let end = RunEnd {
@@ -887,7 +885,7 @@ impl<P: Plugin> Backend<P> for CpalMidir {
         });
         let (outcome, setup_failed) = outcome;
         if setup_failed {
-            self.setup_failure = setup_failure_action(first_run, self.period_request);
+            self.recovery.on_setup_failed(first_run);
         }
         self.failed_sides = failed_sides.load(Ordering::Acquire);
         self.relapsed = relapsed_device(
@@ -901,7 +899,8 @@ impl<P: Plugin> Backend<P> for CpalMidir {
     }
 
     fn reinit(&mut self) -> Result<()> {
-        let after = std::mem::replace(&mut self.setup_failure, SetupFailure::Fail);
+        let requested = self.period_request;
+        let after = self.recovery.on_reinit();
         if after == SetupFailure::StandIn {
             return self.stand_in_shared();
         }
@@ -914,19 +913,19 @@ impl<P: Plugin> Backend<P> for CpalMidir {
         // The session takes the reopened output's rate, which the wrapper follows (A17). For a
         // default-device selection this picks up whatever the *current* system default is.
         let mut previous = self.in_use.lock().clone();
-        if let Some(period) = after.reopen_period() {
-            let refused = previous.buffer_size;
-            let at = refused.map_or_else(String::new, |size| format!(" at {size} samples"));
-            let to = period.map_or_else(
+        if let Some(reopen) = after.reopen(requested, previous.buffer_size) {
+            let at = previous
+                .buffer_size
+                .map_or_else(String::new, |size| format!(" at {size} samples"));
+            let to = reopen.period.map_or_else(
                 || "its own size".to_string(),
                 |size| format!("{size} samples"),
             );
-            nih_error!("The ASIO driver started no stream{at}, reopening it at {to}");
-            self.period_request = period;
-            previous.refused_period = refused;
-            self.in_use.lock().refused_period = refused;
+            nih_error!("The ASIO driver started no stream{at}, reloading it at {to}");
+            self.period_request = reopen.period;
+            previous.refused_period = reopen.refused;
+            self.in_use.lock().refused_period = reopen.refused;
         }
-        self.first_run = after.first_run_after(self.first_run);
         let device_use = self.device_use();
         self.config.period_size = open_period(self.duplex, self.shared_period);
         let opened = Self::open_devices(
@@ -954,8 +953,7 @@ impl<P: Plugin> Backend<P> for CpalMidir {
         // and it replaces whatever a stream that did not start left to do.
         self.quarantined.clear();
         self.returned.get_mut().take();
-        self.setup_failure = SetupFailure::Fail;
-        self.first_run = FirstRun::Other;
+        self.recovery.on_change();
         if next.driver != current.driver {
             return self.switch_host(&current, &next);
         }
@@ -985,12 +983,12 @@ impl<P: Plugin> Backend<P> for CpalMidir {
         );
         match opened {
             Ok(opened) => {
-                self.first_run = first_run_after_change(
+                self.recovery.on_change_opened(first_run_after_change(
                     self.duplex && start == Start::Restart,
                     previous_period,
                     previous.buffer_size,
                     opened.in_use.buffer_size,
-                );
+                ));
                 self.config = config;
                 self.hold(opened);
                 Ok(())
@@ -1325,6 +1323,16 @@ fn published_after_run_end(before: AudioDevicesInUse, end: RunEnd) -> AudioDevic
     AudioDevicesInUse {
         running: before.running && run_outcome(end) != RunOutcome::StreamFailed,
         ..before
+    }
+}
+
+/// What the shared host standing in for the launch's ASIO driver publishes: the host it `left`,
+/// refused, as a switch to it that opened nothing is. Restarts keep it (`keep_refusals`); a change
+/// that opens clears it.
+fn published_after_stand_in(in_use: AudioDevicesInUse, left: String) -> AudioDevicesInUse {
+    AudioDevicesInUse {
+        refused_driver: Some(left),
+        ..in_use
     }
 }
 
@@ -1721,12 +1729,7 @@ impl CpalMidir {
             adopted: None,
             adopted_refused: false,
             relapsed: None,
-            first_run: if duplex {
-                FirstRun::Launch { retried: false }
-            } else {
-                FirstRun::Other
-            },
-            setup_failure: SetupFailure::Fail,
+            recovery: SetupRecovery::at_launch(duplex),
         })
     }
 
@@ -1866,14 +1869,16 @@ impl CpalMidir {
     }
 
     /// The launch's ASIO driver started no stream, at the saved size or its own: the shared host
-    /// stands in on the system default as it does for a launch where no driver opens, published
-    /// the same way (`duplex: false`). A stand-in that opens nothing is tried again by the next
-    /// `reinit()`.
+    /// stands in on the system default as it does for a launch where no driver opens (`duplex:
+    /// false`), with the driver it left published in `refused_driver`. The editor saw that driver
+    /// open before its stream failed, so only the refusal tells it the stand-in is not a switch
+    /// the user made. A stand-in that opens nothing is tried again by the next `reinit()`.
     fn stand_in_shared(&mut self) -> Result<()> {
         let driver = self.in_use.lock().opened.clone().unwrap_or_default();
         nih_error!(
             "The ASIO driver '{driver}' started no stream, WASAPI stands in on the system default"
         );
+        let left = backend_id(self.host_id);
         self.release_driver();
         let stand_in = Target {
             driver: STAND_IN_DRIVER.to_string(),
@@ -1881,11 +1886,12 @@ impl CpalMidir {
             input: None,
             period: None,
         };
-        let opened = self.open_host(&stand_in);
-        if opened.is_err() {
-            self.setup_failure = SetupFailure::StandIn;
+        if let Err(err) = self.open_host(&stand_in) {
+            self.recovery.on_stand_in_failed();
+            return Err(err);
         }
-        opened
+        self.publish_in_use(|in_use| published_after_stand_in(in_use, left));
+        Ok(())
     }
 
     /// Open `next` on its own host and move the backend onto it. Nothing about the backend
@@ -2227,6 +2233,7 @@ impl CpalMidir {
         in_use.running = running_after_open(start, previous.running);
         in_use.sample_rate = Some(output.config.sample_rate.0);
         in_use.buffer_size = stream_period(&output).map(|period| period as u32);
+        in_use.refused_period = still_refused(in_use.refused_period, in_use.buffer_size);
         let rate = output.config.sample_rate.0 as f32;
         if start != Start::Launch && (rate - config.sample_rate).abs() > 0.1 {
             nih_log!("The output runs at {rate} Hz; the session follows it");
@@ -3806,6 +3813,31 @@ mod tests {
         };
         let before = running_duplex("RME");
         assert_eq!(published_after_run_end(before.clone(), end), before);
+    }
+
+    /// The editor saw the launch's driver open and latched that ASIO ran; the refusal is what
+    /// tells it WASAPI stands in for a driver that started no stream, and restarts keep saying it.
+    #[test]
+    fn a_stand_in_for_a_driver_that_started_no_stream_names_the_driver_it_left() {
+        let stood_in = AudioDevicesInUse {
+            driver: Some("wasapi".into()),
+            opened: Some("Speakers".into()),
+            duplex: false,
+            running: true,
+            ..AudioDevicesInUse::default()
+        };
+        let published = published_after_stand_in(stood_in.clone(), "asio".into());
+        assert_eq!(published.refused_driver.as_deref(), Some("asio"));
+        assert_eq!(
+            AudioDevicesInUse {
+                refused_driver: None,
+                ..published.clone()
+            },
+            stood_in
+        );
+        let mut restarted = AudioDevicesInUse::default();
+        keep_refusals(Start::Restart, &published, &mut restarted);
+        assert_eq!(restarted.refused_driver.as_deref(), Some("asio"));
     }
 
     #[test]

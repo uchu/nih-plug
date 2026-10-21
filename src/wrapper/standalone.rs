@@ -53,7 +53,9 @@ pub struct AudioDevicesInUse {
     /// The host the stream runs on, by backend id: `"wasapi"`, `"asio"`, `"core-audio"`, `"alsa"`.
     pub driver: Option<String>,
     /// A driver, by backend id, that was asked for but opened nothing; the stream stayed on `driver`.
-    /// Kept through restarts; a device or driver change that opens clears it.
+    /// Also the launch's ASIO driver that opened and then started no stream, at its size or the
+    /// driver's own, while WASAPI stands in for it. Kept through restarts; a device or driver
+    /// change that opens clears it.
     pub refused_driver: Option<String>,
     /// The ASIO driver the user last picked that did not open: a driver name, or
     /// [`FIRST_AVAILABLE_REFUSED`] when "First available" opened nothing. What ran before runs
@@ -76,8 +78,9 @@ pub struct AudioDevicesInUse {
     /// down.
     pub running: bool,
     /// A buffer size the ASIO driver listed and then refused to run: after a change of the size
-    /// alone the previous size runs instead, after the launch the driver's own. Restarts keep it;
-    /// `None` once a change opens, and on other hosts.
+    /// alone the previous size runs instead, after a launch that asked for it the driver's own.
+    /// Restarts keep it; `None` once a change opens, once the stream runs at that size, and on
+    /// other hosts.
     pub refused_period: Option<u32>,
 }
 
