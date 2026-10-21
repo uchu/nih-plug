@@ -2,6 +2,7 @@
 //! of a run (spec A6), and reloading it by name (A7). Off ASIO every function here is inert.
 
 use super::buffer_sizes::BufferFacts;
+use cpal::traits::StreamTrait;
 use cpal::{Device, Stream};
 use crossbeam::sync::Unparker;
 use std::sync::atomic::AtomicBool;
@@ -20,12 +21,30 @@ pub(crate) fn driver_open() -> bool {
 }
 
 /// A duplex driver's stream, which a run hands to the GUI thread to start, stop and drop (E1).
-pub(crate) struct DriverStream(pub(crate) Stream);
+pub(crate) struct DriverStream(Stream);
 
-// SAFETY: cpal marks every `Stream` as not `Send` for Android's AAudio. Only a duplex (ASIO) run
-// makes a `DriverStream`, and cpal's ASIO stream is a play flag, the driver and its buffers behind
-// `Arc`s and a callback id, all `Send`, which the assertion below checks where ASIO builds.
+// SAFETY: cpal marks every `Stream` as not `Send` for Android's AAudio. `DriverStream::new()`
+// admits only cpal's ASIO stream, a play flag, the driver and its buffers behind `Arc`s and a
+// callback id, all `Send`, which the assertion below checks where ASIO builds.
 unsafe impl Send for DriverStream {}
+
+impl DriverStream {
+    /// `None` for any stream but an ASIO driver's: no other host's stream may cross threads.
+    #[cfg(all(target_os = "windows", feature = "asio"))]
+    pub(crate) fn new(stream: Stream) -> Option<Self> {
+        matches!(stream.as_inner(), cpal::platform::StreamInner::Asio(_)).then_some(Self(stream))
+    }
+
+    #[cfg(not(all(target_os = "windows", feature = "asio")))]
+    pub(crate) fn new(stream: Stream) -> Option<Self> {
+        drop(stream);
+        None
+    }
+
+    pub(crate) fn play(&self) -> Result<(), cpal::PlayStreamError> {
+        self.0.play()
+    }
+}
 
 #[cfg(all(target_os = "windows", feature = "asio"))]
 fn assert_send<T: Send>() {}

@@ -8,7 +8,7 @@ use std::any::Any;
 use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::Arc;
-use std::thread;
+use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
 use super::backend::{wait_unless, Backend, GuiExecutor, RunOutcome, Wake};
@@ -186,6 +186,9 @@ pub enum GuiTask {
     /// Work that must happen on the GUI thread, see [`Backend::reinit_on_gui_thread()`] and
     /// [`Backend::reconfigure_on_gui_thread()`].
     Run(Box<dyn FnOnce() + Send>),
+    /// A backend job through its [`GuiExecutor`]. Unlike [`GuiTask::Run`] it still runs after the
+    /// window closes, until the audio thread ends: a run stops its driver this way.
+    Driver(Box<dyn FnOnce() + Send>),
 }
 
 impl WindowHandler for WrapperWindowHandler {
@@ -201,7 +204,7 @@ impl WindowHandler for WrapperWindowHandler {
                     });
                 }
                 GuiTask::Close => window.close(),
-                GuiTask::Run(job) => job(),
+                GuiTask::Run(job) | GuiTask::Driver(job) => job(),
             }
         }
     }
@@ -392,10 +395,12 @@ impl<P: Plugin, B: Backend<P>> Wrapper<P, B> {
         // We'll spawn a separate thread to handle IO and to process audio. This audio thread should
         // terminate together with this function.
         let terminate_audio_thread = Arc::new(AtomicBool::new(false));
+        let gui_pumping_ended = Arc::new(AtomicBool::new(false));
         self.backend.borrow_mut().set_gui_executor(gui_executor(
             gui_task_sender.clone(),
-            terminate_audio_thread.clone(),
+            gui_pumping_ended.clone(),
         ));
+        let driver_tasks = gui_task_receiver.clone();
         let audio_thread = {
             let this = self.clone();
             let terminate_audio_thread = terminate_audio_thread.clone();
@@ -490,13 +495,15 @@ impl<P: Plugin, B: Backend<P>> Wrapper<P, B> {
                     match task {
                         GuiTask::Resize(..) => (),
                         GuiTask::Close => break,
-                        GuiTask::Run(job) => job(),
+                        GuiTask::Run(job) | GuiTask::Driver(job) => job(),
                     }
                 }
             }
         }
 
         terminate_audio_thread.store(true, Ordering::SeqCst);
+        run_driver_jobs_until_ended(&driver_tasks, &audio_thread);
+        gui_pumping_ended.store(true, Ordering::SeqCst);
         audio_thread.join().unwrap();
 
         // Some plugins may use this to clean up resources. Should not be needed for the standalone
@@ -706,8 +713,10 @@ impl<P: Plugin, B: Backend<P>> Wrapper<P, B> {
                                     nih_error!("The plugin returned an error while processing:");
                                     nih_error!("{}", err);
 
+                                    // Never blocks: the GUI thread may be stopping the driver
+                                    // and waiting for this very callback to return.
                                     let push_successful =
-                                        gui_task_sender.send(GuiTask::Close).is_ok();
+                                        gui_task_sender.try_send(GuiTask::Close).is_ok();
                                     nih_debug_assert!(
                                         push_successful,
                                         "Could not queue window close, the editor will remain open"
@@ -1106,18 +1115,19 @@ fn gui_runner(sender: Sender<GuiTask>) -> GuiRunner {
 }
 
 /// The backend's way to the GUI thread (E1), made on the GUI thread. A full queue is waited out
-/// rather than refusing the job, the job is refused once the application quits, and a job posted
-/// from the GUI thread itself runs right there instead of waiting on the thread meant to run it.
-fn gui_executor(sender: Sender<GuiTask>, quitting: Arc<AtomicBool>) -> GuiExecutor {
+/// rather than refusing the job, the job is refused once the GUI thread pumps no more, and a job
+/// posted from the GUI thread itself runs right there instead of waiting on the thread meant to
+/// run it.
+fn gui_executor(sender: Sender<GuiTask>, pumping_ended: Arc<AtomicBool>) -> GuiExecutor {
     let gui_thread = thread::current().id();
     Arc::new(move |job| {
         if thread::current().id() == gui_thread {
             job();
             return true;
         }
-        let mut task = GuiTask::Run(job);
+        let mut task = GuiTask::Driver(job);
         loop {
-            if quitting.load(Ordering::SeqCst) {
+            if pumping_ended.load(Ordering::SeqCst) {
                 return false;
             }
             match sender.send_timeout(task, Duration::from_millis(50)) {
@@ -1129,8 +1139,23 @@ fn gui_executor(sender: Sender<GuiTask>, quitting: Arc<AtomicBool>) -> GuiExecut
     })
 }
 
+/// Once the window is gone, run the backend's driver jobs until `audio_thread` ends: its last run
+/// stops the driver through one, and the driver is driven from this thread only (E1). Every other
+/// task is dropped unrun.
+fn run_driver_jobs_until_ended<T>(
+    tasks: &channel::Receiver<GuiTask>,
+    audio_thread: &JoinHandle<T>,
+) {
+    while !audio_thread.is_finished() {
+        if let Ok(GuiTask::Driver(job)) = tasks.recv_timeout(Duration::from_millis(50)) {
+            job();
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
+    use super::super::backend::run_on_gui_or_here;
     use super::*;
 
     #[test]
@@ -1155,8 +1180,8 @@ mod tests {
     #[test]
     fn the_gui_executor_runs_a_gui_thread_job_in_place_and_posts_every_other_one() {
         let (sender, tasks) = channel::bounded(1);
-        let quitting = Arc::new(AtomicBool::new(false));
-        let exec = gui_executor(sender, quitting.clone());
+        let pumping_ended = Arc::new(AtomicBool::new(false));
+        let exec = gui_executor(sender, pumping_ended.clone());
 
         let ran = Arc::new(AtomicBool::new(false));
         let flag = ran.clone();
@@ -1170,7 +1195,7 @@ mod tests {
         };
         thread::sleep(Duration::from_millis(120));
         assert!(
-            matches!(tasks.try_recv(), Ok(GuiTask::Run(_))),
+            matches!(tasks.try_recv(), Ok(GuiTask::Driver(_))),
             "the first job is queued"
         );
         assert_eq!(
@@ -1178,9 +1203,9 @@ mod tests {
             Some((true, true)),
             "a full queue is waited out"
         );
-        assert!(matches!(tasks.try_recv(), Ok(GuiTask::Run(_))));
+        assert!(matches!(tasks.try_recv(), Ok(GuiTask::Driver(_))));
 
-        quitting.store(true, Ordering::SeqCst);
+        pumping_ended.store(true, Ordering::SeqCst);
         let refused = {
             let exec = exec.clone();
             thread::spawn(move || exec(Box::new(|| ())))
@@ -1188,9 +1213,45 @@ mod tests {
         assert_eq!(refused.join().ok(), Some(false));
         assert!(tasks.is_empty());
 
-        quitting.store(false, Ordering::SeqCst);
+        pumping_ended.store(false, Ordering::SeqCst);
         drop(tasks);
         let closed = thread::spawn(move || exec(Box::new(|| ())));
         assert_eq!(closed.join().ok(), Some(false));
+    }
+
+    #[test]
+    fn once_the_window_is_gone_driver_jobs_run_here_until_the_audio_thread_ends() {
+        let (sender, tasks) = channel::bounded(4);
+        let exec = gui_executor(sender.clone(), Arc::new(AtomicBool::new(false)));
+        let other_ran = Arc::new(AtomicBool::new(false));
+        {
+            let other_ran = other_ran.clone();
+            let queued = sender.try_send(GuiTask::Run(Box::new(move || {
+                other_ran.store(true, Ordering::SeqCst)
+            })));
+            assert!(queued.is_ok());
+        }
+        let audio_thread = thread::spawn(move || {
+            thread::sleep(Duration::from_millis(100));
+            let ran_on = Arc::new(Mutex::new(None));
+            let record = ran_on.clone();
+            run_on_gui_or_here(Some(&exec), (), move |()| {
+                *record.lock() = Some(thread::current().id());
+            });
+            let ran_on = *ran_on.lock();
+            ran_on
+        });
+
+        run_driver_jobs_until_ended(&tasks, &audio_thread);
+        assert!(audio_thread.is_finished());
+        assert_eq!(
+            audio_thread.join().ok().flatten(),
+            Some(thread::current().id()),
+            "the end of the run ran on the thread that drains"
+        );
+        assert!(
+            !other_ran.load(Ordering::SeqCst),
+            "no other GUI task runs once the window is gone"
+        );
     }
 }

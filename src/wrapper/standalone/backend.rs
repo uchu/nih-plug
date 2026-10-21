@@ -1,6 +1,6 @@
 use crossbeam::channel::{self, RecvTimeoutError};
 use parking_lot::Mutex;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -79,56 +79,132 @@ pub(crate) fn wait_unless(should_stop: &AtomicBool, max: Duration) -> Wake {
 }
 
 /// Posts a job to the GUI thread, which loads and releases an ASIO driver and so makes every
-/// other call to it (A7, E1). `false` when the job was not taken: the application is quitting.
+/// other call to it (A7, E1). `false` when the job was not taken: the GUI thread pumps no more.
 pub type GuiExecutor = Arc<dyn Fn(Box<dyn FnOnce() + Send>) -> bool + Send + Sync>;
 
-/// Run `job` on the GUI thread through `exec` and wait for its value, or right here without one.
-/// `None` when the application quits first: the executor refused the job or `should_stop` was
-/// raised while waiting.
-pub(crate) fn run_on_gui<T: Send + 'static>(
-    exec: Option<&GuiExecutor>,
-    should_stop: &AtomicBool,
-    job: impl FnOnce() -> T + Send + 'static,
-) -> Option<T> {
-    let Some(exec) = exec else {
-        return Some(job());
-    };
-    if should_stop.load(Ordering::SeqCst) {
-        return None;
-    }
-    let (reply_sender, reply) = channel::bounded(1);
-    if !exec(Box::new(move || {
-        let _ = reply_sender.send(job());
-    })) {
-        return None;
-    }
-    loop {
-        match reply.recv_timeout(Duration::from_millis(50)) {
-            Ok(value) => return Some(value),
-            Err(RecvTimeoutError::Timeout) if !should_stop.load(Ordering::SeqCst) => {}
-            Err(_) => return None,
-        }
-    }
-}
-
-/// [`run_on_gui()`] for a job that consumes `input`: when the application quits before the job
-/// runs, `input` comes back instead of staying with a job the GUI thread never runs, so whatever
-/// it holds (a driver handle, a stream) is let go of here.
+/// Run `job` on `input` on the GUI thread through `exec` and wait for its value, or right here
+/// without one. When the application quits first (the executor refuses the job or `should_stop`
+/// is raised while it waits), `input` comes back instead of staying with a job the GUI thread may
+/// still run, so whatever it holds (a driver handle, a stream) is let go of here; `None` in its
+/// place only when there is no job to take it back from. A job that took its input before the
+/// stop is waited for: what it made (a started stream) is never dropped unseen.
 pub(crate) fn run_on_gui_owning<I: Send + 'static, T: Send + 'static>(
     exec: Option<&GuiExecutor>,
     should_stop: &AtomicBool,
     input: I,
     job: impl FnOnce(I) -> T + Send + 'static,
 ) -> Result<T, Option<I>> {
+    let Some(exec) = exec else {
+        return Ok(job(input));
+    };
+    if should_stop.load(Ordering::SeqCst) {
+        return Err(Some(input));
+    }
     let slot = Arc::new(Mutex::new(Some(input)));
     let job_slot = slot.clone();
-    let ran = run_on_gui(exec, should_stop, move || {
-        let input = job_slot.lock().take();
-        input.map(job)
-    });
-    match ran {
-        Some(Some(value)) => Ok(value),
-        _ => Err(slot.lock().take()),
+    let (reply_sender, reply) = channel::bounded(1);
+    let posted = exec(Box::new(move || {
+        let taken = job_slot.lock().take();
+        if let Some(input) = taken {
+            let _ = reply_sender.send(job(input));
+        }
+    }));
+    if !posted {
+        return Err(slot.lock().take());
+    }
+    loop {
+        match reply.recv_timeout(Duration::from_millis(50)) {
+            Ok(value) => return Ok(value),
+            Err(RecvTimeoutError::Timeout) if !should_stop.load(Ordering::SeqCst) => {}
+            Err(RecvTimeoutError::Timeout) => {
+                let left = slot.lock().take();
+                return match left {
+                    Some(input) => Err(Some(input)),
+                    None => reply.recv().map_err(|_| None),
+                };
+            }
+            Err(RecvTimeoutError::Disconnected) => return Err(slot.lock().take()),
+        }
+    }
+}
+
+/// Run `job` on `input` on the GUI thread through `exec`, however long that thread takes, or right
+/// here when there is no executor, it refuses the job or the job is dropped unrun. Unlike
+/// [`run_on_gui_owning()`] a stop does not end the wait: this is how a run lets go of a driver, and the
+/// wrapper runs such jobs until the audio thread ends.
+pub(crate) fn run_on_gui_or_here<I: Send + 'static>(
+    exec: Option<&GuiExecutor>,
+    input: I,
+    job: impl FnOnce(I) + Send + 'static,
+) {
+    let Some(exec) = exec else {
+        return job(input);
+    };
+    let slot = Arc::new(Mutex::new(Some((input, job))));
+    let job_slot = slot.clone();
+    let (reply_sender, reply) = channel::bounded(1);
+    let posted = exec(Box::new(move || {
+        let taken = job_slot.lock().take();
+        if let Some((input, job)) = taken {
+            job(input);
+        }
+        let _ = reply_sender.send(());
+    }));
+    if posted && reply.recv().is_ok() {
+        return;
+    }
+    let left = slot.lock().take();
+    if let Some((input, job)) = left {
+        job(input);
+    }
+}
+
+/// A rate read on the GUI thread that nothing waits for: [`Self::post()`] asks for one, a later
+/// [`Self::take()`] collects it. At most one read is in flight, so a GUI thread held by a modal
+/// control panel never collects a backlog.
+#[derive(Default)]
+pub(crate) struct GuiRead {
+    in_flight: AtomicBool,
+    fresh: AtomicBool,
+    bits: AtomicU64,
+}
+
+impl GuiRead {
+    /// Post `read` through `exec`, or run it right here without one, unless a read is in flight.
+    /// `wake` runs once the read is done.
+    pub(crate) fn post(
+        self: &Arc<Self>,
+        exec: Option<&GuiExecutor>,
+        read: impl FnOnce() -> Option<f64> + Send + 'static,
+        wake: impl FnOnce() + Send + 'static,
+    ) {
+        if self.in_flight.swap(true, Ordering::AcqRel) {
+            return;
+        }
+        let this = self.clone();
+        let job = move || {
+            if let Some(value) = read() {
+                this.bits.store(value.to_bits(), Ordering::Relaxed);
+                this.fresh.store(true, Ordering::Release);
+            }
+            this.in_flight.store(false, Ordering::Release);
+            wake();
+        };
+        match exec {
+            Some(exec) => {
+                if !exec(Box::new(job)) {
+                    self.in_flight.store(false, Ordering::Release);
+                }
+            }
+            None => job(),
+        }
+    }
+
+    /// The value a read brought since the last call, if any.
+    pub(crate) fn take(&self) -> Option<f64> {
+        self.fresh
+            .swap(false, Ordering::AcqRel)
+            .then(|| f64::from_bits(self.bits.load(Ordering::Relaxed)))
     }
 }
 
@@ -214,7 +290,8 @@ pub trait Backend<P: Plugin>: 'static + Send + Sync {
     ///
     /// Every driver call outside the driver's own callbacks runs on the GUI thread: `run()` builds,
     /// starts, polls, stops and drops such a driver's stream through the [`GuiExecutor`] given to
-    /// [`set_gui_executor()`][Self::set_gui_executor()], and waits for each job.
+    /// [`set_gui_executor()`][Self::set_gui_executor()], and waits for each job but the rate read,
+    /// which it collects on a later wake.
     ///
     /// While such a stream is down, nothing on the GUI thread may block on the audio thread:
     /// `GuiContext::set_state()` waits for an audio callback, which would then never come.
@@ -241,6 +318,14 @@ mod tests {
     use super::*;
     use crate::wrapper::standalone::change::{request_audio_change, take_audio_change};
     use std::thread;
+
+    fn run_on_gui<T: Send + 'static>(
+        exec: Option<&GuiExecutor>,
+        should_stop: &AtomicBool,
+        job: impl FnOnce() -> T + Send + 'static,
+    ) -> Option<T> {
+        run_on_gui_owning(exec, should_stop, (), move |()| job()).ok()
+    }
 
     /// An executor that runs every job it takes on one spawned thread, in order.
     fn forwarding_executor() -> GuiExecutor {
@@ -360,6 +445,135 @@ mod tests {
             Arc::strong_count(&held),
             1,
             "the job left queued holds nothing of the input"
+        );
+    }
+
+    #[test]
+    fn a_job_that_took_its_input_before_the_stop_is_waited_for() {
+        let exec: GuiExecutor = Arc::new(|job| {
+            thread::spawn(job);
+            true
+        });
+        let stop = Arc::new(AtomicBool::new(false));
+        let raise = stop.clone();
+        let ran = run_on_gui_owning(Some(&exec), &stop, vec![1, 2], move |input| {
+            raise.store(true, Ordering::SeqCst);
+            thread::sleep(Duration::from_millis(150));
+            input.len()
+        });
+        assert!(
+            matches!(ran, Ok(2)),
+            "what the job made comes back, never dropped on the GUI thread"
+        );
+    }
+
+    /// Runs `end` through [`run_on_gui_or_here()`] and reports how often it ran and on which
+    /// threads.
+    fn end_a_run(exec: Option<&GuiExecutor>) -> Vec<thread::ThreadId> {
+        let ran = Arc::new(Mutex::new(Vec::new()));
+        let held = Arc::new(());
+        let record = ran.clone();
+        run_on_gui_or_here(exec, held.clone(), move |input| {
+            drop(input);
+            record.lock().push(thread::current().id());
+        });
+        assert_eq!(Arc::strong_count(&held), 1, "the input is consumed");
+        let ran = ran.lock().clone();
+        ran
+    }
+
+    #[test]
+    fn the_end_of_a_run_runs_once_on_the_gui_thread() {
+        let exec = forwarding_executor();
+        let ran = end_a_run(Some(&exec));
+        assert_eq!(ran.len(), 1);
+        assert_ne!(ran[0], thread::current().id());
+    }
+
+    #[test]
+    fn the_end_of_a_run_runs_once_here_without_a_gui_thread_to_take_it() {
+        let here = thread::current().id();
+        assert_eq!(end_a_run(None), vec![here]);
+        let refused: GuiExecutor = Arc::new(|_| false);
+        assert_eq!(end_a_run(Some(&refused)), vec![here]);
+    }
+
+    #[test]
+    fn the_end_of_a_run_left_unrun_by_the_gui_thread_runs_once_here() {
+        let parked = Arc::new(Mutex::new(Vec::new()));
+        let exec: GuiExecutor = {
+            let parked = parked.clone();
+            Arc::new(move |job| {
+                parked.lock().push(job);
+                true
+            })
+        };
+        {
+            let parked = parked.clone();
+            thread::spawn(move || {
+                thread::sleep(Duration::from_millis(120));
+                parked.lock().clear();
+            });
+        }
+        assert_eq!(end_a_run(Some(&exec)), vec![thread::current().id()]);
+    }
+
+    #[test]
+    fn a_gui_read_arrives_without_a_wait_and_is_taken_once() {
+        let exec = forwarding_executor();
+        let read = Arc::new(GuiRead::default());
+        let (woken, wake) = channel::bounded(1);
+        read.post(
+            Some(&exec),
+            || Some(48000.0),
+            move || {
+                let _ = woken.send(());
+            },
+        );
+        assert!(wake.recv_timeout(Duration::from_secs(1)).is_ok());
+        assert_eq!(read.take(), Some(48000.0));
+        assert_eq!(read.take(), None);
+
+        read.post(None, || None, || ());
+        assert_eq!(read.take(), None, "a read without a value brings nothing");
+    }
+
+    #[test]
+    fn a_gui_read_is_posted_once_while_it_waits_for_the_gui_thread() {
+        let parked = Arc::new(Mutex::new(Vec::new()));
+        let exec: GuiExecutor = {
+            let parked = parked.clone();
+            Arc::new(move |job| {
+                parked.lock().push(job);
+                true
+            })
+        };
+        let read = Arc::new(GuiRead::default());
+        read.post(Some(&exec), || Some(44100.0), || ());
+        read.post(Some(&exec), || Some(44100.0), || ());
+        assert_eq!(parked.lock().len(), 1);
+        assert_eq!(read.take(), None);
+
+        let job = parked.lock().pop();
+        if let Some(job) = job {
+            job();
+        }
+        assert_eq!(read.take(), Some(44100.0));
+        read.post(Some(&exec), || Some(44100.0), || ());
+        assert_eq!(
+            parked.lock().len(),
+            1,
+            "a read that came in lets the next one go"
+        );
+
+        let refused: GuiExecutor = Arc::new(|_| false);
+        let read = Arc::new(GuiRead::default());
+        read.post(Some(&refused), || Some(1.0), || ());
+        read.post(Some(&exec), || Some(1.0), || ());
+        assert_eq!(
+            parked.lock().len(),
+            2,
+            "a refused read lets the next one go"
         );
     }
 

@@ -30,7 +30,10 @@ use super::asio_driver::{self, DriverStream, ResetListener};
 use super::buffer_sizes::{legal_sizes, snap, BufferFacts, DUPLEX_BLOCK};
 use super::coreaudio_rate::DeviceRate;
 use super::device_watch::{DeviceWatch, Kind, Wanted};
-use super::{run_on_gui_owning, sleep_unless, wait_unless, Backend, GuiExecutor, RunOutcome, Wake};
+use super::{
+    run_on_gui_or_here, run_on_gui_owning, sleep_unless, wait_unless, Backend, GuiExecutor,
+    GuiRead, RunOutcome, Wake,
+};
 use crate::midi::MidiResult;
 use crate::prelude::{
     AudioIOLayout, AuxiliaryBuffers, Buffer, MidiConfig, NoteEvent, Plugin, PluginNoteEvent,
@@ -507,7 +510,7 @@ impl<P: Plugin> Backend<P> for CpalMidir {
                                 |_: &Stream| Ok::<(), cpal::PlayStreamError>(()),
                                 || false,
                             )
-                            .map(DriverStream)
+                            .and_then(driver_stream)
                         },
                     );
                     gui_gone = built.is_err();
@@ -761,6 +764,7 @@ impl<P: Plugin> Backend<P> for CpalMidir {
             // would also deadlock the scoped MIDI output thread, which blocks on its channel until
             // it receives a `Terminate` task).
             let mut setup_failed = false;
+            let rate_wake = unparker.clone();
             let mut shared_output: Option<Stream> = None;
             let mut driver_output: Option<DriverStream> = None;
             let build = output_stream_builder!(
@@ -830,6 +834,7 @@ impl<P: Plugin> Backend<P> for CpalMidir {
                 liveness.stamp();
                 let check_rate = rate_check_applies(self.duplex, self.host_id);
                 let mut rate_checked = Instant::now();
+                let driver_rate = Arc::new(GuiRead::default());
                 let mut called_back = false;
                 loop {
                     parker.park_timeout(Duration::from_millis(100));
@@ -862,21 +867,37 @@ impl<P: Plugin> Backend<P> for CpalMidir {
                     }
                     // An output whose rate moves (a control panel, an external clock, Audio MIDI
                     // Setup) may keep calling back; the restart adopts the new rate (A17).
+                    // The driver's rate is read on the GUI thread (E1), which a modal control panel
+                    // may hold: posted there, never waited for, and not posted while a panel may
+                    // be open.
+                    let mut rate_now = None;
                     if check_rate && rate_checked.elapsed() >= RATE_CHECK_INTERVAL {
                         rate_checked = Instant::now();
-                        if let Some(rate) =
-                            output_rate_now(self.duplex, output, gui.as_ref(), &should_stop).filter(
-                                |&rate| rate_moved(self.duplex, rate, self.config.sample_rate),
-                            )
-                        {
-                            let device = if self.duplex {
-                                "the ASIO driver"
-                            } else {
-                                "the output device"
-                            };
-                            restart = Some(format!("{device} now runs at {rate} Hz"));
-                            break;
+                        if !self.duplex {
+                            rate_now = output.rate_source.and_then(DeviceRate::read);
+                        } else if !change::panel_pending() {
+                            let device = output.device.clone();
+                            let wake = rate_wake.clone();
+                            driver_rate.post(
+                                gui.as_ref(),
+                                move || watched_duplex_rate(asio_driver::driver_rate(&device)),
+                                move || wake.unpark(),
+                            );
                         }
+                    }
+                    if self.duplex {
+                        rate_now = driver_rate.take();
+                    }
+                    if let Some(rate) = rate_now
+                        .filter(|&rate| rate_moved(self.duplex, rate, self.config.sample_rate))
+                    {
+                        let device = if self.duplex {
+                            "the ASIO driver"
+                        } else {
+                            "the output device"
+                        };
+                        restart = Some(format!("{device} now runs at {rate} Hz"));
+                        break;
                     }
                 }
             }
@@ -887,13 +908,9 @@ impl<P: Plugin> Backend<P> for CpalMidir {
                     reset_listener.take(),
                     driver_input.take(),
                 );
-                // A quitting application's GUI thread no longer takes jobs and waits for this
-                // thread to end; the driver is stopped here then, before its handle is released.
-                if let Err(Some(held)) =
-                    run_on_gui_owning(gui.as_ref(), &should_stop, held, end_driver_run)
-                {
-                    end_driver_run(held);
-                }
+                // Waited out even when quitting: the wrapper runs this job on the GUI thread until
+                // this thread ends.
+                run_on_gui_or_here(gui.as_ref(), held, end_driver_run);
             }
             drop(shared_output);
             watch_stop.store(true, Ordering::Release);
@@ -1429,28 +1446,6 @@ fn published_after_failed_open(
     }
 }
 
-/// The output's rate right now: the ASIO driver's, read on the GUI thread (E1) and not at all while
-/// a modal control panel may hold that thread, or the nominal rate of the device a shared output
-/// resolved to. `None` when there is nothing to read or the device does not answer.
-fn output_rate_now(
-    duplex: bool,
-    output: &CpalDevice,
-    gui: Option<&GuiExecutor>,
-    should_stop: &AtomicBool,
-) -> Option<f64> {
-    if !duplex {
-        return output.rate_source.and_then(DeviceRate::read);
-    }
-    if change::panel_pending() {
-        return None;
-    }
-    run_on_gui_owning(gui, should_stop, output.device.clone(), |device| {
-        asio_driver::driver_rate(&device)
-    })
-    .ok()
-    .and_then(watched_duplex_rate)
-}
-
 /// Build a duplex driver's output stream, then start the capture built before it and the output,
 /// on the GUI thread (E1). The streams come back with whether the setup failed.
 fn start_driver_streams(
@@ -1459,14 +1454,15 @@ fn start_driver_streams(
     build: StreamBuilder,
     input: Option<DriverStream>,
 ) -> (Option<DriverStream>, Option<DriverStream>, bool) {
-    let stream = match build(device, config) {
-        Ok(stream) => stream,
+    let stream = match build(device, config).map(driver_stream) {
+        Ok(Some(stream)) => stream,
+        Ok(None) => return (input, None, true),
         Err(err) => {
             nih_error!("Error creating the output stream: {err:#}");
             return (input, None, true);
         }
     };
-    if let Some(Err(err)) = input.as_ref().map(|input| input.0.play()) {
+    if let Some(Err(err)) = input.as_ref().map(DriverStream::play) {
         nih_error!("Could not start the capture stream: {err:#}");
     }
     let failed = match stream.play() {
@@ -1476,7 +1472,16 @@ fn start_driver_streams(
             true
         }
     };
-    (input, Some(DriverStream(stream)), failed)
+    (input, Some(stream), failed)
+}
+
+/// `stream` as one the GUI thread may own, which only an ASIO driver's is.
+fn driver_stream(stream: Stream) -> Option<DriverStream> {
+    let stream = DriverStream::new(stream);
+    if stream.is_none() {
+        nih_error!("A duplex run built a stream that is not an ASIO driver's; dropping it");
+    }
+    stream
 }
 
 /// What a duplex run ends: the driver, its streams and its reset listener.
