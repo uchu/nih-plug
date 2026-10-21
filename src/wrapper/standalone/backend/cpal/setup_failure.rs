@@ -1,5 +1,10 @@
 //! A buffer size the ASIO driver listed and then refused at CreateBuffers or Start fails only
-//! inside a run: what the reopen after that run does (E3).
+//! inside a run: what the reopen after that run does (E3), and at launch the walk on to the next
+//! listed driver (§ 6 f).
+
+use anyhow::Result;
+
+pub(super) use super::target::LaunchWalk;
 
 /// The open a run is the first one after, as far as a stream that does not start in it goes.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -25,8 +30,12 @@ pub(super) enum SetupFailure {
     PickFollowingDriver,
     /// Reopen at the size that ran before the change (`None`: the driver's own).
     RevertPeriod(Option<u32>),
-    /// The launch's driver starts no stream: the shared host stands in on the system default, as
-    /// it does for a launch where no driver opens.
+    /// The launch's driver starts no stream, at the saved size nor its own, or a driver the
+    /// launch walked on to starts none: the next listed driver the launch has not tried opens,
+    /// following the driver.
+    WalkOn,
+    /// The launch's driver starts no stream and no listed driver is left to walk on to: the
+    /// shared host stands in on the system default, as it does for a launch where no driver opens.
     StandIn,
     /// Recover as from any stream that failed.
     Fail,
@@ -71,7 +80,7 @@ impl SetupFailure {
                 period,
                 refused: attempted,
             }),
-            SetupFailure::StandIn | SetupFailure::Fail => None,
+            SetupFailure::WalkOn | SetupFailure::StandIn | SetupFailure::Fail => None,
         }
     }
 
@@ -80,7 +89,9 @@ impl SetupFailure {
     /// shared host in when the run after a later reopen does not start either.
     fn first_run_after(self, first_run: FirstRun) -> FirstRun {
         match self {
-            SetupFailure::RetryFollowingDriver => FirstRun::Launch { retried: true },
+            SetupFailure::RetryFollowingDriver | SetupFailure::WalkOn => {
+                FirstRun::Launch { retried: true }
+            }
             SetupFailure::PickFollowingDriver
             | SetupFailure::RevertPeriod(_)
             | SetupFailure::StandIn => FirstRun::Other,
@@ -100,17 +111,29 @@ pub(super) fn still_refused(refused: Option<u32>, running: Option<u32>) -> Optio
     refused.filter(|&size| Some(size) != running)
 }
 
-/// The backend's E3 state: what the next run is the first one after, and what the last run whose
-/// stream did not start left `reinit()` to do. The backend calls these at each step, so the
-/// sequence below is the one it runs.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+/// Where the launch's walk over the listed drivers got to (`SetupRecovery::walk_on`).
+#[derive(Debug)]
+pub(super) enum Walked<T> {
+    /// This driver opened; its first run gets one attempt.
+    Opened(String, T),
+    /// No driver is left that opens: the shared host stands in.
+    Spent,
+    /// A pick or a quit stopped the walk.
+    Ended,
+}
+
+/// The backend's E3 state: what the next run is the first one after, what the last run whose
+/// stream did not start left `reinit()` to do, and the launch's walk over the listed drivers. The
+/// backend calls these at each step, so the sequence below is the one it runs.
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub(super) struct SetupRecovery {
     first_run: FirstRun,
     pending: SetupFailure,
+    walk: LaunchWalk,
 }
 
 impl SetupRecovery {
-    pub(super) fn at_launch(duplex: bool) -> Self {
+    pub(super) fn at_launch(duplex: bool, walk: LaunchWalk) -> Self {
         Self {
             first_run: if duplex {
                 FirstRun::Launch { retried: false }
@@ -118,6 +141,7 @@ impl SetupRecovery {
                 FirstRun::Other
             },
             pending: SetupFailure::Fail,
+            walk,
         }
     }
 
@@ -132,11 +156,37 @@ impl SetupRecovery {
         self.pending = setup_failure_action(first_run);
     }
 
-    /// `reinit()` starts: what it does, the run after its reopen counted from here on.
+    /// `reinit()` starts: what it does, the run after its reopen counted from here on. A stand-in
+    /// waits while the launch's walk has a driver left.
     pub(super) fn on_reinit(&mut self) -> SetupFailure {
-        let action = std::mem::replace(&mut self.pending, SetupFailure::Fail);
+        let action = match std::mem::replace(&mut self.pending, SetupFailure::Fail) {
+            SetupFailure::StandIn if !self.walk.is_spent() => SetupFailure::WalkOn,
+            action => action,
+        };
         self.first_run = action.first_run_after(self.first_run);
         action
+    }
+
+    /// `reinit()` walks on (`SetupFailure::WalkOn`): `open` loads the next untried driver,
+    /// following the driver. Once none is left that opens, the stand-in's first run counts.
+    pub(super) fn walk_on<T>(
+        &mut self,
+        open: impl FnMut(&str) -> Result<T>,
+        ended: impl Fn() -> bool,
+    ) -> Walked<T> {
+        match self.walk.next_that_opens(open, &ended) {
+            Some((name, opened)) => Walked::Opened(name, opened),
+            None if ended() => Walked::Ended,
+            None => {
+                self.first_run = SetupFailure::StandIn.first_run_after(self.first_run);
+                Walked::Spent
+            }
+        }
+    }
+
+    /// The saved driver a driver the launch walked on to stands in for.
+    pub(super) fn walk_refused(&self) -> Option<&str> {
+        self.walk.refused()
     }
 
     /// The stand-in opened nothing and the backend stays on the driver it left: the next
@@ -147,10 +197,12 @@ impl SetupRecovery {
         self.pending = SetupFailure::Fail;
     }
 
-    /// A pick is a fresh choice: it replaces whatever a stream that did not start left to do.
+    /// A pick is a fresh choice: it replaces whatever a stream that did not start left to do, the
+    /// launch's walk included.
     pub(super) fn on_change(&mut self) {
         self.first_run = FirstRun::Other;
         self.pending = SetupFailure::Fail;
+        self.walk = LaunchWalk::default();
     }
 
     /// A change opened; its first run counts as `first_run`.
@@ -188,7 +240,199 @@ pub(super) fn first_run_after_pick(duplex: bool, requested: Option<u32>) -> Firs
 
 #[cfg(test)]
 mod tests {
+    use super::super::target::launch_duplex;
     use super::*;
+
+    fn names(names: &[&str]) -> Vec<String> {
+        names.iter().map(|name| name.to_string()).collect()
+    }
+
+    /// No driver left to walk on to.
+    fn at_launch(duplex: bool) -> SetupRecovery {
+        SetupRecovery::at_launch(duplex, LaunchWalk::default())
+    }
+
+    #[derive(Debug, PartialEq, Eq)]
+    enum Ends {
+        Runs(String),
+        StandIn,
+    }
+
+    /// A duplex launch driven through the sequence the backend runs: the launch's own walk to the
+    /// first driver that opens, then each run, `reinit()` and the walk on. A driver in `opens`
+    /// loads and opens, one in `streams` also starts its stream. Returns where it ends, every
+    /// load in order and the driver published as refused.
+    fn launch(
+        requested: Option<&str>,
+        listed: &[&str],
+        opens: &[&str],
+        streams: &[&str],
+    ) -> (Ends, Vec<String>, Option<String>) {
+        let listed = names(listed);
+        let loads = std::cell::RefCell::new(Vec::new());
+        let mut open = |name: &str| {
+            loads.borrow_mut().push(name.to_string());
+            if opens.contains(&name) {
+                Ok(())
+            } else {
+                Err(anyhow::anyhow!("'{name}' does not open"))
+            }
+        };
+        let (_, opened) = launch_duplex(requested, &listed, &mut open);
+        let Ok((mut running, ())) = opened else {
+            return (Ends::StandIn, loads.into_inner(), None);
+        };
+        let mut recovery =
+            SetupRecovery::at_launch(true, LaunchWalk::after(requested, &listed, &running));
+        for _ in 0..=2 * listed.len() {
+            let first_run = recovery.on_run_start();
+            if streams.contains(&running.as_str()) {
+                let refused = recovery.walk_refused().map(str::to_string);
+                let later = recovery.on_run_start();
+                assert_eq!(later, FirstRun::Other, "the walk ends once a stream runs");
+                recovery.on_setup_failed(later);
+                assert_eq!(recovery.on_reinit(), SetupFailure::Fail);
+                return (Ends::Runs(running), loads.into_inner(), refused);
+            }
+            recovery.on_setup_failed(first_run);
+            match recovery.on_reinit() {
+                SetupFailure::RetryFollowingDriver => loads.borrow_mut().push(running.clone()),
+                SetupFailure::WalkOn => match recovery.walk_on(&mut open, || false) {
+                    Walked::Opened(name, ()) => running = name,
+                    Walked::Spent => return (Ends::StandIn, loads.into_inner(), None),
+                    Walked::Ended => unreachable!("nothing ends this walk"),
+                },
+                SetupFailure::StandIn => return (Ends::StandIn, loads.into_inner(), None),
+                other => panic!("a launch does not {other:?}"),
+            }
+        }
+        panic!("the launch walk did not end: {:?}", loads.into_inner());
+    }
+
+    #[test]
+    fn a_saved_driver_that_starts_no_stream_walks_on_to_the_next_listed_driver_that_runs() {
+        let (ends, loads, refused) = launch(Some("A"), &["A", "B", "C"], &["A", "C"], &["C"]);
+        assert_eq!(ends, Ends::Runs("C".into()));
+        assert_eq!(
+            loads,
+            ["A", "A", "B", "C"],
+            "B does not open and is skipped"
+        );
+        assert_eq!(refused.as_deref(), Some("A"));
+    }
+
+    #[test]
+    fn a_walk_where_no_driver_runs_stands_the_shared_host_in() {
+        let (ends, loads, _) = launch(Some("A"), &["A", "B", "C"], &["A", "C"], &[]);
+        assert_eq!(ends, Ends::StandIn);
+        assert_eq!(loads, ["A", "A", "B", "C"], "C started no stream, once");
+        let (ends, loads, _) = launch(Some("A"), &["A", "B", "C"], &["A"], &[]);
+        assert_eq!(ends, Ends::StandIn);
+        assert_eq!(loads, ["A", "A", "B", "C"], "no other driver opened");
+        let (ends, loads, _) = launch(Some("A"), &["A"], &["A"], &[]);
+        assert_eq!(ends, Ends::StandIn);
+        assert_eq!(
+            loads,
+            ["A", "A"],
+            "a lone driver stands the shared host in as before"
+        );
+    }
+
+    #[test]
+    fn first_available_walks_on_the_same_way_and_refuses_no_saved_driver() {
+        let (ends, loads, refused) = launch(None, &["A", "B", "C"], &["A", "C"], &["C"]);
+        assert_eq!(ends, Ends::Runs("C".into()));
+        assert_eq!(loads, ["A", "A", "B", "C"]);
+        assert_eq!(refused, None);
+        let (ends, _, _) = launch(None, &["A", "B", "C"], &["A", "C"], &[]);
+        assert_eq!(ends, Ends::StandIn);
+    }
+
+    #[test]
+    fn a_saved_driver_refused_at_open_walks_on_past_the_driver_that_stood_in() {
+        let (ends, loads, refused) = launch(Some("B"), &["A", "B", "C", "D"], &["A", "D"], &["D"]);
+        assert_eq!(ends, Ends::Runs("D".into()));
+        assert_eq!(loads, ["B", "A", "A", "C", "D"], "B is never loaded again");
+        assert_eq!(refused.as_deref(), Some("B"));
+    }
+
+    #[test]
+    fn a_walked_driver_that_starts_no_stream_gets_one_attempt() {
+        let (ends, loads, _) = launch(Some("A"), &["A", "B", "C"], &["A", "B", "C"], &["C"]);
+        assert_eq!(ends, Ends::Runs("C".into()));
+        assert_eq!(loads, ["A", "A", "B", "C"], "B is not retried");
+    }
+
+    #[test]
+    fn a_pick_during_the_walk_ends_it() {
+        let listed = names(&["A", "B", "C"]);
+        let mut recovery = SetupRecovery::at_launch(true, LaunchWalk::after(None, &listed, "A"));
+        for _ in 0..2 {
+            let first_run = recovery.on_run_start();
+            recovery.on_setup_failed(first_run);
+            if recovery.on_reinit() == SetupFailure::WalkOn {
+                break;
+            }
+        }
+        let mut loads = Vec::new();
+        let picked = std::cell::Cell::new(false);
+        let walked = recovery.walk_on(
+            |name: &str| {
+                loads.push(name.to_string());
+                picked.set(true);
+                Err::<(), _>(anyhow::anyhow!("'{name}' does not open"))
+            },
+            || picked.get(),
+        );
+        assert!(matches!(walked, Walked::Ended));
+        assert_eq!(loads, ["B"], "C is not loaded after the pick");
+        recovery.on_change();
+        assert_eq!(recovery.walk_refused(), None);
+        assert_eq!(recovery.on_reinit(), SetupFailure::Fail);
+        let first_run = recovery.on_run_start();
+        assert_eq!(first_run, FirstRun::Other);
+        recovery.on_setup_failed(first_run);
+        assert_eq!(
+            recovery.on_reinit(),
+            SetupFailure::Fail,
+            "nothing is left to walk on to"
+        );
+    }
+
+    #[test]
+    fn a_pick_before_the_walk_starts_clears_it() {
+        let listed = names(&["A", "B"]);
+        let mut recovery =
+            SetupRecovery::at_launch(true, LaunchWalk::after(Some("A"), &listed, "A"));
+        let first_run = recovery.on_run_start();
+        recovery.on_setup_failed(first_run);
+        recovery.on_change();
+        assert_eq!(recovery.on_reinit(), SetupFailure::Fail);
+        recovery.on_change_opened(FirstRun::Launch { retried: true });
+        let first_run = recovery.on_run_start();
+        recovery.on_setup_failed(first_run);
+        assert_eq!(recovery.on_reinit(), SetupFailure::StandIn);
+    }
+
+    #[test]
+    fn a_stand_in_that_opened_nothing_after_the_walk_never_walks_again() {
+        let listed = names(&["A", "B"]);
+        let mut recovery = SetupRecovery::at_launch(true, LaunchWalk::after(None, &listed, "A"));
+        for _ in 0..2 {
+            let first_run = recovery.on_run_start();
+            recovery.on_setup_failed(first_run);
+            recovery.on_reinit();
+        }
+        assert!(matches!(
+            recovery.walk_on(|_| Err::<(), _>(anyhow::anyhow!("no")), || false),
+            Walked::Spent
+        ));
+        recovery.on_stand_in_failed();
+        assert_eq!(recovery.on_reinit(), SetupFailure::Fail);
+        let first_run = recovery.on_run_start();
+        recovery.on_setup_failed(first_run);
+        assert_eq!(recovery.on_reinit(), SetupFailure::StandIn);
+    }
 
     #[test]
     fn a_first_launch_failure_retries_following_the_driver() {
@@ -270,27 +514,33 @@ mod tests {
 
     /// A driver whose every stream refuses to start, driven through the transitions the backend
     /// calls: each run starts and its stream does not, then `reinit()` runs and its reopen opens.
-    /// Every path ends in a stand-in or the ordinary recovery within one reopen at another size.
+    /// Every path ends in a stand-in or the ordinary recovery within one reopen at another size,
+    /// and a launch's walk loads each listed driver it has not tried once, every one opening.
     #[test]
     fn a_driver_that_starts_no_stream_at_any_size_ends_within_one_reopen() {
-        let launch = SetupRecovery::at_launch(true);
-        let mut period_change = SetupRecovery::at_launch(false);
+        let launch = at_launch(true);
+        let listed = names(&["A", "B", "C"]);
+        let walk = SetupRecovery::at_launch(true, LaunchWalk::after(Some("B"), &listed, "B"));
+        let mut period_change = at_launch(false);
         period_change.on_change();
         period_change.on_change_opened(FirstRun::PeriodChange {
             previous: Some(256),
         });
-        let mut pick = SetupRecovery::at_launch(true);
+        let mut pick = at_launch(true);
         pick.on_change();
         pick.on_change_opened(first_run_after_pick(true, Some(32)));
         let starts = [
-            (launch, Some(64)),
+            (launch.clone(), Some(64)),
             (launch, None),
+            (walk.clone(), Some(64)),
+            (walk, None),
             (period_change, Some(32)),
             (pick, Some(32)),
-            (SetupRecovery::at_launch(false), Some(32)),
+            (at_launch(false), Some(32)),
         ];
         for (mut recovery, mut period) in starts {
             let mut reopens = 0;
+            let mut walked: Vec<String> = Vec::new();
             let ended = loop {
                 let first_run = recovery.on_run_start();
                 recovery.on_setup_failed(first_run);
@@ -301,8 +551,23 @@ mod tests {
                     assert!(reopens <= 1, "{recovery:?} keeps reopening");
                     continue;
                 }
+                if action == SetupFailure::WalkOn {
+                    assert_eq!(action.reopen(period, period), None);
+                    let Walked::Opened(name, ()) = recovery.walk_on(|_| Ok(()), || false) else {
+                        panic!("every driver opens");
+                    };
+                    assert!(!walked.contains(&name), "{name} walked onto twice");
+                    walked.push(name);
+                    assert!(
+                        walked.len() < listed.len(),
+                        "{walked:?} walks past the list"
+                    );
+                    period = None;
+                    continue;
+                }
                 break action;
             };
+            assert!(walked.is_empty() || walked == ["A", "C"], "{walked:?}");
             assert!(matches!(ended, SetupFailure::StandIn | SetupFailure::Fail));
             if ended == SetupFailure::StandIn {
                 recovery.on_stand_in_failed();
@@ -317,7 +582,7 @@ mod tests {
 
     #[test]
     fn a_launch_retries_once_then_stands_the_shared_host_in() {
-        let mut recovery = SetupRecovery::at_launch(true);
+        let mut recovery = at_launch(true);
         let first_run = recovery.on_run_start();
         assert_eq!(first_run, FirstRun::Launch { retried: false });
         recovery.on_setup_failed(first_run);
@@ -330,7 +595,7 @@ mod tests {
 
     #[test]
     fn a_reopen_that_did_not_open_keeps_the_launch_retry_pending() {
-        let mut recovery = SetupRecovery::at_launch(true);
+        let mut recovery = at_launch(true);
         let first_run = recovery.on_run_start();
         recovery.on_setup_failed(first_run);
         assert_eq!(recovery.on_reinit(), SetupFailure::RetryFollowingDriver);
@@ -344,7 +609,7 @@ mod tests {
 
     #[test]
     fn a_run_whose_stream_started_uses_the_first_run_up() {
-        let mut recovery = SetupRecovery::at_launch(true);
+        let mut recovery = at_launch(true);
         recovery.on_run_start();
         assert_eq!(recovery.on_reinit(), SetupFailure::Fail);
         let first_run = recovery.on_run_start();
@@ -355,7 +620,7 @@ mod tests {
 
     #[test]
     fn a_change_replaces_what_a_failed_stream_left_to_do() {
-        let mut recovery = SetupRecovery::at_launch(true);
+        let mut recovery = at_launch(true);
         let first_run = recovery.on_run_start();
         recovery.on_setup_failed(first_run);
         recovery.on_change();
@@ -376,7 +641,7 @@ mod tests {
                 refused: Some(32)
             })
         );
-        let mut recovery = SetupRecovery::at_launch(true);
+        let mut recovery = at_launch(true);
         recovery.on_run_start();
         recovery.on_change();
         recovery.on_change_opened(first_run_after_pick(true, Some(32)));
@@ -398,7 +663,7 @@ mod tests {
 
     #[test]
     fn a_stand_in_that_opened_nothing_reloads_the_driver_before_standing_in_again() {
-        let mut recovery = SetupRecovery::at_launch(true);
+        let mut recovery = at_launch(true);
         for _ in 0..2 {
             let first_run = recovery.on_run_start();
             recovery.on_setup_failed(first_run);

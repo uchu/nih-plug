@@ -18,8 +18,8 @@ use std::thread::ScopedJoinHandle;
 use std::time::{Duration, Instant};
 
 use self::setup_failure::{
-    first_run_after_change, first_run_after_pick, setup_failure_action, still_refused,
-    SetupFailure, SetupRecovery,
+    first_run_after_change, first_run_after_pick, setup_failure_action, still_refused, LaunchWalk,
+    SetupFailure, SetupRecovery, Walked,
 };
 use self::target::{
     duplex_refused_output, first_that_opens, host_id_for, keep_refusals, launch_duplex,
@@ -115,6 +115,8 @@ pub struct CpalMidir {
     /// The way to the GUI thread, where a duplex driver's stream is built, started, polled,
     /// stopped and dropped (E1).
     gui: Option<GuiExecutor>,
+    /// The last run's `should_stop`: a quit ends the launch's walk before the next driver loads.
+    should_stop: Arc<AtomicBool>,
 }
 
 /// Builds one direction's stream on the device it is given.
@@ -303,6 +305,8 @@ fn watch_after_open(
 
 /// The devices a start or restart opened, and the requested ones it could not.
 struct OpenedDevices {
+    /// The ASIO driver the open loaded, by its listed name.
+    loaded: Option<String>,
     output: CpalDevice,
     input: Option<CpalDevice>,
     in_use: AudioDevicesInUse,
@@ -396,6 +400,7 @@ impl<P: Plugin> Backend<P> for CpalMidir {
         // A duplex driver never reports a dead stream, so the output callback stamps this and the
         // wait below watches it (A6).
         let liveness = Liveness::new();
+        self.should_stop = should_stop.clone();
         let first_run = self.recovery.on_run_start();
         let Some(output) = self.output.as_ref() else {
             nih_error!("No audio output is open");
@@ -1002,8 +1007,10 @@ impl<P: Plugin> Backend<P> for CpalMidir {
     fn reinit(&mut self) -> Result<()> {
         let requested = self.period_request;
         let after = self.recovery.on_reinit();
-        if after == SetupFailure::StandIn {
-            return self.stand_in_shared();
+        match after {
+            SetupFailure::WalkOn => return self.walk_on(),
+            SetupFailure::StandIn => return self.stand_in_shared(),
+            _ => {}
         }
         // On ASIO a real driver reset (asio.h kAsioResetRequest): every handle to the driver is
         // released, so it runs ASIODisposeBuffers and ASIOExit, and the resolution below loads the
@@ -1469,6 +1476,21 @@ fn published_after_stand_in(in_use: AudioDevicesInUse, left: String) -> AudioDev
     }
 }
 
+/// What the restart that opens the driver `name` the launch walked on to reopens from: the
+/// driver named in `opened`, and the saved driver it stands in for (`refused`) in
+/// `refused_output`, which the restart path publishes and keeps (`duplex_refused_output`).
+fn walked_stand_in(
+    previous: &AudioDevicesInUse,
+    name: &str,
+    refused: Option<String>,
+) -> AudioDevicesInUse {
+    AudioDevicesInUse {
+        opened: Some(name.to_string()),
+        refused_output: refused,
+        ..previous.clone()
+    }
+}
+
 /// Whether a stream that just opened is published as running before it calls back. A launch or
 /// a pick is taken as running; a restart keeps what the run before it ended with, so a driver
 /// that loads and then never calls back is not reported running on every recovery attempt.
@@ -1900,6 +1922,16 @@ impl CpalMidir {
             None => None,
         };
 
+        let walk = opened
+            .loaded
+            .as_deref()
+            .map_or_else(LaunchWalk::default, |loaded| {
+                LaunchWalk::after(
+                    config.output_device.as_deref(),
+                    &opened.in_use.outputs,
+                    loaded,
+                )
+            });
         asio_driver::set_driver_open(duplex);
         Ok(CpalMidir {
             config,
@@ -1930,8 +1962,9 @@ impl CpalMidir {
             adopted: None,
             adopted_refused: false,
             relapsed: None,
-            recovery: SetupRecovery::at_launch(duplex),
+            recovery: SetupRecovery::at_launch(duplex, walk),
             gui: None,
+            should_stop: Arc::new(AtomicBool::new(false)),
         })
     }
 
@@ -2089,9 +2122,59 @@ impl CpalMidir {
         self.reopen_previous(previous, refused_asio, Some(next.driver.clone()))
     }
 
-    /// The launch's ASIO driver started no stream, at the saved size or its own: the shared host
-    /// stands in on the system default as it does for a launch where no driver opens (`duplex:
-    /// false`), with the driver it left published in `refused_driver`. The editor saw that driver
+    /// The launch's driver started no stream, at the saved size nor its own, or a driver the walk
+    /// opened started none (§ 6 f): the next listed driver the launch has not tried loads,
+    /// following the driver, one attempt each, a driver that does not open skipped. It stands in
+    /// for the saved driver as the launch's first driver that opens does (`refused_output`), and
+    /// the stream is not published down meanwhile. Once no driver is left that opens, the shared
+    /// host stands in (`stand_in_shared`). A pick or a quit ends the walk before the next load.
+    fn walk_on(&mut self) -> Result<()> {
+        let left = self.in_use.lock().opened.clone().unwrap_or_default();
+        nih_error!("The ASIO driver '{left}' started no stream, the next listed driver is tried");
+        self.release_driver();
+        self.period_request = None;
+        self.config.period_size = open_period(self.duplex, self.shared_period);
+        let previous = self.in_use.lock().clone();
+        let refused = self.recovery.walk_refused().map(str::to_string);
+        let device_use = self.device_use();
+        let (host, config, layout) = (&self.host, &mut self.config, &self.audio_io_layout);
+        let should_stop = &self.should_stop;
+        let walked = self.recovery.walk_on(
+            |name| {
+                let stand_in = walked_stand_in(&previous, name, refused.clone());
+                Self::open_devices(
+                    host,
+                    config,
+                    layout,
+                    Start::Restart,
+                    &[],
+                    device_use,
+                    &stand_in,
+                )
+                .map_err(|failed| failed.err)
+            },
+            || should_stop.load(Ordering::SeqCst) || audio_change_pending(),
+        );
+        match walked {
+            Walked::Opened(name, opened) => {
+                nih_log!("The launch walked on to the ASIO driver '{name}'");
+                self.hold(opened);
+                Ok(())
+            }
+            Walked::Spent => {
+                nih_error!("No other listed ASIO driver opened");
+                self.stand_in_shared()
+            }
+            Walked::Ended => {
+                anyhow::bail!("The walk over the ASIO drivers ended for a change or a quit")
+            }
+        }
+    }
+
+    /// The launch's ASIO driver started no stream, at the saved size or its own, and no listed
+    /// driver is left to walk on to: the shared host stands in on the system default as it does
+    /// for a launch where no driver opens (`duplex: false`), with the driver it left published in
+    /// `refused_driver`. The editor saw that driver
     /// open before its stream failed, so only the refusal tells it the stand-in is not a switch
     /// the user made. A stand-in that opens nothing leaves the backend on the driver, published as
     /// not running, and the next `reinit()` reloads that driver (`on_stand_in_failed`).
@@ -2357,6 +2440,7 @@ impl CpalMidir {
 
         let output_channels = main_channels(layout.main_output_channels);
         let mut output = None;
+        let mut loaded = None;
         let mut failure = None;
         if duplex && start != Start::Launch {
             match Self::reopen_asio(start, config, previous, output_channels, device_use) {
@@ -2364,8 +2448,9 @@ impl CpalMidir {
                     let requested = config.output_device.as_deref() == Some(name.as_str());
                     in_use.refused_output = duplex_refused_output(start, requested, previous);
                     if requested {
-                        in_use.output = Some(name);
+                        in_use.output = Some(name.clone());
                     }
+                    loaded = Some(name);
                     output = Some(device);
                 }
                 Err(err) => failure = Some(err),
@@ -2377,7 +2462,10 @@ impl CpalMidir {
             });
             launch_published(requested, outcome, &mut in_use, &mut opened, quarantined);
             match result {
-                Ok((_, device)) => output = Some(device),
+                Ok((name, device)) => {
+                    loaded = Some(name);
+                    output = Some(device);
+                }
                 Err(err) => failure = Some(err),
             }
         } else if let Some(name) = config.output_device.clone() {
@@ -2552,6 +2640,7 @@ impl CpalMidir {
         let in_use = with_driver_loaded(in_use, true);
         publish_audio_devices_in_use(in_use.clone());
         Ok(OpenedDevices {
+            loaded,
             output,
             input,
             in_use,
@@ -4072,6 +4161,41 @@ mod tests {
         let mut restarted = AudioDevicesInUse::default();
         keep_refusals(Start::Restart, &published, &mut restarted);
         assert_eq!(restarted.refused_driver.as_deref(), Some("asio"));
+    }
+
+    /// § 6 f: the driver the launch walks on to is published as the launch's stand-in for the
+    /// saved driver, through the restart path that opens it, and restarts keep that refusal.
+    #[test]
+    fn a_driver_the_launch_walked_on_to_stands_in_for_the_saved_driver() {
+        let saved_ran = AudioDevicesInUse {
+            output: Some("A".into()),
+            refused_period: Some(64),
+            ..running_duplex("A")
+        };
+        let walked = walked_stand_in(&saved_ran, "C", Some("A".into()));
+        assert_eq!(walked.opened.as_deref(), Some("C"));
+        assert!(walked.running, "no 'not running' while the walk goes on");
+        let mut opened = AudioDevicesInUse::default();
+        keep_refusals(Start::Restart, &walked, &mut opened);
+        opened.refused_output = duplex_refused_output(Start::Restart, false, &walked);
+        assert_eq!(opened.output, None);
+        assert_eq!(opened.refused_output.as_deref(), Some("A"));
+        assert_eq!(opened.refused_period, Some(64));
+        assert_eq!(opened.refused_driver, None);
+        assert!(running_after_open(Start::Restart, walked.running));
+        let restarted = AudioDevicesInUse {
+            opened: Some("C".into()),
+            ..opened
+        };
+        assert_eq!(
+            duplex_refused_output(Start::Restart, false, &restarted).as_deref(),
+            Some("A")
+        );
+        let first_available = walked_stand_in(&running_duplex("A"), "B", None);
+        assert_eq!(
+            duplex_refused_output(Start::Restart, false, &first_available),
+            None
+        );
     }
 
     #[test]

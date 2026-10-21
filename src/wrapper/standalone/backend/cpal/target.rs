@@ -2,6 +2,7 @@
 //! one that runs, and the rules that decide how the backend opens it.
 
 use anyhow::Result;
+use std::collections::VecDeque;
 
 use super::Start;
 use crate::wrapper::standalone::change::AudioChange;
@@ -180,6 +181,79 @@ pub(super) fn launch_duplex<T>(
         .cloned()
         .collect();
     (outcome, first_that_opens(&others, open))
+}
+
+/// The order a duplex launch tries the listed drivers in (`launch_duplex`): the requested driver
+/// when it is listed, then every other listed one.
+fn launch_order<'a>(
+    requested: Option<&'a str>,
+    names: &'a [String],
+) -> impl Iterator<Item = &'a String> + 'a {
+    let listed = names
+        .iter()
+        .filter(move |name| Some(name.as_str()) == requested);
+    let others = names
+        .iter()
+        .filter(move |name| Some(name.as_str()) != requested);
+    listed.take(1).chain(others)
+}
+
+/// What is left of a duplex launch's walk over the listed drivers once one opened (§ 6 f): when
+/// that driver starts no stream, at the saved size nor its own, the next driver the launch has
+/// not tried loads, following the driver, and the shared host stands in only once every listed
+/// driver failed to open or to stream. Each driver is tried once, in the launch's own order.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub(super) struct LaunchWalk {
+    /// The saved driver, when it is listed: published refused while another driver runs.
+    refused: Option<String>,
+    untried: VecDeque<String>,
+}
+
+impl LaunchWalk {
+    /// The walk after a launch that asked for `requested` among `names` opened `opened`: the
+    /// launch tried every driver before it.
+    pub(super) fn after(requested: Option<&str>, names: &[String], opened: &str) -> Self {
+        Self {
+            refused: requested
+                .filter(|requested| names.iter().any(|name| name == requested))
+                .map(str::to_string),
+            untried: launch_order(requested, names)
+                .skip_while(|name| name.as_str() != opened)
+                .skip(1)
+                .cloned()
+                .collect(),
+        }
+    }
+
+    pub(super) fn refused(&self) -> Option<&str> {
+        self.refused.as_deref()
+    }
+
+    pub(super) fn is_spent(&self) -> bool {
+        self.untried.is_empty()
+    }
+
+    /// The next untried driver that opens. Every driver tried leaves the walk, whether it opens
+    /// or not, and `ended` (a pick, a quit) stops it before the next one loads.
+    pub(super) fn next_that_opens<T>(
+        &mut self,
+        mut open: impl FnMut(&str) -> Result<T>,
+        ended: impl Fn() -> bool,
+    ) -> Option<(String, T)> {
+        while !ended() {
+            let name = self.untried.pop_front()?;
+            match open(&name) {
+                Ok(opened) => return Some((name, opened)),
+                Err(err) => nih_log!("The launch walks on: {err:#}"),
+            }
+        }
+        None
+    }
+
+    #[cfg(test)]
+    fn untried(&self) -> Vec<&str> {
+        self.untried.iter().map(String::as_str).collect()
+    }
 }
 
 #[cfg(test)]
@@ -434,6 +508,84 @@ mod tests {
         assert!(matches!(requested, Requested::Absent));
         assert_eq!(opened.unwrap().0, "A");
         assert_eq!(tried, ["A"]);
+    }
+
+    #[test]
+    fn the_walk_goes_on_in_the_order_the_launch_tried() {
+        let listed = names(&["A", "B", "C", "D"]);
+        let mut tried = Vec::new();
+        let (_, opened) = launch_duplex(Some("C"), &listed, opens_only("A", &mut tried));
+        assert_eq!(opened.unwrap().0, "A");
+        assert_eq!(tried, ["C", "A"]);
+        let walk = LaunchWalk::after(Some("C"), &listed, "A");
+        assert_eq!(walk.untried(), ["B", "D"], "C and A were tried");
+        assert_eq!(walk.refused(), Some("C"));
+    }
+
+    #[test]
+    fn the_walk_after_a_saved_driver_that_opened_holds_every_other_one() {
+        let walk = LaunchWalk::after(Some("B"), &names(&["A", "B", "C"]), "B");
+        assert_eq!(walk.untried(), ["A", "C"]);
+        assert_eq!(walk.refused(), Some("B"));
+        assert!(!walk.is_spent());
+    }
+
+    #[test]
+    fn the_walk_for_first_available_or_an_unlisted_saved_driver_refuses_none() {
+        let listed = names(&["A", "B", "C"]);
+        let walk = LaunchWalk::after(None, &listed, "A");
+        assert_eq!(walk.untried(), ["B", "C"]);
+        assert_eq!(walk.refused(), None);
+        let walk = LaunchWalk::after(Some("Gone"), &listed, "B");
+        assert_eq!(walk.untried(), ["C"]);
+        assert_eq!(walk.refused(), None);
+    }
+
+    #[test]
+    fn the_walk_after_the_last_listed_driver_is_spent() {
+        let walk = LaunchWalk::after(None, &names(&["A", "B"]), "B");
+        assert!(walk.is_spent());
+        assert!(LaunchWalk::after(None, &names(&["A"]), "Unlisted").is_spent());
+        assert!(LaunchWalk::default().is_spent());
+    }
+
+    #[test]
+    fn the_walk_tries_each_untried_driver_once_until_one_opens() {
+        let mut walk = LaunchWalk::after(Some("A"), &names(&["A", "B", "C", "D"]), "A");
+        let mut tried = Vec::new();
+        let opened = walk.next_that_opens(opens_only("C", &mut tried), || false);
+        assert_eq!(opened, Some(("C".to_string(), "c".to_string())));
+        assert_eq!(tried, ["B", "C"]);
+        assert_eq!(walk.untried(), ["D"]);
+        let mut tried = Vec::new();
+        assert_eq!(
+            walk.next_that_opens(opens_only("C", &mut tried), || false),
+            None
+        );
+        assert_eq!(tried, ["D"], "B and C are never tried again");
+        assert!(walk.is_spent());
+        let mut tried = Vec::new();
+        assert_eq!(
+            walk.next_that_opens(opens_only("B", &mut tried), || false),
+            None
+        );
+        assert!(tried.is_empty());
+    }
+
+    #[test]
+    fn a_pick_or_a_quit_ends_the_walk_before_the_next_driver_loads() {
+        let mut walk = LaunchWalk::after(None, &names(&["A", "B", "C"]), "A");
+        let mut tried = Vec::new();
+        let ended = std::cell::Cell::new(false);
+        let opened = walk.next_that_opens(
+            |name| {
+                ended.set(true);
+                opens_only("C", &mut tried)(name)
+            },
+            || ended.get(),
+        );
+        assert_eq!(opened, None);
+        assert_eq!(tried, ["B"], "C is not loaded once the walk ended");
     }
 
     #[test]
