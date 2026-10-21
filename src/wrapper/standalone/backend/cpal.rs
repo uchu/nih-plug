@@ -1484,6 +1484,21 @@ fn with_driver_loaded(in_use: AudioDevicesInUse, loaded: bool) -> AudioDevicesIn
     }
 }
 
+/// What the backend keeps while it reopens what ran before a change that opened nothing: the
+/// refusals added, and no driver loaded until the reopen loads one.
+fn kept_for_reopen(
+    previous: AudioDevicesInUse,
+    refused_asio: Option<String>,
+    refused_driver: Option<String>,
+) -> AudioDevicesInUse {
+    let previous = with_driver_loaded(previous, false);
+    AudioDevicesInUse {
+        refused_asio: refused_asio.or(previous.refused_asio),
+        refused_driver: refused_driver.or(previous.refused_driver),
+        ..previous
+    }
+}
+
 /// What an open that opened no output publishes. A restart keeps naming what last opened, as
 /// not running; a launch or a pick that fails names nothing, as a failed pick is followed by the
 /// previous device's reopen.
@@ -2005,16 +2020,11 @@ impl CpalMidir {
     /// does not open either; `reinit()` then keeps trying it, refusals included.
     fn reopen_previous(
         &mut self,
-        mut previous: AudioDevicesInUse,
+        previous: AudioDevicesInUse,
         refused_asio: Option<String>,
         refused_driver: Option<String>,
     ) -> Result<()> {
-        if refused_asio.is_some() {
-            previous.refused_asio = refused_asio;
-        }
-        if refused_driver.is_some() {
-            previous.refused_driver = refused_driver;
-        }
+        let previous = kept_for_reopen(previous, refused_asio, refused_driver);
         *self.in_use.lock() = previous.clone();
         let device_use = self.device_use();
         self.config.period_size = open_period(self.duplex, self.shared_period);
@@ -4161,6 +4171,21 @@ mod tests {
         let after = published_after_failed_open(Start::Restart, &previous, failed);
         assert_eq!(after.opened.as_deref(), Some("Realtek ASIO"));
         assert!(!after.driver_loaded);
+    }
+
+    #[test]
+    fn a_reopen_keeps_the_previous_driver_unloaded_with_the_refusals() {
+        let previous = with_driver_loaded(running_duplex("Realtek ASIO"), true);
+        let kept = kept_for_reopen(previous.clone(), Some("RME".into()), None);
+        assert!(!kept.driver_loaded);
+        assert_eq!(kept.refused_asio.as_deref(), Some("RME"));
+        assert_eq!(
+            kept,
+            AudioDevicesInUse {
+                refused_asio: Some("RME".into()),
+                ..with_driver_loaded(previous, false)
+            }
+        );
     }
 
     #[test]
