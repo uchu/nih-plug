@@ -305,6 +305,11 @@ pub trait Backend<P: Plugin>: 'static + Send + Sync {
         let _ = exec;
     }
 
+    /// Let go of a driver that must be released on the GUI thread (see
+    /// [`reinit_on_gui_thread()`][Self::reinit_on_gui_thread()]). The wrapper calls this there once
+    /// the audio thread has ended, as the last strong reference to it may drop on another thread.
+    fn release_on_gui_thread(&mut self) {}
+
     /// The (sample rate, plugin block) the stream that is open runs with, which the wrapper
     /// follows after every reopen (A17). `None` when the backend cannot say, and the plugin keeps
     /// the configuration it was initialized with.

@@ -502,9 +502,9 @@ impl<P: Plugin, B: Backend<P>> Wrapper<P, B> {
         }
 
         terminate_audio_thread.store(true, Ordering::SeqCst);
-        run_driver_jobs_until_ended(&driver_tasks, &audio_thread);
-        gui_pumping_ended.store(true, Ordering::SeqCst);
-        audio_thread.join().unwrap();
+        end_audio_thread(&driver_tasks, audio_thread, &gui_pumping_ended, || {
+            self.backend.borrow_mut().release_on_gui_thread()
+        });
 
         // Some plugins may use this to clean up resources. Should not be needed for the standalone
         // application, but it seems like a good idea to stay consistent.
@@ -1153,6 +1153,22 @@ fn run_driver_jobs_until_ended<T>(
     }
 }
 
+/// Once the window is gone: the audio thread's driver jobs run here until it ends, then it is
+/// joined and `release` lets go of the driver here too. A background task may still hold the
+/// wrapper and drop it last on its own thread, which must not be the one to release the driver.
+fn end_audio_thread<T>(
+    tasks: &channel::Receiver<GuiTask>,
+    audio_thread: JoinHandle<T>,
+    pumping_ended: &AtomicBool,
+    release: impl FnOnce(),
+) -> T {
+    run_driver_jobs_until_ended(tasks, &audio_thread);
+    pumping_ended.store(true, Ordering::SeqCst);
+    let ended = audio_thread.join().unwrap();
+    release();
+    ended
+}
+
 #[cfg(test)]
 mod tests {
     use super::super::backend::run_on_gui_or_here;
@@ -1253,5 +1269,25 @@ mod tests {
             !other_ran.load(Ordering::SeqCst),
             "no other GUI task runs once the window is gone"
         );
+    }
+
+    #[test]
+    fn the_driver_is_released_here_once_the_audio_thread_ended() {
+        let (_sender, tasks) = channel::bounded(4);
+        let audio_ended = Arc::new(AtomicBool::new(false));
+        let audio_thread = {
+            let audio_ended = audio_ended.clone();
+            thread::spawn(move || {
+                thread::sleep(Duration::from_millis(60));
+                audio_ended.store(true, Ordering::SeqCst);
+            })
+        };
+        let pumping_ended = AtomicBool::new(false);
+        let mut released = None;
+        end_audio_thread(&tasks, audio_thread, &pumping_ended, || {
+            released = Some((thread::current().id(), audio_ended.load(Ordering::SeqCst)));
+        });
+        assert_eq!(released, Some((thread::current().id(), true)));
+        assert!(pumping_ended.load(Ordering::SeqCst));
     }
 }

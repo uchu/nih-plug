@@ -9,7 +9,9 @@ pub(super) enum FirstRun {
     Launch { retried: bool },
     /// A change of the ASIO buffer size alone, from `previous` (`None` follows the driver).
     PeriodChange { previous: Option<u32> },
-    /// A restart, a pick of a driver or a host, a shared host.
+    /// A pick of an ASIO driver, or a switch onto ASIO, that asked the driver for a buffer size.
+    Pick,
+    /// A restart, a pick that follows the driver's size, a shared host.
     Other,
 }
 
@@ -18,6 +20,9 @@ pub(super) enum FirstRun {
 pub(super) enum SetupFailure {
     /// Reload the driver at its own size.
     RetryFollowingDriver,
+    /// Reload the picked driver at its own size; a stream that does not start then either is a
+    /// failed stream.
+    PickFollowingDriver,
     /// Reopen at the size that ran before the change (`None`: the driver's own).
     RevertPeriod(Option<u32>),
     /// The launch's driver starts no stream: the shared host stands in on the system default, as
@@ -35,8 +40,9 @@ pub(super) struct Reopen {
     pub refused: Option<u32>,
 }
 
-/// What a stream that did not start in the first run after `first_run` leads to. Each answer but `Fail` happens once per launch or
-/// change: the reopen it asks for runs as `first_run_after` says. The launch retry reloads the
+/// What a stream that did not start in the first run after `first_run` leads to. Each answer but
+/// `Fail` happens once per launch or change, or once more after a stand-in that opened nothing:
+/// the reopen it asks for runs as `first_run_after` says. The launch retry reloads the
 /// driver even when it already followed the driver: the reload is what clears a first start the
 /// hardware refused once (a clock still locking, another client still letting go).
 pub(super) fn setup_failure_action(first_run: FirstRun) -> SetupFailure {
@@ -44,6 +50,7 @@ pub(super) fn setup_failure_action(first_run: FirstRun) -> SetupFailure {
         FirstRun::Launch { retried: false } => SetupFailure::RetryFollowingDriver,
         FirstRun::Launch { retried: true } => SetupFailure::StandIn,
         FirstRun::PeriodChange { previous } => SetupFailure::RevertPeriod(previous),
+        FirstRun::Pick => SetupFailure::PickFollowingDriver,
         FirstRun::Other => SetupFailure::Fail,
     }
 }
@@ -54,10 +61,12 @@ impl SetupFailure {
     /// driver refused no size the user picked, so it names none.
     pub(super) fn reopen(self, requested: Option<u32>, attempted: Option<u32>) -> Option<Reopen> {
         match self {
-            SetupFailure::RetryFollowingDriver => Some(Reopen {
-                period: None,
-                refused: requested.and(attempted),
-            }),
+            SetupFailure::RetryFollowingDriver | SetupFailure::PickFollowingDriver => {
+                Some(Reopen {
+                    period: None,
+                    refused: requested.and(attempted),
+                })
+            }
             SetupFailure::RevertPeriod(period) => Some(Reopen {
                 period,
                 refused: attempted,
@@ -72,9 +81,17 @@ impl SetupFailure {
     fn first_run_after(self, first_run: FirstRun) -> FirstRun {
         match self {
             SetupFailure::RetryFollowingDriver => FirstRun::Launch { retried: true },
-            SetupFailure::RevertPeriod(_) | SetupFailure::StandIn => FirstRun::Other,
+            SetupFailure::PickFollowingDriver
+            | SetupFailure::RevertPeriod(_)
+            | SetupFailure::StandIn => FirstRun::Other,
             SetupFailure::Fail => first_run,
         }
+    }
+
+    /// Whether `reinit()` goes on with the open the run belonged to (a reopen at another size, the
+    /// stand-in) instead of recovering from a failed stream: the stream is not down meanwhile.
+    pub(super) fn follows_up(self) -> bool {
+        self != SetupFailure::Fail
     }
 }
 
@@ -122,9 +139,12 @@ impl SetupRecovery {
         action
     }
 
-    /// The stand-in opened nothing: the next `reinit()` tries it again.
+    /// The stand-in opened nothing and the backend stays on the driver it left: the next
+    /// `reinit()` reloads that driver, and a stream it then does not start stands the shared host
+    /// in again.
     pub(super) fn on_stand_in_failed(&mut self) {
-        self.pending = SetupFailure::StandIn;
+        self.first_run = FirstRun::Launch { retried: true };
+        self.pending = SetupFailure::Fail;
     }
 
     /// A pick is a fresh choice: it replaces whatever a stream that did not start left to do.
@@ -139,19 +159,28 @@ impl SetupRecovery {
     }
 }
 
-/// What the first run after a live change that opened counts as. `period_only`: a duplex change
-/// that picked no driver; it reverts to `previous_period` only when the driver now runs another
-/// size (`size_before`, `size_now`) than before.
+/// What the first run after a duplex change that picked no driver counts as: it reverts to
+/// `previous_period` only when the driver now runs another size (`size_before`, `size_now`) than
+/// before.
 pub(super) fn first_run_after_change(
-    period_only: bool,
     previous_period: Option<u32>,
     size_before: Option<u32>,
     size_now: Option<u32>,
 ) -> FirstRun {
-    if period_only && size_before != size_now {
+    if size_before != size_now {
         FirstRun::PeriodChange {
             previous: previous_period,
         }
+    } else {
+        FirstRun::Other
+    }
+}
+
+/// What the first run after a pick or a switch that opened counts as, the host it opened being
+/// `duplex` and asked for the buffer size `requested`.
+pub(super) fn first_run_after_pick(duplex: bool, requested: Option<u32>) -> FirstRun {
+    if duplex && requested.is_some() {
+        FirstRun::Pick
     } else {
         FirstRun::Other
     }
@@ -250,10 +279,14 @@ mod tests {
         period_change.on_change_opened(FirstRun::PeriodChange {
             previous: Some(256),
         });
+        let mut pick = SetupRecovery::at_launch(true);
+        pick.on_change();
+        pick.on_change_opened(first_run_after_pick(true, Some(32)));
         let starts = [
             (launch, Some(64)),
             (launch, None),
             (period_change, Some(32)),
+            (pick, Some(32)),
             (SetupRecovery::at_launch(false), Some(32)),
         ];
         for (mut recovery, mut period) in starts {
@@ -273,6 +306,9 @@ mod tests {
             assert!(matches!(ended, SetupFailure::StandIn | SetupFailure::Fail));
             if ended == SetupFailure::StandIn {
                 recovery.on_stand_in_failed();
+                assert_eq!(recovery.on_reinit(), SetupFailure::Fail);
+                let first_run = recovery.on_run_start();
+                recovery.on_setup_failed(first_run);
                 assert_eq!(recovery.on_reinit(), SetupFailure::StandIn);
             }
             assert_eq!(recovery.on_run_start(), FirstRun::Other);
@@ -328,26 +364,79 @@ mod tests {
     }
 
     #[test]
+    fn a_pick_that_asked_for_a_size_retries_once_following_the_driver() {
+        assert_eq!(
+            setup_failure_action(FirstRun::Pick),
+            SetupFailure::PickFollowingDriver
+        );
+        assert_eq!(
+            SetupFailure::PickFollowingDriver.reopen(Some(32), Some(32)),
+            Some(Reopen {
+                period: None,
+                refused: Some(32)
+            })
+        );
+        let mut recovery = SetupRecovery::at_launch(true);
+        recovery.on_run_start();
+        recovery.on_change();
+        recovery.on_change_opened(first_run_after_pick(true, Some(32)));
+        let first_run = recovery.on_run_start();
+        assert_eq!(first_run, FirstRun::Pick);
+        recovery.on_setup_failed(first_run);
+        assert_eq!(recovery.on_reinit(), SetupFailure::PickFollowingDriver);
+        let first_run = recovery.on_run_start();
+        recovery.on_setup_failed(first_run);
+        assert_eq!(recovery.on_reinit(), SetupFailure::Fail);
+    }
+
+    #[test]
+    fn only_a_duplex_pick_that_asked_for_a_size_counts_as_a_pick() {
+        assert_eq!(first_run_after_pick(true, Some(64)), FirstRun::Pick);
+        assert_eq!(first_run_after_pick(true, None), FirstRun::Other);
+        assert_eq!(first_run_after_pick(false, Some(64)), FirstRun::Other);
+    }
+
+    #[test]
+    fn a_stand_in_that_opened_nothing_reloads_the_driver_before_standing_in_again() {
+        let mut recovery = SetupRecovery::at_launch(true);
+        for _ in 0..2 {
+            let first_run = recovery.on_run_start();
+            recovery.on_setup_failed(first_run);
+            recovery.on_reinit();
+        }
+        recovery.on_stand_in_failed();
+        assert_eq!(recovery.on_reinit(), SetupFailure::Fail);
+        let first_run = recovery.on_run_start();
+        assert_eq!(first_run, FirstRun::Launch { retried: true });
+        recovery.on_setup_failed(first_run);
+        assert_eq!(recovery.on_reinit(), SetupFailure::StandIn);
+    }
+
+    #[test]
+    fn every_failure_but_a_plain_one_is_followed_up_by_the_same_open() {
+        assert!(SetupFailure::RetryFollowingDriver.follows_up());
+        assert!(SetupFailure::PickFollowingDriver.follows_up());
+        assert!(SetupFailure::RevertPeriod(Some(256)).follows_up());
+        assert!(SetupFailure::StandIn.follows_up());
+        assert!(!SetupFailure::Fail.follows_up());
+    }
+
+    #[test]
     fn a_period_change_counts_only_when_the_driver_runs_another_size() {
         assert_eq!(
-            first_run_after_change(true, Some(256), Some(256), Some(32)),
+            first_run_after_change(Some(256), Some(256), Some(32)),
             FirstRun::PeriodChange {
                 previous: Some(256)
             }
         );
         assert_eq!(
-            first_run_after_change(true, None, Some(256), Some(32)),
+            first_run_after_change(None, Some(256), Some(32)),
             FirstRun::PeriodChange { previous: None }
         );
         assert_eq!(
-            first_run_after_change(true, None, Some(256), Some(256)),
+            first_run_after_change(None, Some(256), Some(256)),
             FirstRun::Other,
             "the same size snapped twice has nothing to revert to"
-        );
-        assert_eq!(
-            first_run_after_change(false, Some(256), Some(256), Some(32)),
-            FirstRun::Other,
-            "a driver or host pick is no period change"
         );
     }
 }

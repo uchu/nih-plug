@@ -326,11 +326,18 @@ pub(crate) fn output_report(_device: &Device) -> Option<OutputReport> {
 /// The driver `name`, loaded by name. Enumerating through the cpal host instead loads and
 /// releases every driver registered ahead of it, and all of them while it does not load. Called
 /// only with every handle to the previous driver released, so no driver is loaded.
+///
+/// The SDK loads by a list of the registered drivers it takes once, at the first load, while the
+/// listing (`names`) reads the registry afresh; asio-sys offers no way to retake that list. A
+/// driver registered after the first load is therefore listed but loads only after a relaunch,
+/// which is logged when it happens.
 #[cfg(all(target_os = "windows", feature = "asio"))]
 pub(crate) fn load(name: &str) -> Option<Device> {
     use std::sync::atomic::AtomicI32;
-    use std::sync::Mutex;
+    use std::sync::{Mutex, OnceLock};
 
+    static FIRST_LOAD_LISTING: OnceLock<Vec<String>> = OnceLock::new();
+    let first_listing = FIRST_LOAD_LISTING.get_or_init(registered);
     let started = Instant::now();
     let loaded = asio().load_driver(name);
     let ms = millis_since(started);
@@ -341,6 +348,14 @@ pub(crate) fn load(name: &str) -> Option<Device> {
         }
         Err(err) => {
             nih_log!("The ASIO driver '{name}' does not load ({ms:.1} ms): {err}");
+            if matches!(err, asio_sys::LoadDriverError::LoadDriverFailed)
+                && registered_since(first_listing, &registered(), name)
+            {
+                nih_warn!(
+                    "The ASIO driver '{name}' was registered after the first ASIO driver loaded: \
+                     the ASIO SDK loads it only after a relaunch"
+                );
+            }
             return None;
         }
     };
@@ -358,6 +373,12 @@ pub(crate) fn load(name: &str) -> Option<Device> {
 #[cfg(not(all(target_os = "windows", feature = "asio")))]
 pub(crate) fn load(_name: &str) -> Option<Device> {
     None
+}
+
+/// Whether `name` is registered `now` but was not when the SDK took its list (`first`).
+#[cfg(any(test, all(target_os = "windows", feature = "asio")))]
+fn registered_since(first: &[String], now: &[String], name: &str) -> bool {
+    now.iter().any(|listed| listed == name) && !first.iter().any(|listed| listed == name)
 }
 
 /// Drop `handles`. When the loaded driver goes with them (its last handle runs
@@ -536,6 +557,15 @@ mod tests {
             listing_warnings(&["ASIO4ALL v2".to_string(), "Realtek ASIO".to_string()]).is_empty()
         );
         assert!(listing_warnings(&[]).is_empty());
+    }
+
+    #[test]
+    fn only_a_driver_registered_since_the_first_load_is_one_the_sdk_cannot_load() {
+        let first = ["ASIO4ALL v2".to_string()];
+        let now = ["ASIO4ALL v2".to_string(), "Focusrite USB ASIO".to_string()];
+        assert!(registered_since(&first, &now, "Focusrite USB ASIO"));
+        assert!(!registered_since(&first, &now, "ASIO4ALL v2"));
+        assert!(!registered_since(&first, &now, "Gone ASIO"));
     }
 
     #[test]
