@@ -83,8 +83,8 @@ pub struct AudioDevicesInUse {
     /// A buffer size the ASIO driver listed and then refused to run: after a change of the size
     /// alone the previous size runs instead, after a launch, a driver pick or a switch to ASIO
     /// that asked for it the driver's own.
-    /// Restarts keep it; `None` once a change opens, once the stream runs at that size, and on
-    /// other hosts.
+    /// Restarts keep it; `None` once a change opens, once the stream runs at that size, when the
+    /// launch walks on to another driver (which opens at its own size), and on other hosts.
     pub refused_period: Option<u32>,
     /// Whether an ASIO driver is loaded: from an open that loaded it until the backend releases
     /// it for a restart, a change, a switch or the end, whether or not its stream runs. A recovery

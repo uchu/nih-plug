@@ -1050,17 +1050,20 @@ impl<P: Plugin> Backend<P> for CpalMidir {
                 self.hold(opened);
                 Ok(())
             }
-            Err(failed) if after == SetupFailure::RetryFollowingDriver => {
-                nih_error!(
-                    "The ASIO driver did not reload at its own size: {:#}",
-                    failed.err
-                );
-                match self.recovery.on_retry_refused() {
-                    SetupFailure::WalkOn => self.walk_on(),
-                    _ => self.stand_in_shared(),
+            Err(failed) => match self.recovery.on_reopen_refused(after) {
+                SetupFailure::Fail => Err(self.reopen_failed(failed)),
+                next => {
+                    nih_error!(
+                        "The ASIO driver did not reload at its own size: {:#}",
+                        failed.err
+                    );
+                    if next == SetupFailure::WalkOn {
+                        self.walk_on()
+                    } else {
+                        self.stand_in_shared()
+                    }
                 }
-            }
-            Err(failed) => Err(self.reopen_failed(failed)),
+            },
         }
     }
 

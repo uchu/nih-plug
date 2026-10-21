@@ -167,10 +167,14 @@ impl SetupRecovery {
         action
     }
 
-    /// The launch retry's reload (`SetupFailure::RetryFollowingDriver`) did not open: the saved
-    /// driver is refused as a second stream that did not start is, so the same `reinit()` walks
-    /// on, or stands the shared host in once the walk is spent.
-    pub(super) fn on_retry_refused(&mut self) -> SetupFailure {
+    /// The reopen `reinit()` made for `after` did not open. The launch retry's reload
+    /// (`SetupFailure::RetryFollowingDriver`) is refused as a second stream that did not start
+    /// is, so the same `reinit()` walks on, or stands the shared host in once the walk is spent.
+    /// Any other reopen that did not open recovers as a failed reopen (`Fail`), nothing changed.
+    pub(super) fn on_reopen_refused(&mut self, after: SetupFailure) -> SetupFailure {
+        if after != SetupFailure::RetryFollowingDriver {
+            return SetupFailure::Fail;
+        }
         self.pending = setup_failure_action(FirstRun::Launch { retried: true });
         self.on_reinit()
     }
@@ -360,7 +364,7 @@ mod tests {
             if action == SetupFailure::RetryFollowingDriver {
                 loads.borrow_mut().push(running.clone());
                 if !reload_opens {
-                    action = recovery.on_retry_refused();
+                    action = recovery.on_reopen_refused(action);
                 }
             }
             match action {
@@ -707,13 +711,48 @@ mod tests {
         let first_run = recovery.on_run_start();
         recovery.on_setup_failed(first_run);
         assert_eq!(recovery.on_reinit(), SetupFailure::RetryFollowingDriver);
-        assert_eq!(recovery.on_retry_refused(), SetupFailure::WalkOn);
+        assert_eq!(
+            recovery.on_reopen_refused(SetupFailure::RetryFollowingDriver),
+            SetupFailure::WalkOn
+        );
         let mut recovery = at_launch(true);
         let first_run = recovery.on_run_start();
         recovery.on_setup_failed(first_run);
         assert_eq!(recovery.on_reinit(), SetupFailure::RetryFollowingDriver);
-        assert_eq!(recovery.on_retry_refused(), SetupFailure::StandIn);
+        assert_eq!(
+            recovery.on_reopen_refused(SetupFailure::RetryFollowingDriver),
+            SetupFailure::StandIn
+        );
         assert_eq!(recovery.on_run_start(), FirstRun::Other);
+    }
+
+    #[test]
+    fn any_other_reopen_that_did_not_open_recovers_as_a_failed_reopen() {
+        for first_run in [
+            FirstRun::Pick,
+            FirstRun::PeriodChange {
+                previous: Some(256),
+            },
+        ] {
+            let mut recovery = at_launch(true);
+            recovery.on_run_start();
+            recovery.on_change_opened(first_run);
+            let first_run = recovery.on_run_start();
+            recovery.on_setup_failed(first_run);
+            let after = recovery.on_reinit();
+            assert_ne!(after, SetupFailure::RetryFollowingDriver);
+            let before = recovery.clone();
+            assert_eq!(recovery.on_reopen_refused(after), SetupFailure::Fail);
+            assert_eq!(recovery, before, "{after:?} leaves the recovery as it was");
+        }
+        let mut recovery = at_launch(true);
+        recovery.on_run_start();
+        let before = recovery.clone();
+        assert_eq!(
+            recovery.on_reopen_refused(SetupFailure::Fail),
+            SetupFailure::Fail
+        );
+        assert_eq!(recovery, before);
     }
 
     #[test]
