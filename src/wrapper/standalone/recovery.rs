@@ -41,6 +41,9 @@ pub enum Action {
     ReinitNow,
     /// The stream keeps dying: wait for the audio hardware to change before starting over.
     WaitForHardware,
+    /// Pause `Recovery::FOLLOW_UP`, then reinitialise: the stream did not start and the open it
+    /// belonged to goes on with another attempt.
+    FollowUp,
 }
 
 pub struct Recovery {
@@ -69,6 +72,8 @@ impl Recovery {
     pub const MIN_RESTART_RUN: Duration = Duration::from_secs(2);
     /// The longest a wait for a hardware change lasts before trying again regardless.
     pub const HARDWARE_WAIT: Duration = Duration::from_secs(30);
+    /// The pause before a reopen that follows up a stream that did not start.
+    pub const FOLLOW_UP: Duration = Duration::from_millis(250);
 
     pub fn new() -> Self {
         Self {
@@ -101,6 +106,16 @@ impl Recovery {
         self.failures += 1;
         self.relapses += u32::from(relapse);
         Action::Reinit { backoff }
+    }
+
+    /// The stream did not start and the open it belonged to goes on with another attempt: a
+    /// reload at the driver's own size, a revert to the size that ran, the launch's walk on to the
+    /// next listed driver, the stand-in. The backend makes each of those a bounded number of
+    /// times per launch or change, so none spends the budget: a launch walking over many drivers
+    /// that open and never stream reaches the stand-in without a wait for the hardware, and the
+    /// driver that runs starts with the whole budget.
+    pub fn follow_up(&self) -> Action {
+        Action::FollowUp
     }
 
     /// The backend reported that a requested device is back after a run of `ran_for`.
@@ -159,6 +174,22 @@ mod tests {
                 backoff: Recovery::BACKOFF[0]
             }
         );
+    }
+
+    #[test]
+    fn a_follow_up_never_spends_the_budget() {
+        let mut recovery = Recovery::new();
+        recovery.stream_failed(quick());
+        for _ in 0..=2 * Recovery::MAX_RETRIES {
+            assert_eq!(recovery.follow_up(), Action::FollowUp);
+        }
+        assert_eq!(
+            recovery.stream_failed(quick()),
+            Action::Reinit {
+                backoff: Recovery::BACKOFF[1]
+            }
+        );
+        assert!(Recovery::FOLLOW_UP <= Recovery::BACKOFF[0]);
     }
 
     #[test]

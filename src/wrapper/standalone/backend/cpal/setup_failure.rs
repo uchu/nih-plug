@@ -167,6 +167,14 @@ impl SetupRecovery {
         action
     }
 
+    /// The launch retry's reload (`SetupFailure::RetryFollowingDriver`) did not open: the saved
+    /// driver is refused as a second stream that did not start is, so the same `reinit()` walks
+    /// on, or stands the shared host in once the walk is spent.
+    pub(super) fn on_retry_refused(&mut self) -> SetupFailure {
+        self.pending = setup_failure_action(FirstRun::Launch { retried: true });
+        self.on_reinit()
+    }
+
     /// `reinit()` walks on (`SetupFailure::WalkOn`): `open` loads the next untried driver,
     /// following the driver. Once none is left that opens, the stand-in's first run counts.
     pub(super) fn walk_on<T>(
@@ -241,7 +249,10 @@ pub(super) fn first_run_after_pick(duplex: bool, requested: Option<u32>) -> Firs
 #[cfg(test)]
 mod tests {
     use super::super::target::launch_duplex;
+    use super::super::{run_outcome_after, RunEnd, RunOutcome};
     use super::*;
+    use crate::wrapper::standalone::recovery::{Action, Recovery};
+    use std::time::Duration;
 
     fn names(names: &[&str]) -> Vec<String> {
         names.iter().map(|name| name.to_string()).collect()
@@ -258,16 +269,39 @@ mod tests {
         StandIn,
     }
 
-    /// A duplex launch driven through the sequence the backend runs: the launch's own walk to the
-    /// first driver that opens, then each run, `reinit()` and the walk on. A driver in `opens`
-    /// loads and opens, one in `streams` also starts its stream. Returns where it ends, every
-    /// load in order and the driver published as refused.
+    /// Where a duplex launch ended, every load in order, the driver published as refused, and
+    /// what the wrapper's stream-death budget made of the runs whose stream did not start: the
+    /// pauses before each reopen and whether it waited for the hardware.
+    struct Launched {
+        ends: Ends,
+        loads: Vec<String>,
+        refused: Option<String>,
+        paused: Duration,
+        waited_for_hardware: bool,
+    }
+
     fn launch(
         requested: Option<&str>,
         listed: &[&str],
         opens: &[&str],
         streams: &[&str],
     ) -> (Ends, Vec<String>, Option<String>) {
+        let launched = launch_with(requested, listed, opens, streams, true);
+        (launched.ends, launched.loads, launched.refused)
+    }
+
+    /// A duplex launch driven through the sequence the backend runs: the launch's own walk to the
+    /// first driver that opens, then each run, `reinit()` and the walk on, every run that did not
+    /// start ending as `run()` reports it to the wrapper's `Recovery`. A driver in `opens` loads
+    /// and opens (its launch retry's reload only when `reload_opens`), one in `streams` also
+    /// starts its stream.
+    fn launch_with(
+        requested: Option<&str>,
+        listed: &[&str],
+        opens: &[&str],
+        streams: &[&str],
+        reload_opens: bool,
+    ) -> Launched {
         let listed = names(listed);
         let loads = std::cell::RefCell::new(Vec::new());
         let mut open = |name: &str| {
@@ -278,35 +312,107 @@ mod tests {
                 Err(anyhow::anyhow!("'{name}' does not open"))
             }
         };
+        let mut launched = Launched {
+            ends: Ends::StandIn,
+            loads: Vec::new(),
+            refused: None,
+            paused: Duration::ZERO,
+            waited_for_hardware: false,
+        };
         let (_, opened) = launch_duplex(requested, &listed, &mut open);
         let Ok((mut running, ())) = opened else {
-            return (Ends::StandIn, loads.into_inner(), None);
+            launched.loads = loads.into_inner();
+            return launched;
         };
         let mut recovery =
             SetupRecovery::at_launch(true, LaunchWalk::after(requested, &listed, &running));
+        let mut budget = Recovery::new();
         for _ in 0..=2 * listed.len() {
             let first_run = recovery.on_run_start();
             if streams.contains(&running.as_str()) {
-                let refused = recovery.walk_refused().map(str::to_string);
+                launched.refused = recovery.walk_refused().map(str::to_string);
                 let later = recovery.on_run_start();
                 assert_eq!(later, FirstRun::Other, "the walk ends once a stream runs");
                 recovery.on_setup_failed(later);
                 assert_eq!(recovery.on_reinit(), SetupFailure::Fail);
-                return (Ends::Runs(running), loads.into_inner(), refused);
+                launched.ends = Ends::Runs(running);
+                launched.loads = loads.into_inner();
+                return launched;
             }
             recovery.on_setup_failed(first_run);
-            match recovery.on_reinit() {
-                SetupFailure::RetryFollowingDriver => loads.borrow_mut().push(running.clone()),
+            let end = RunEnd {
+                setup_failed: true,
+                ..RunEnd::default()
+            };
+            let action = match run_outcome_after(end, setup_failure_action(first_run).follows_up())
+            {
+                RunOutcome::FollowUp => budget.follow_up(),
+                RunOutcome::StreamFailed => budget.stream_failed(Duration::ZERO),
+                other => panic!("a stream that did not start ends as {other:?}"),
+            };
+            match action {
+                Action::FollowUp => launched.paused += Recovery::FOLLOW_UP,
+                Action::Reinit { backoff } => launched.paused += backoff,
+                Action::ReinitNow => {}
+                Action::WaitForHardware => launched.waited_for_hardware = true,
+            }
+            let mut action = recovery.on_reinit();
+            if action == SetupFailure::RetryFollowingDriver {
+                loads.borrow_mut().push(running.clone());
+                if !reload_opens {
+                    action = recovery.on_retry_refused();
+                }
+            }
+            match action {
+                SetupFailure::RetryFollowingDriver => {}
                 SetupFailure::WalkOn => match recovery.walk_on(&mut open, || false) {
                     Walked::Opened(name, ()) => running = name,
-                    Walked::Spent => return (Ends::StandIn, loads.into_inner(), None),
+                    Walked::Spent => break,
                     Walked::Ended => unreachable!("nothing ends this walk"),
                 },
-                SetupFailure::StandIn => return (Ends::StandIn, loads.into_inner(), None),
+                SetupFailure::StandIn => break,
                 other => panic!("a launch does not {other:?}"),
             }
         }
-        panic!("the launch walk did not end: {:?}", loads.into_inner());
+        assert_eq!(
+            budget.stream_failed(Duration::ZERO),
+            Action::Reinit {
+                backoff: Recovery::BACKOFF[0]
+            },
+            "the stand-in starts with the whole budget"
+        );
+        launched.loads = loads.into_inner();
+        launched
+    }
+
+    #[test]
+    fn a_walk_over_drivers_that_open_and_never_stream_spends_no_stream_death_budget() {
+        let listed = ["A", "B", "C", "D", "E", "F", "G"];
+        let launched = launch_with(Some("A"), &listed, &listed, &[], true);
+        assert_eq!(launched.ends, Ends::StandIn);
+        assert_eq!(launched.loads, ["A", "A", "B", "C", "D", "E", "F", "G"]);
+        assert!(!launched.waited_for_hardware);
+        assert_eq!(
+            launched.paused,
+            Recovery::FOLLOW_UP * 8,
+            "one short pause per reopen the launch makes"
+        );
+    }
+
+    #[test]
+    fn a_launch_retry_whose_reload_does_not_open_walks_on_at_once() {
+        let launched = launch_with(Some("A"), &["A", "B", "C"], &["A", "B"], &["B"], false);
+        assert_eq!(launched.ends, Ends::Runs("B".into()));
+        assert_eq!(launched.loads, ["A", "A", "B"]);
+        assert_eq!(launched.refused.as_deref(), Some("A"));
+        assert!(!launched.waited_for_hardware);
+        let launched = launch_with(Some("A"), &["A"], &["A"], &[], false);
+        assert_eq!(
+            launched.ends,
+            Ends::StandIn,
+            "no other driver: the stand-in"
+        );
+        assert_eq!(launched.loads, ["A", "A"]);
     }
 
     #[test]
@@ -594,17 +700,20 @@ mod tests {
     }
 
     #[test]
-    fn a_reopen_that_did_not_open_keeps_the_launch_retry_pending() {
+    fn a_launch_retry_that_did_not_reopen_walks_on_or_stands_in() {
+        let listed = names(&["A", "B"]);
+        let mut recovery =
+            SetupRecovery::at_launch(true, LaunchWalk::after(Some("A"), &listed, "A"));
+        let first_run = recovery.on_run_start();
+        recovery.on_setup_failed(first_run);
+        assert_eq!(recovery.on_reinit(), SetupFailure::RetryFollowingDriver);
+        assert_eq!(recovery.on_retry_refused(), SetupFailure::WalkOn);
         let mut recovery = at_launch(true);
         let first_run = recovery.on_run_start();
         recovery.on_setup_failed(first_run);
         assert_eq!(recovery.on_reinit(), SetupFailure::RetryFollowingDriver);
-        // That reopen failed: the wrapper calls `reinit()` again with no run between.
-        assert_eq!(recovery.on_reinit(), SetupFailure::Fail);
-        let first_run = recovery.on_run_start();
-        assert_eq!(first_run, FirstRun::Launch { retried: true });
-        recovery.on_setup_failed(first_run);
-        assert_eq!(recovery.on_reinit(), SetupFailure::StandIn);
+        assert_eq!(recovery.on_retry_refused(), SetupFailure::StandIn);
+        assert_eq!(recovery.on_run_start(), FirstRun::Other);
     }
 
     #[test]

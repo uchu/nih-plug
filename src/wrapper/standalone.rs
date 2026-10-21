@@ -53,10 +53,10 @@ pub struct AudioDevicesInUse {
     pub inputs: Vec<String>,
     /// The host the stream runs on, by backend id: `"wasapi"`, `"asio"`, `"core-audio"`, `"alsa"`.
     pub driver: Option<String>,
-    /// A driver, by backend id, that was asked for but opened nothing; the stream stayed on `driver`.
-    /// Also the launch's ASIO driver that opened and then started no stream, at its size or the
-    /// driver's own, while WASAPI stands in for it because no other listed driver opened and ran. Kept through restarts; a device or driver
-    /// change that opens clears it.
+    /// A driver, by backend id, that was asked for but opened nothing; the stream stayed on
+    /// `driver`. Also the launch's ASIO driver that opened and then started no stream, at its size
+    /// or the driver's own, while WASAPI stands in for it because no other listed driver opened
+    /// and ran. Kept through restarts; a device or driver change that opens clears it.
     pub refused_driver: Option<String>,
     /// The ASIO driver the user last picked that did not open: a driver name, or
     /// [`FIRST_AVAILABLE_REFUSED`] when "First available" opened nothing. What ran before runs
@@ -75,9 +75,10 @@ pub struct AudioDevicesInUse {
     /// ends because its stream did not start, failed or (on a duplex host) fell silent, and
     /// `false` from then until a stream calls back again. A stream that did not start stays
     /// `true` while the same open goes on with it: the driver reloaded at another size, the
-    /// launch walking on to the next listed driver, or the shared host standing in. A recovery reopen keeps the value the run before it ended with,
-    /// and a recovery reopen that fails is `false` and keeps naming `opened`, so a driver that
-    /// loads and then never calls back is named, and not running, while it is down.
+    /// launch walking on to the next listed driver, or the shared host standing in. A recovery
+    /// reopen keeps the value the run before it ended with, and a recovery reopen that fails is
+    /// `false` and keeps naming `opened`, so a driver that loads and then never calls back is
+    /// named, and not running, while it is down.
     pub running: bool,
     /// A buffer size the ASIO driver listed and then refused to run: after a change of the size
     /// alone the previous size runs instead, after a launch, a driver pick or a switch to ASIO

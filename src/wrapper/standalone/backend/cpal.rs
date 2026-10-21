@@ -981,8 +981,8 @@ impl<P: Plugin> Backend<P> for CpalMidir {
                 device_returned: device_returned.load(Ordering::Acquire),
                 restart: restart.is_some(),
             };
-            let outcome = run_outcome(end);
             let follows_up = setup_failed && setup_failure_action(first_run).follows_up();
+            let outcome = run_outcome_after(end, follows_up);
             self.publish_in_use(|before| published_after_run_end(before, end, follows_up));
             if let (RunOutcome::Restart, Some(reason)) = (outcome, restart) {
                 nih_log!("Restarting the audio stream: {reason}");
@@ -1044,10 +1044,24 @@ impl<P: Plugin> Backend<P> for CpalMidir {
             &self.quarantined,
             device_use,
             &previous,
-        )
-        .map_err(|failed| self.reopen_failed(failed))?;
-        self.hold(opened);
-        Ok(())
+        );
+        match opened {
+            Ok(opened) => {
+                self.hold(opened);
+                Ok(())
+            }
+            Err(failed) if after == SetupFailure::RetryFollowingDriver => {
+                nih_error!(
+                    "The ASIO driver did not reload at its own size: {:#}",
+                    failed.err
+                );
+                match self.recovery.on_retry_refused() {
+                    SetupFailure::WalkOn => self.walk_on(),
+                    _ => self.stand_in_shared(),
+                }
+            }
+            Err(failed) => Err(self.reopen_failed(failed)),
+        }
     }
 
     /// A change on the host that runs, or a switch to another host (`switch_host`). A shared host
@@ -1340,8 +1354,9 @@ const DUPLEX_RATE_TOLERANCE: f64 = 5e-4;
 /// An output that keeps streaming at another rate leaves the plugin processing at the session's
 /// rate on hardware running at a different one. A shared device's rate is taken as a reopen would
 /// adopt it, truncated as cpal's `SampleRate` is: a device reporting a fraction must not restart a
-/// stream whose reopen lands on the rate it already runs. A duplex driver's measured rate moves by distance, not by its rounding,
-/// so a reading that wanders across a half hertz does not restart the stream every check (E5).
+/// stream whose reopen lands on the rate it already runs. A duplex driver's measured rate moves by
+/// distance, not by its rounding, so a reading that wanders across a half hertz does not restart
+/// the stream every check (E5).
 pub(crate) fn rate_moved(duplex: bool, device_rate: f64, session_rate: f32) -> bool {
     let session_rate = f64::from(session_rate);
     if duplex {
@@ -1363,8 +1378,8 @@ fn runs_at(
 }
 
 /// The output configuration a stream of `channels` at `rate` with a period of `period` opens
-/// with: F32 with the fewest channels that cover the plugin, else the fewest channels. A device with more channels than needed (a multichannel interface) is written
-/// on its first ones.
+/// with: F32 with the fewest channels that cover the plugin, else the fewest channels. A device
+/// with more channels than needed (a multichannel interface) is written on its first ones.
 fn pick_output_config(
     configs: impl IntoIterator<Item = cpal::SupportedStreamConfigRange>,
     channels: usize,
@@ -1442,6 +1457,16 @@ fn run_outcome(end: RunEnd) -> RunOutcome {
     }
 }
 
+/// `run_outcome`, except that a stream that did not start and that the open it belonged to
+/// `follows_up` (E3, the launch's walk) is no stream death: it ends as `RunOutcome::FollowUp`, so
+/// the wrapper spends no failure budget on it.
+fn run_outcome_after(end: RunEnd, follows_up: bool) -> RunOutcome {
+    match run_outcome(end) {
+        RunOutcome::StreamFailed if follows_up && end.setup_failed => RunOutcome::FollowUp,
+        outcome => outcome,
+    }
+}
+
 /// What the stream is open on once a run ended with `end`. A run whose stream did not start,
 /// failed or fell silent leaves nothing running until a stream calls back again, unless the open
 /// it belonged to `follows_up` its stream that did not start (E3); every other end is followed by
@@ -1452,7 +1477,7 @@ fn published_after_run_end(
     follows_up: bool,
 ) -> AudioDevicesInUse {
     AudioDevicesInUse {
-        running: before.running && (follows_up || run_outcome(end) != RunOutcome::StreamFailed),
+        running: before.running && run_outcome_after(end, follows_up) != RunOutcome::StreamFailed,
         ..before
     }
 }
@@ -1478,7 +1503,8 @@ fn published_after_stand_in(in_use: AudioDevicesInUse, left: String) -> AudioDev
 
 /// What the restart that opens the driver `name` the launch walked on to reopens from: the
 /// driver named in `opened`, and the saved driver it stands in for (`refused`) in
-/// `refused_output`, which the restart path publishes and keeps (`duplex_refused_output`).
+/// `refused_output`, which the restart path publishes and keeps (`duplex_refused_output`). A size
+/// the driver it leaves refused is not carried on: the walked driver opens at its own.
 fn walked_stand_in(
     previous: &AudioDevicesInUse,
     name: &str,
@@ -1487,6 +1513,7 @@ fn walked_stand_in(
     AudioDevicesInUse {
         opened: Some(name.to_string()),
         refused_output: refused,
+        refused_period: None,
         ..previous.clone()
     }
 }
@@ -4180,7 +4207,10 @@ mod tests {
         opened.refused_output = duplex_refused_output(Start::Restart, false, &walked);
         assert_eq!(opened.output, None);
         assert_eq!(opened.refused_output.as_deref(), Some("A"));
-        assert_eq!(opened.refused_period, Some(64));
+        assert_eq!(
+            opened.refused_period, None,
+            "the walked driver was never asked for the saved driver's refused size"
+        );
         assert_eq!(opened.refused_driver, None);
         assert!(running_after_open(Start::Restart, walked.running));
         let restarted = AudioDevicesInUse {
@@ -4207,6 +4237,28 @@ mod tests {
         let before = running_duplex("RME");
         assert_eq!(published_after_run_end(before.clone(), end, true), before);
         assert!(!published_after_run_end(before, end, false).running);
+    }
+
+    /// The wrapper spends its stream-death budget on `StreamFailed` alone, so a stream that did
+    /// not start and that the same open goes on with is reported as the follow-up it is.
+    #[test]
+    fn a_setup_failure_the_same_open_follows_up_is_no_stream_death() {
+        let end = RunEnd {
+            setup_failed: true,
+            ..RunEnd::default()
+        };
+        assert_eq!(run_outcome_after(end, true), RunOutcome::FollowUp);
+        assert_eq!(run_outcome_after(end, false), RunOutcome::StreamFailed);
+        let changed = RunEnd {
+            change_pending: true,
+            ..end
+        };
+        assert_eq!(run_outcome_after(changed, true), RunOutcome::Reconfigure);
+        let failed = RunEnd {
+            stream_error: true,
+            ..RunEnd::default()
+        };
+        assert_eq!(run_outcome_after(failed, true), RunOutcome::StreamFailed);
     }
 
     #[test]

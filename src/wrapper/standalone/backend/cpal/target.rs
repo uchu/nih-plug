@@ -175,16 +175,16 @@ pub(super) fn launch_duplex<T>(
             Err(err) => Requested::Refused(err),
         },
     };
-    let others: Vec<String> = names
-        .iter()
+    let others: Vec<String> = launch_order(requested, names)
         .filter(|listed| Some(listed.as_str()) != requested)
         .cloned()
         .collect();
     (outcome, first_that_opens(&others, open))
 }
 
-/// The order a duplex launch tries the listed drivers in (`launch_duplex`): the requested driver
-/// when it is listed, then every other listed one.
+/// The order a duplex launch tries the listed drivers in, which `launch_duplex` and the walk
+/// after it (`LaunchWalk`) both follow: the requested driver when it is listed, then every other
+/// listed one.
 fn launch_order<'a>(
     requested: Option<&'a str>,
     names: &'a [String],

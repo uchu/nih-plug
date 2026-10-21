@@ -30,6 +30,11 @@ pub enum RunOutcome {
     /// The audio stream failed, e.g. because the audio device was disconnected. The caller may try
     /// [`Backend::reinit()`] followed by another [`Backend::run()`] call to recover.
     StreamFailed,
+    /// The stream did not start, and the open it belonged to goes on with another attempt in the
+    /// next [`Backend::reinit()`]: a reload at another size, a walk on to another driver, a
+    /// stand-in. Not a stream death: the caller reinitialises after a short pause without spending
+    /// its failure budget.
+    FollowUp,
     /// A requested device that another device was standing in for is available again. Not a
     /// failure: the caller should [`Backend::reinit()`] and [`Backend::run()`] again to move onto it.
     DeviceReturned,
@@ -230,8 +235,9 @@ pub trait Backend<P: Plugin>: 'static + Send + Sync {
     ) -> RunOutcome;
 
     /// Rebuild the backend's audio resources after [`run()`][Self::run()] returned
-    /// [`RunOutcome::StreamFailed`], [`RunOutcome::DeviceReturned`] or [`RunOutcome::Restart`], so
-    /// that `run()` can be called again. Backends that don't support recovery return an error.
+    /// [`RunOutcome::StreamFailed`], [`RunOutcome::FollowUp`], [`RunOutcome::DeviceReturned`] or
+    /// [`RunOutcome::Restart`], so that `run()` can be called again. Backends that don't support
+    /// recovery return an error.
     fn reinit(&mut self) -> anyhow::Result<()> {
         anyhow::bail!("Audio device recovery is not supported by this backend")
     }

@@ -780,6 +780,8 @@ impl<P: Plugin, B: Backend<P>> Wrapper<P, B> {
                 // The plugin or the user asked to stop; same behavior as before the restart loop
                 RunOutcome::Stopped => break,
                 RunOutcome::StreamFailed => Some(recovery.stream_failed(run_started.elapsed())),
+                // The backend logged what it tries next.
+                RunOutcome::FollowUp => Some(recovery.follow_up()),
                 RunOutcome::DeviceReturned => {
                     let refused_again = self.backend.borrow().returned_device_refused();
                     if refused_again {
@@ -898,6 +900,11 @@ impl<P: Plugin, B: Backend<P>> Wrapper<P, B> {
                 }
             }
             Action::ReinitNow => {}
+            Action::FollowUp => {
+                if wait_unless(should_terminate, Recovery::FOLLOW_UP) == Wake::Stop {
+                    return None;
+                }
+            }
             Action::WaitForHardware => {
                 if self.backend.borrow_mut().quarantine_requested() {
                     nih_error!(
