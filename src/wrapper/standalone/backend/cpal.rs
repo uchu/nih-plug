@@ -1180,14 +1180,14 @@ impl<P: Plugin> Backend<P> for CpalMidir {
     }
 
     fn release_on_gui_thread(&mut self) {
-        asio_driver::set_driver_open(false);
+        self.set_driver_loaded(false);
         asio_driver::release((self.input.take(), self.output.take()));
     }
 }
 
 impl Drop for CpalMidir {
     fn drop(&mut self) {
-        asio_driver::set_driver_open(false);
+        self.set_driver_loaded(false);
         asio_driver::release((self.input.take(), self.output.take()));
     }
 }
@@ -1476,6 +1476,14 @@ fn running_after_open(start: Start, previous_running: bool) -> bool {
     start != Start::Restart || previous_running
 }
 
+/// `in_use` with `loaded` as whether an ASIO driver is loaded; never on a shared host.
+fn with_driver_loaded(in_use: AudioDevicesInUse, loaded: bool) -> AudioDevicesInUse {
+    AudioDevicesInUse {
+        driver_loaded: loaded && in_use.duplex,
+        ..in_use
+    }
+}
+
 /// What an open that opened no output publishes. A restart keeps naming what last opened, as
 /// not running; a launch or a pick that fails names nothing, as a failed pick is followed by the
 /// previous device's reopen.
@@ -1490,6 +1498,7 @@ fn published_after_failed_open(
     AudioDevicesInUse {
         opened,
         running: false,
+        driver_loaded: false,
         ..failed
     }
 }
@@ -1954,11 +1963,17 @@ impl CpalMidir {
         }
     }
 
+    /// Raise or lower the flag the control panel opens on, and publish it.
+    fn set_driver_loaded(&self, loaded: bool) {
+        asio_driver::set_driver_open(loaded);
+        self.publish_in_use(|in_use| with_driver_loaded(in_use, loaded));
+    }
+
     /// Let go of an ASIO driver before the next open: dropping the last handle stops it and runs
     /// ASIODisposeBuffers and ASIOExit, and the SDK holds one driver at a time. A shared host's
     /// streams ended with the run.
     fn release_driver(&mut self) {
-        asio_driver::set_driver_open(false);
+        self.set_driver_loaded(false);
         if self.duplex {
             asio_driver::release((self.input.take(), self.output.take()));
         }
@@ -1982,7 +1997,7 @@ impl CpalMidir {
             Instant::now(),
         );
         *self.in_use.lock() = opened.in_use;
-        asio_driver::set_driver_open(self.duplex);
+        self.set_driver_loaded(self.duplex);
     }
 
     /// After a change that opened nothing: what the stream ran on, reopened as a restart does (on
@@ -2042,7 +2057,7 @@ impl CpalMidir {
     /// when that does not open either.
     fn switch_host(&mut self, current: &Target, next: &Target) -> Result<()> {
         let previous = self.in_use.lock().clone();
-        asio_driver::set_driver_open(false);
+        self.set_driver_loaded(false);
         asio_driver::release((self.input.take(), self.output.take()));
 
         let Err(err) = self.open_host(next) else {
@@ -2524,6 +2539,7 @@ impl CpalMidir {
             }
         }
 
+        let in_use = with_driver_loaded(in_use, true);
         publish_audio_devices_in_use(in_use.clone());
         Ok(OpenedDevices {
             output,
@@ -4113,6 +4129,38 @@ mod tests {
             assert_eq!(after.opened, None);
             assert!(!after.running);
         }
+    }
+
+    #[test]
+    fn a_released_driver_is_published_unloaded_and_keeps_its_name() {
+        let loaded = with_driver_loaded(running_duplex("RME"), true);
+        assert!(loaded.driver_loaded);
+        let released = with_driver_loaded(loaded, false);
+        assert_eq!(released, running_duplex("RME"));
+    }
+
+    #[test]
+    fn a_shared_host_never_publishes_a_driver_loaded() {
+        let shared = AudioDevicesInUse {
+            driver: Some("wasapi".into()),
+            opened: Some("Speakers".into()),
+            running: true,
+            ..Default::default()
+        };
+        assert!(!with_driver_loaded(shared, true).driver_loaded);
+    }
+
+    #[test]
+    fn a_failed_recovery_reopen_names_the_driver_with_none_loaded() {
+        let previous = with_driver_loaded(running_duplex("Realtek ASIO"), true);
+        let failed = AudioDevicesInUse {
+            duplex: true,
+            driver_loaded: true,
+            ..Default::default()
+        };
+        let after = published_after_failed_open(Start::Restart, &previous, failed);
+        assert_eq!(after.opened.as_deref(), Some("Realtek ASIO"));
+        assert!(!after.driver_loaded);
     }
 
     #[test]

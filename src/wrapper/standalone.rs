@@ -84,6 +84,10 @@ pub struct AudioDevicesInUse {
     /// Restarts keep it; `None` once a change opens, once the stream runs at that size, and on
     /// other hosts.
     pub refused_period: Option<u32>,
+    /// Whether an ASIO driver is loaded: from an open that loaded it until the backend releases
+    /// it for a restart, a change, a switch or the end, whether or not its stream runs. A recovery
+    /// reopen that fails keeps naming `opened` with no driver loaded. `false` on other hosts.
+    pub driver_loaded: bool,
 }
 
 /// [`AudioDevicesInUse::refused_asio`] when "First available" was picked on ASIO and no driver
