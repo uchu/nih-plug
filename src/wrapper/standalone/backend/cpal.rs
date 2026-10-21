@@ -793,7 +793,7 @@ impl<P: Plugin> Backend<P> for CpalMidir {
                     }
                 });
 
-            let outcome = run_outcome(RunEnd {
+            let end = RunEnd {
                 callback_stopped: callback_stopped.load(Ordering::Acquire),
                 stop_requested: should_stop.load(Ordering::SeqCst),
                 change_pending: audio_change_pending(),
@@ -801,7 +801,16 @@ impl<P: Plugin> Backend<P> for CpalMidir {
                 stream_error: stream_error.load(Ordering::Acquire),
                 device_returned: device_returned.load(Ordering::Acquire),
                 restart: restart.is_some(),
-            });
+            };
+            let outcome = run_outcome(end);
+            {
+                let mut in_use = self.in_use.lock();
+                let after = published_after_run_end(in_use.clone(), end);
+                if after != *in_use {
+                    *in_use = after.clone();
+                    publish_audio_devices_in_use(after);
+                }
+            }
             if let (RunOutcome::Restart, Some(reason)) = (outcome, restart) {
                 nih_log!("Restarting the audio stream: {reason}");
             }
@@ -1139,6 +1148,16 @@ fn run_outcome(end: RunEnd) -> RunOutcome {
         RunOutcome::Restart
     } else {
         RunOutcome::Stopped
+    }
+}
+
+/// What the stream is open on once a run ended with `end`. A run whose stream did not start,
+/// failed or fell silent leaves nothing running until an open succeeds again; every other end is
+/// followed by a reopen or a shutdown, and a reopen publishes for itself.
+fn published_after_run_end(before: AudioDevicesInUse, end: RunEnd) -> AudioDevicesInUse {
+    AudioDevicesInUse {
+        running: before.running && run_outcome(end) != RunOutcome::StreamFailed,
+        ..before
     }
 }
 
@@ -1946,6 +1965,7 @@ impl CpalMidir {
             }
         }
         in_use.opened = output.device.name().ok();
+        in_use.running = true;
         in_use.sample_rate = Some(output.config.sample_rate.0);
         in_use.buffer_size = stream_period(&output).map(|period| period as u32);
         let rate = output.config.sample_rate.0 as f32;
@@ -3277,6 +3297,63 @@ mod tests {
     #[test]
     fn a_shared_wasapi_stream_leaves_a_rate_change_to_its_error_callback() {
         assert!(!rate_check_applies(false, cpal::HostId::Wasapi));
+    }
+
+    fn running_duplex(opened: &str) -> AudioDevicesInUse {
+        AudioDevicesInUse {
+            opened: Some(opened.into()),
+            duplex: true,
+            running: true,
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn a_failed_duplex_run_publishes_not_running_and_keeps_the_opened_name() {
+        let end = RunEnd {
+            setup_failed: true,
+            ..RunEnd::default()
+        };
+        let after = published_after_run_end(running_duplex("RME"), end);
+        assert!(!after.running);
+        assert_eq!(after.opened.as_deref(), Some("RME"));
+        assert!(after.duplex);
+    }
+
+    #[test]
+    fn a_stream_error_publishes_not_running() {
+        let end = RunEnd {
+            stream_error: true,
+            ..RunEnd::default()
+        };
+        assert!(!published_after_run_end(running_duplex("RME"), end).running);
+    }
+
+    #[test]
+    fn a_restart_or_reconfigure_end_keeps_running_true() {
+        for end in [
+            RunEnd {
+                restart: true,
+                ..RunEnd::default()
+            },
+            RunEnd {
+                change_pending: true,
+                ..RunEnd::default()
+            },
+        ] {
+            let before = running_duplex("RME");
+            assert_eq!(published_after_run_end(before.clone(), end), before);
+        }
+    }
+
+    #[test]
+    fn a_stop_keeps_running_true() {
+        let end = RunEnd {
+            stop_requested: true,
+            ..RunEnd::default()
+        };
+        let before = running_duplex("RME");
+        assert_eq!(published_after_run_end(before.clone(), end), before);
     }
 
     #[test]
