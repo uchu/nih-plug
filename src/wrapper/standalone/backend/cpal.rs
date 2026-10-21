@@ -803,7 +803,7 @@ impl<P: Plugin> Backend<P> for CpalMidir {
                     if check_rate && rate_checked.elapsed() >= RATE_CHECK_INTERVAL {
                         rate_checked = Instant::now();
                         if let Some(rate) = output_rate_now(self.duplex, output)
-                            .filter(|&rate| rate_moved(rate, self.config.sample_rate))
+                            .filter(|&rate| rate_moved(self.duplex, rate, self.config.sample_rate))
                         {
                             let device = if self.duplex {
                                 "the ASIO driver"
@@ -1138,13 +1138,84 @@ pub(crate) fn adopted_rate(current: Option<cpal::SampleRate>, session: f32) -> f
     current.map_or(session, |rate| rate.0 as f32)
 }
 
+/// A rate to the nearest hertz, half up: an externally clocked ASIO driver reporting 47999.98 Hz
+/// runs at 48000 (E5). An unreadable rate saturates and fails `plausible_rate`.
+pub(crate) fn whole_hertz(rate: f64) -> u32 {
+    rate.round() as u32
+}
+
+/// Whether a rate is one an audio converter runs at. An unlocked driver can report 0.6 Hz or
+/// infinity; a session never adopts such a rate.
+fn plausible_rate(rate: u32) -> bool {
+    (8_000..=768_000).contains(&rate)
+}
+
+/// The rate a duplex session runs at: whatever the driver reports, to the hertz, with no list of
+/// common rates in between (E5). `None` when the driver reports nothing usable.
+pub(crate) fn duplex_rate(driver_rate: Option<f64>) -> Option<cpal::SampleRate> {
+    driver_rate
+        .map(whole_hertz)
+        .filter(|&rate| plausible_rate(rate))
+        .map(cpal::SampleRate)
+}
+
+/// The rate a reopen adopts from a device reporting `rate`: a duplex open rounds it to the hertz
+/// (`duplex_rate`), a shared open takes cpal's `SampleRate`, which truncates.
+fn reopen_rate(duplex: bool, rate: f64) -> u32 {
+    if duplex {
+        whole_hertz(rate)
+    } else {
+        rate as u32
+    }
+}
+
 /// An output that keeps streaming at another rate leaves the plugin processing at the session's
 /// rate on hardware running at a different one. The device's rate is taken as a reopen would adopt
-/// it, through cpal's whole-hertz `SampleRate`: a device reporting a fraction must not restart a
-/// stream whose reopen lands on the rate it already runs.
-pub(crate) fn rate_moved(device_rate: f64, session_rate: f32) -> bool {
-    let adopted = adopted_rate(Some(cpal::SampleRate(device_rate as u32)), session_rate);
-    (adopted - session_rate).abs() > 0.1
+/// it: a device reporting a fraction must not restart a stream whose reopen lands on the rate it
+/// already runs.
+pub(crate) fn rate_moved(duplex: bool, device_rate: f64, session_rate: f32) -> bool {
+    reopen_rate(duplex, device_rate) != whole_hertz(f64::from(session_rate))
+}
+
+/// Whether a listed configuration can run a stream at `rate`. A duplex driver runs at its own
+/// rate, which cpal need not list (an external clock, 352.8 or 384 kHz); its configurations differ
+/// only in channels, so the rate is not matched there (E5).
+fn runs_at(
+    config: &cpal::SupportedStreamConfigRange,
+    rate: cpal::SampleRate,
+    duplex: bool,
+) -> bool {
+    duplex || (config.min_sample_rate()..=config.max_sample_rate()).contains(&rate)
+}
+
+/// The output configuration a stream of `channels` at `rate` with a period of `period` opens
+/// with: F32 with the fewest channels that cover the plugin, else the fewest channels, one listed
+/// at `rate` first. A device with more channels than needed (a multichannel interface) is written
+/// on its first ones.
+fn pick_output_config(
+    configs: impl IntoIterator<Item = cpal::SupportedStreamConfigRange>,
+    channels: usize,
+    rate: cpal::SampleRate,
+    period: u32,
+    duplex: bool,
+) -> Option<cpal::SupportedStreamConfigRange> {
+    let mut fitting: Vec<_> = configs
+        .into_iter()
+        .filter(|c| match c.buffer_size() {
+            cpal::SupportedBufferSize::Range { min, max } => {
+                c.channels() as usize >= channels
+                    && runs_at(c, rate, duplex)
+                    && (min..=max).contains(&&period)
+            }
+            cpal::SupportedBufferSize::Unknown => false,
+        })
+        .collect();
+    fitting.sort_by_key(|c| (c.channels(), !runs_at(c, rate, false)));
+    fitting
+        .iter()
+        .find(|c| c.sample_format() == SampleFormat::F32)
+        .or_else(|| fitting.first())
+        .cloned()
 }
 
 /// Whether a running stream polls its output's rate. An ASIO driver keeps calling back at its new
@@ -1237,7 +1308,7 @@ fn published_after_failed_open(
 /// output resolved to. `None` when there is nothing to read or the device does not answer.
 fn output_rate_now(duplex: bool, output: &CpalDevice) -> Option<f64> {
     if duplex {
-        asio_driver::driver_rate(&output.device)
+        asio_driver::driver_rate(&output.device).filter(|&rate| duplex_rate(Some(rate)).is_some())
     } else {
         output.rate_source.and_then(DeviceRate::read)
     }
@@ -1264,7 +1335,7 @@ fn watched_rate(name: Option<&str>, on_default: bool, session: f32) -> Option<De
 }
 
 fn agrees(rate: Option<f64>, session: f32) -> bool {
-    rate.is_some_and(|rate| !rate_moved(rate, session))
+    rate.is_some_and(|rate| !rate_moved(false, rate, session))
 }
 
 /// The `-b` id of the host a stream runs on, as the app names drivers.
@@ -2089,14 +2160,11 @@ impl CpalMidir {
         if duplex {
             let wanted = main_channels(layout.main_input_channels) as u16;
             let rate = output.config.sample_rate;
+            // Taken at the driver's rate whatever rates cpal lists for it (E5).
             let configs: Vec<_> = output
                 .device
                 .supported_input_configs()
-                .map(|configs| {
-                    configs
-                        .filter(|c| c.min_sample_rate() <= rate && rate <= c.max_sample_rate())
-                        .collect()
-                })
+                .map(|configs| configs.collect())
                 .unwrap_or_default();
             let available: Vec<u16> = configs.iter().map(|c| c.channels()).collect();
             match duplex_input_channels(wanted, &available) {
@@ -2288,10 +2356,24 @@ impl CpalMidir {
         num_output_channels: usize,
         device_use: DeviceUse,
     ) -> Result<CpalDevice> {
-        let current = device
-            .default_output_config()
-            .ok()
-            .map(|current| current.sample_rate());
+        let current = match device_use {
+            DeviceUse::Duplex { .. } => {
+                let reported = asio_driver::driver_rate(&device);
+                let Some(rate) = duplex_rate(reported) else {
+                    match reported {
+                        Some(rate) => anyhow::bail!(
+                            "the ASIO driver reports {rate} Hz, not a rate audio runs at"
+                        ),
+                        None => anyhow::bail!("the ASIO driver does not report its sample rate"),
+                    }
+                };
+                Some(rate)
+            }
+            DeviceUse::Shared => device
+                .default_output_config()
+                .ok()
+                .map(|current| current.sample_rate()),
+        };
         let mut config = config.clone();
         config.sample_rate = adopted_rate(current, config.sample_rate);
         if let DeviceUse::Duplex { requested } = device_use {
@@ -2305,7 +2387,7 @@ impl CpalMidir {
             }
             config.period_size = period;
         }
-        Self::build_output_cpal_device(device, &config, num_output_channels)
+        Self::build_output_cpal_device(device, &config, num_output_channels, device_use)
     }
 
     fn build_input_cpal_device(
@@ -2371,40 +2453,27 @@ impl CpalMidir {
         device: Device,
         config: &WrapperConfig,
         num_output_channels: usize,
+        device_use: DeviceUse,
     ) -> Result<CpalDevice> {
-        let requested_sample_rate = cpal::SampleRate(config.sample_rate as u32);
+        let requested_sample_rate = cpal::SampleRate(whole_hertz(f64::from(config.sample_rate)));
         let requested_buffer_size = cpal::BufferSize::Fixed(config.period_size);
 
-        let mut output_configs: Vec<_> = device
-            .supported_output_configs()
-            .context("Could not get supported audio output configurations")?
-            .filter(|c| match c.buffer_size() {
-                cpal::SupportedBufferSize::Range { min, max } => {
-                    // Accept devices with more channels than needed (e.g. multichannel
-                    // interfaces like UAD Apollo). We'll write to the first N channels and
-                    // silence the rest in the output callback.
-                    c.channels() as usize >= num_output_channels
-                        && (c.min_sample_rate()..=c.max_sample_rate())
-                            .contains(&requested_sample_rate)
-                        && (min..=max).contains(&&config.period_size)
-                }
-                cpal::SupportedBufferSize::Unknown => false,
-            })
-            .collect();
-        // Prefer F32 with the fewest channels to minimize wasted bandwidth
-        output_configs.sort_by_key(|c| c.channels());
-        let output_config_range = output_configs
-            .iter()
-            .find(|c| c.sample_format() == SampleFormat::F32)
-            .or_else(|| output_configs.first())
-            .cloned()
-            .with_context(|| {
-                format!(
-                    "The audio output device does not support at least {} audio channels at a \
-                     sample rate of {} Hz and a period size of {} samples",
-                    num_output_channels, config.sample_rate, config.period_size,
-                )
-            })?;
+        let output_config_range = pick_output_config(
+            device
+                .supported_output_configs()
+                .context("Could not get supported audio output configurations")?,
+            num_output_channels,
+            requested_sample_rate,
+            config.period_size,
+            device_use.is_duplex(),
+        )
+        .with_context(|| {
+            format!(
+                "The audio output device does not support at least {} audio channels at a sample \
+                 rate of {} Hz and a period size of {} samples",
+                num_output_channels, config.sample_rate, config.period_size,
+            )
+        })?;
         let device_channels = output_config_range.channels();
         if device_channels as usize > num_output_channels {
             nih_log!(
@@ -3486,19 +3555,79 @@ mod tests {
 
     #[test]
     fn a_rate_moves_to_another_whole_hertz_rate() {
-        assert!(!rate_moved(48_000.0, 48_000.0));
-        assert!(!rate_moved(48_000.05, 48_000.0));
-        assert!(rate_moved(44_100.0, 48_000.0));
-        assert!(rate_moved(96_000.0, 48_000.0));
+        for duplex in [true, false] {
+            assert!(!rate_moved(duplex, 48_000.0, 48_000.0));
+            assert!(!rate_moved(duplex, 48_000.05, 48_000.0));
+            assert!(rate_moved(duplex, 44_100.0, 48_000.0));
+            assert!(rate_moved(duplex, 96_000.0, 48_000.0));
+        }
     }
 
     #[test]
-    fn a_fractional_rate_moves_only_when_a_reopen_would_adopt_another() {
+    fn a_driver_rate_rounds_to_the_nearest_hertz() {
+        assert_eq!(whole_hertz(47_999.98), 48_000);
+        assert_eq!(whole_hertz(384_000.4), 384_000);
+        assert_eq!(whole_hertz(44_100.5), 44_101);
+        assert_eq!(whole_hertz(47_999.4), 47_999);
+        assert!(!rate_moved(true, 47_999.98, 48_000.0));
+        assert!(rate_moved(true, 48_000.0, 44_100.0));
+    }
+
+    #[test]
+    fn a_duplex_session_runs_at_the_driver_rate_to_the_hertz() {
+        assert_eq!(duplex_rate(Some(47_999.98)), Some(cpal::SampleRate(48_000)));
+        assert_eq!(
+            duplex_rate(Some(352_800.0)),
+            Some(cpal::SampleRate(352_800))
+        );
+        assert_eq!(duplex_rate(Some(0.6)), None);
+        assert_eq!(duplex_rate(Some(f64::INFINITY)), None);
+        assert_eq!(duplex_rate(Some(f64::NAN)), None);
+        assert_eq!(duplex_rate(None), None);
+    }
+
+    #[test]
+    fn a_shared_fractional_rate_moves_only_when_a_reopen_would_adopt_another() {
         let adopted = adopted_rate(Some(cpal::SampleRate(47_999.6 as u32)), 48_000.0);
         assert_eq!(adopted, 47_999.0);
-        assert!(!rate_moved(47_999.6, adopted));
-        assert!(rate_moved(47_999.6, 48_000.0));
-        assert!(!rate_moved(44_100.9, 44_100.0));
+        assert!(!rate_moved(false, 47_999.6, adopted));
+        assert!(rate_moved(false, 47_999.6, 48_000.0));
+        assert!(!rate_moved(false, 44_100.9, 44_100.0));
+    }
+
+    fn stereo_f32_at(rate: u32) -> cpal::SupportedStreamConfigRange {
+        cpal::SupportedStreamConfigRange::new(
+            2,
+            cpal::SampleRate(rate),
+            cpal::SampleRate(rate),
+            cpal::SupportedBufferSize::Range { min: 32, max: 2048 },
+            SampleFormat::F32,
+        )
+    }
+
+    #[test]
+    fn a_duplex_output_opens_at_a_rate_its_driver_lists_outside_the_common_rates() {
+        let listed = vec![stereo_f32_at(48_000), stereo_f32_at(384_000)];
+        let picked = pick_output_config(listed, 2, cpal::SampleRate(384_000), 256, true);
+        assert!(picked.is_some_and(|c| c.max_sample_rate() == cpal::SampleRate(384_000)));
+    }
+
+    #[test]
+    fn a_duplex_output_opens_at_the_driver_rate_even_when_cpal_does_not_list_it() {
+        let common = || vec![stereo_f32_at(44_100), stereo_f32_at(48_000)];
+        let rate = cpal::SampleRate(384_000);
+        assert!(pick_output_config(common(), 2, rate, 256, true).is_some());
+        assert!(pick_output_config(common(), 2, rate, 256, false).is_none());
+        assert!(pick_output_config(common(), 4, rate, 256, true).is_none());
+        assert!(pick_output_config(common(), 2, rate, 4096, true).is_none());
+    }
+
+    #[test]
+    fn only_a_shared_configuration_has_to_list_the_rate() {
+        let at_48k = stereo_f32_at(48_000);
+        assert!(runs_at(&at_48k, cpal::SampleRate(384_000), true));
+        assert!(!runs_at(&at_48k, cpal::SampleRate(384_000), false));
+        assert!(runs_at(&at_48k, cpal::SampleRate(48_000), false));
     }
 
     #[test]
